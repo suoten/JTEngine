@@ -1,0 +1,19 @@
+{
+  "title": "Vehicle Management",
+  "list": "Vehicle List",
+  "detail": "Vehicle Detail",
+  "plateNo": "Plate No.",
+  "plateColor": "Plate Color",
+  "manufacturer": "Manufacturer",
+  "terminalModel": "Terminal Model",
+  "terminalId": "Terminal ID",
+  "province": "Province",
+  "city": "City",
+  "registerTime": "Register Time",
+  "lastActive": "Last Active",
+  "plateColorBlue": "Blue",
+  "plateColorYellow": "Yellow",
+  "plateColorBlack": "Black",
+  "plateColorWhite": "White",
+  "plateColorGreen": "Green"
+}

@@ -1,0 +1,19 @@
+{
+  "title": "车辆管理",
+  "list": "车辆列表",
+  "detail": "车辆详情",
+  "plateNo": "车牌号",
+  "plateColor": "车牌颜色",
+  "manufacturer": "制造商",
+  "terminalModel": "终端型号",
+  "terminalId": "终端ID",
+  "province": "省份",
+  "city": "城市",
+  "registerTime": "注册时间",
+  "lastActive": "最后活跃",
+  "plateColorBlue": "蓝色",
+  "plateColorYellow": "黄色",
+  "plateColorBlack": "黑色",
+  "plateColorWhite": "白色",
+  "plateColorGreen": "绿色"
+}

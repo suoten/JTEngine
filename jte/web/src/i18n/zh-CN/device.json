@@ -1,0 +1,23 @@
+{
+  "title": "设备管理",
+  "list": "设备列表",
+  "detail": "设备详情",
+  "phone": "手机号",
+  "protocol": "协议",
+  "status": "状态",
+  "registerTime": "注册时间",
+  "lastActive": "最后活跃",
+  "onlineCount": "在线设备",
+  "offlineCount": "离线设备",
+  "sendCommand": "发送指令",
+  "commandType": "指令类型",
+  "commandResult": "指令结果",
+  "map_type": "地图类型",
+  "tianditu": "天地图",
+  "amap": "高德地图",
+  "baidu_map": "百度地图",
+  "protocol_filter": "协议筛选",
+  "online_vehicles": "在线车辆",
+  "units_online": "辆在线",
+  "search": "搜索设备"
+}

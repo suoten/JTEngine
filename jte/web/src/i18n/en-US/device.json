@@ -1,0 +1,23 @@
+{
+  "title": "Device Management",
+  "list": "Device List",
+  "detail": "Device Detail",
+  "phone": "Phone",
+  "protocol": "Protocol",
+  "status": "Status",
+  "registerTime": "Register Time",
+  "lastActive": "Last Active",
+  "onlineCount": "Online Devices",
+  "offlineCount": "Offline Devices",
+  "sendCommand": "Send Command",
+  "commandType": "Command Type",
+  "commandResult": "Command Result",
+  "map_type": "Map Type",
+  "tianditu": "Tianditu",
+  "amap": "Amap",
+  "baidu_map": "Baidu Map",
+  "protocol_filter": "Protocol Filter",
+  "online_vehicles": "Online Vehicles",
+  "units_online": "online",
+  "search": "Search Device"
+}

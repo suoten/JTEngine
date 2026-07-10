@@ -1,0 +1,157 @@
+# JTE NetworkPolicy 网络隔离策略
+# 限制 Pod 间网络通信，遵循最小权限原则
+#
+# 前置条件：
+#   1. 集群 CNI 支持 NetworkPolicy（Calico / Cilium / Weave Net）
+#
+# 使用：kubectl apply -f network-policy.yaml
+
+---
+# JTE 引擎命名空间默认拒绝所有入站
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jte-default-deny-ingress
+  namespace: jte
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+
+---
+# JTE 引擎 Pod 入站策略：仅允许 Ingress + 同命名空间 + 健康检查
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jte-allow-ingress
+  namespace: jte
+spec:
+  podSelector:
+    matchLabels:
+      app: jte
+  policyTypes:
+    - Ingress
+  ingress:
+    # 允许 Ingress Controller 流量（HTTP/HTTPS/API/WebSocket）
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 7611
+    # 允许同命名空间 Pod 互访
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 7611
+    # 允许 Prometheus 抓取指标
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+
+---
+# JTE 官网 Pod 入站策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jte-website-allow-ingress
+  namespace: jte
+spec:
+  podSelector:
+    matchLabels:
+      app: jte-website
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8081
+    - from:
+        - podSelector:
+            matchLabels:
+              app: jte
+      ports:
+        - protocol: TCP
+          port: 8081
+
+---
+# JTE 引擎出站策略：仅允许 DNS + 数据库 + Redis + 对外 API
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jte-egress-policy
+  namespace: jte
+spec:
+  podSelector:
+    matchLabels:
+      app: jte
+  policyTypes:
+    - Egress
+  egress:
+    # DNS 解析
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # MySQL
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mysql
+      ports:
+        - protocol: TCP
+          port: 3306
+    # Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # TDengine
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tdengine
+      ports:
+        - protocol: TCP
+          port: 6030
+        - protocol: TCP
+          port: 6041
+    # MinIO
+    - to:
+        - podSelector:
+            matchLabels:
+              app: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    # 对外 HTTPS（AI API 调用、支付回调等）
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

@@ -1,0 +1,18 @@
+{
+  "title": "Alarm Management",
+  "list": "Alarm List",
+  "type": "Alarm Type",
+  "level": "Alarm Level",
+  "source": "Alarm Source",
+  "time": "Alarm Time",
+  "location": "Alarm Location",
+  "filter": "Alarm Filter",
+  "startTime": "Start Time",
+  "endTime": "End Time",
+  "levelLow": "Low",
+  "levelMedium": "Medium",
+  "levelHigh": "High",
+  "levelCritical": "Critical",
+  "handleAlarm": "Handle Alarm",
+  "alarmStats": "Alarm Statistics"
+}

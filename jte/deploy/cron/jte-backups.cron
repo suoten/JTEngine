@@ -1,0 +1,36 @@
+# JTE 定时备份 Cron 配置
+# AUTO-FIX-2026-06-30 [P1-5]: 备份与灾难恢复
+#
+# 部署：将本文件复制到 /etc/cron.d/jte-backups（或 crontab -e 添加）
+# 前置：所有 *_backup.sh 脚本已部署到 /opt/jte/scripts/ops/
+#       环境变量已配置（JTE_MYSQL_PASSWORD / JTE_REDIS_PASSWORD 等）
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=ops@jte.example.com
+
+# ===== MySQL =====
+# 每日凌晨 2:00 全量备份（RPO=1h 配合每小时增量）
+0 2 * * * root JTE_MYSQL_BACKUP_DIR=/data/backups/mysql /opt/jte/scripts/ops/mysql_backup.sh full >> /var/log/jte/mysql-backup.log 2>&1
+# 每小时整点增量备份（binlog）
+0 * * * * root JTE_MYSQL_BACKUP_DIR=/data/backups/mysql /opt/jte/scripts/ops/mysql_backup.sh incremental >> /var/log/jte/mysql-backup.log 2>&1
+
+# ===== TDengine =====
+# 每日凌晨 2:30 全量备份（Replica=3 保证 RPO=0，备份为兜底）
+30 2 * * * root JTE_TDENGINE_BACKUP_DIR=/data/backups/tdengine /opt/jte/scripts/ops/tdengine_backup.sh full >> /var/log/jte/tdengine-backup.log 2>&1
+# 每日凌晨 3:30 触发一次离线归档到 MinIO（冷数据迁移）
+30 3 * * * root JTE_API=http://jte-svc:8080 /opt/jte/scripts/ops/tdengine_backup.sh archive-trigger >> /var/log/jte/tdengine-archive.log 2>&1
+
+# ===== Redis =====
+# 每日凌晨 3:00 RDB 快照备份
+0 3 * * * root JTE_REDIS_BACKUP_DIR=/data/backups/redis /opt/jte/scripts/ops/redis_backup.sh rdb >> /var/log/jte/redis-backup.log 2>&1
+# 每 2 小时 AOF 备份（RPO=1s 由 AOF everysec 保证，备份为兜底）
+0 */2 * * * root JTE_REDIS_BACKUP_DIR=/data/backups/redis /opt/jte/scripts/ops/redis_backup.sh aof >> /var/log/jte/redis-backup.log 2>&1
+
+# ===== 灾难恢复演练 =====
+# 每季度首月 1 日凌晨 4:00 执行演练（低峰期）
+0 4 1 1,4,7,10 * root JTE_DR_NAMESPACE=jte-dr-drill /opt/jte/scripts/ops/dr_drill.sh --restore-only >> /var/log/jte/dr-drill.log 2>&1
+
+# ===== 备份完整性校验 =====
+# 每日凌晨 4:30 校验最近备份可解压/可读取
+30 4 * * * root /opt/jte/scripts/ops/verify_backups.sh >> /var/log/jte/backup-verify.log 2>&1

@@ -1,0 +1,43 @@
+{
+  "app": {
+    "title": "JTE Protocol Engine",
+    "subtitle": "JT/T Protocol Management Platform"
+  },
+  "nav": {
+    "dashboard": "Dashboard",
+    "devices": "Devices",
+    "vehicles": "Vehicles",
+    "alarms": "Alarms",
+    "tracks": "Tracks",
+    "video": "Video",
+    "ai": "AI Analysis",
+    "system": "System",
+    "modules": "Modules"
+  },
+  "btn": {
+    "search": "Search",
+    "reset": "Reset",
+    "add": "Add",
+    "edit": "Edit",
+    "delete": "Delete",
+    "export": "Export",
+    "confirm": "Confirm",
+    "cancel": "Cancel",
+    "refresh": "Refresh",
+    "save": "Save"
+  },
+  "msg": {
+    "loading": "Loading...",
+    "success": "Success",
+    "failed": "Failed",
+    "noData": "No Data",
+    "confirmDelete": "Confirm delete?",
+    "total": "Total {count} items"
+  },
+  "status": {
+    "online": "Online",
+    "offline": "Offline",
+    "connected": "Connected",
+    "disconnected": "Disconnected"
+  }
+}

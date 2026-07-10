@@ -1,0 +1,52 @@
+version: "3.8"
+
+services:
+  jte:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7611:7611"
+      - "8080:8080"
+    volumes:
+      - ./configs:/app/configs
+      - ./modules:/app/modules
+    depends_on:
+      - mysql
+      - redis
+      - zlmediakit
+    environment:
+      - JTE_GATEWAY_TCPPORT=7611
+      - JTE_API_PORT=8080
+      - JTE_STORAGE_TYPE=mysql
+      - JTE_STORAGE_DSN=root:jte123@tcp(mysql:3306)/jte?charset=utf8mb4&parseTime=True&loc=Local
+      - JTE_ZLMEDIAKIT_URL=http://zlmediakit:80
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: jte123
+      MYSQL_DATABASE: jte
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  zlmediakit:
+    image: zlmediakit/zlmediakit:master
+    ports:
+      - "80:80"
+      - "1935:1935"
+      - "554:554"
+      - "8000:8000/udp"
+    volumes:
+      - zlm-data:/opt/media
+
+volumes:
+  mysql-data:
+  zlm-data:

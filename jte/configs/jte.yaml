@@ -1,0 +1,390 @@
+server:
+  host: "0.0.0.0"
+  port: 7611
+
+gateway:
+  tcp_port: 7611
+  udp_port: 7612
+  # AUTO-FIX-2026-07-10 [生产加固]: read/write_timeout 对齐代码层实际期望值。
+  # 注意：808 协议网关的阶段性 deadline（connect 5s / auth 10s / read 30s）
+  # 在 gateway.go 代码层实现，不读此处配置；此处仅管控 TCP 读写总超时。
+  read_timeout: 30
+  write_timeout: 30
+  heartbeat_interval: 30
+  heartbeat_timeout: 180
+  max_connections: 1000
+  max_devices: 10000
+  oom_protect:
+    enabled: true                # 是否启用 OOM 防护
+    warn_mb: 8192                # 内存告警阈值（MB）
+    critical_mb: 9216            # 内存危险阈值（MB）
+    fatal_mb: 9728               # 内存致命阈值（MB），触发主动熔断
+    check_interval_seconds: 5    # 内存检查间隔（秒）
+
+api:
+  enabled: true
+  port: 8080
+  # AUTO-FIX-2026-06-29 [P1]: cors_origins 禁止配置 ["*"]（与 Allow-Credentials: true
+  # 构成危险组合，任意网站可携带凭证跨域访问）。生产环境必须配置具体域名白名单。
+  cors_origins:
+    - "http://localhost:5173"   # Vite 开发服务器
+    - "http://localhost:8080"   # 本地访问
+    # - "https://jte.example.com"  # 生产环境前端域名
+  rate_limit: 100
+  # AUTO-FIX-2026-07-10 [生产加固]: HTTP API 层 Slowloris/资源耗尽防护
+  security:
+    conn_limit_per_ip: 100       # 单 IP 最大并发连接数，超过返回 429（防 Slowloris）
+    body_limit_bytes: 10485760   # 请求体最大字节数（默认 10MB，防大请求体 OOM）
+  jwt:
+    # AUTO-FIX-2026-06-29 [P0]: 生产环境必须替换为 ≥32 字节强随机密钥！
+    # 生成命令：openssl rand -base64 48
+    # 配置占位符时启动会失败（config.go 强制校验）；开发环境可设置环境变量
+    # JTE_ALLOW_INSECURE_JWT=1 跳过校验。
+    # AUTO-FIX-2026-07-04 [安全]: 密钥从环境变量加载，禁止主配置文件明文存储
+    # 环境变量：JTE_JWT_SECRET_KID-2026-06（kid 用大写，点号转下划线）
+    kms_source: "env"
+    secrets: {}
+    active_kid: "kid-2026-06"
+    rotate_days: 90
+  # 保留 jwt_secret 向后兼容（生产环境通过环境变量 JTE_API_JWT_SECRET 配置）
+  jwt_secret: ""
+  jwt_expire_hours: 24
+  # AUTO-FIX-2026-07-02 [等保2.0 传输安全]: HTTPS 强制 + 证书自动续期
+  # 生产环境必须启用 TLS；WebSocket 自动升级为 WSS（同端口复用）
+  tls:
+    enabled: false              # 是否启用 HTTPS（生产环境必须 true）
+    cert_file: ""               # 证书文件路径（PEM 格式）
+    key_file: ""                # 私钥文件路径（PEM 格式）
+    auto_renew: false           # 是否启用证书自动续期
+    min_version: "TLS1.2"       # 最低 TLS 版本（TLS1.0/TLS1.1 已禁用，等保2.0 要求 TLS1.2+）
+    # Let's Encrypt ACME 自动证书（需公网域名 + 80 端口可访问）
+    acme: false                 # 是否使用 Let's Encrypt 自动证书
+    acme_dir: "./data/acme"     # ACME 证书存储目录
+    acme_domains:               # 申请证书的域名列表
+      - "jte.example.com"
+  # 强制 HTTPS：true 时 HTTP 请求返回 426 Upgrade Required
+  require_tls: false            # 生产环境建议 true（需 TLS 启用后生效）
+
+websocket:
+  enabled: true
+  path: "/ws/v1/stream"
+  write_buffer_size: 1024
+  read_buffer_size: 1024
+
+storage:
+  # 关系数据库：设备/用户/车辆/配置等低频变更数据（v1.x 兼容）
+  type: "sqlite"
+  dsn: "./data/jte.db"
+  # 历史数据归档保留时长（天），0 表示不清理
+  retention_days: 90
+
+  # v2.0 百亿级轨迹数据存储方案 - 时序库/缓存/对象存储分离
+  # 时序层：轨迹/报警/CAN等高频时序数据（文档第三章）
+  # 留空 driver 则不启用时序层，仍走关系库（向后兼容）
+  time_series:
+    driver: ""              # tdengine / iotdb / kingbase_ts，生产建议 tdengine
+    host: "127.0.0.1"
+    port: 6030
+    user: "root"
+    # AUTO-FIX-2026-07-04 [安全]: 密码通过环境变量 JTE_STORAGE_TIME_SERIES_PASSWORD 配置
+    # 留空时代码回退到 TDengine 默认密码（仅开发/测试环境）
+    password: ""
+    database: "jte_ts"
+    keep_days: 365           # 数据保留时长（TDengine KEEP 参数）
+    batch_size: 1000          # 异步批量写入大小
+    buffer_size: 10000        # 异步写入缓冲通道大小
+    flush_interval_ms: 100   # 异步 flush 间隔（毫秒）
+    # AUTO-FIX-2026-06-28: 集群部署参数（百亿级场景分片策略）
+    # 单节点部署全部留空使用默认值即可；集群部署按规模调整
+    replica: 1                # 副本数（1/3，默认 1；生产环境建议 3 保证高可用）
+    vgroups: 10               # 超级表初始 VGroup 数（默认 10；百亿级场景建议 100+）
+    days: 10                  # 数据文件存储周期（默认 10；与 KEEP 配合决定冷热分级）
+    blocks: 6                 # 每个 VGroup 内存块数（默认 6；写入吞吐不足时调大）
+
+    # v3.0 P0 #5：ws/unified WebSocket 连接（跨平台，无需安装客户端）
+    # 启用后优先走 Stmt2 写入路径（千万点/秒）+ LAST_ROW 查询（<10ms）
+    # 不启用则回退 database/sql + REST/原生驱动
+    ws_enabled: false         # 是否启用 ws/unified 引擎
+    # WebSocket DSN，支持多节点故障切换（v3.8.0+）：
+#   单节点：root:<password>@ws(127.0.0.1:6041)/jte_ts
+#   多节点：root:<password>@ws(node1:6041,node2:6041,node3:6041)/jte_ts?autoReconnect=true&reconnectRetryCount=10
+    # 留空则根据 host/port 自动构造单节点 DSN
+    ws_dsn: ""
+    # 多节点列表（与 ws_dsn 二选一），配置后自动构造多节点故障切换 DSN
+    # 示例：["node1:6041","node2:6041","node3:6041"]
+    ws_nodes: []
+    ws_skip_verify: false     # TLS 跳过证书校验（wss 时生效，生产环境必须 false）
+    ws_auto_reconnect: true   # 自动重连（默认 true）
+    ws_reconnect_retry_count: 10  # 重连次数（默认 10）
+    ws_read_timeout_ms: 0     # 读超时（毫秒，0=驱动默认）
+    ws_write_timeout_ms: 0    # 写超时（毫秒，0=驱动默认）
+    # v3.0 P2 #11：TLS 安全连接，启用后使用 wss 协议
+    ws_tls_enabled: false     # 生产环境建议 true（需 TDengine 服务端配置证书）
+
+    # v3.0 P2 #12：Worker Pool 并行批量写入
+    # 启用后 writeChan 不再由单 asyncWriter 消费，而是按 deviceID 哈希分发到多 worker
+    # 适用于高并发写入场景（>1万点/秒）
+    wp_enabled: false         # 是否启用 Worker Pool
+    wp_worker_count: 0        # worker 数量（0=runtime.NumCPU()，上限 16）
+    wp_batch_size: 1000       # 每个 worker 的批次大小
+    wp_flush_interval_ms: 100 # worker flush 间隔（毫秒）
+    wp_queue_size: 10000      # 每个 worker 的本地队列大小
+
+    # v3.0 P0 #3 补充：SchemalessInsert 无模式写入（需 ws_enabled=true）
+    # 适用于动态字段扩展、第三方设备自定义字段、灰度上线新字段
+    schemaless_enabled: false # 是否启用 SchemalessWriter
+    schemaless_protocol: 1    # 1=InfluxDB Line, 2=OpenTSDB Telnet, 3=OpenTSDB JSON
+    schemaless_precision: "ms" # ms/us/ns/s
+    schemaless_ttl: 0         # 数据保留时长（天，0=使用数据库默认 KEEP）
+    schemaless_table_name_key: "device_id" # 子表名提取键
+    schemaless_batch_size: 1000     # 单批次最大行数
+    schemaless_flush_interval_ms: 100 # flush 间隔（毫秒）
+
+    # v3.0 P0 #5 补充：TMQ 数据订阅（实时报警推送）
+    # 需先在 TDengine 中执行 CREATE TOPIC（见 schema.sql）
+    tmq_enabled: false        # 是否启用 TMQ 订阅
+    tmq_topics: []            # 订阅主题列表，如 ["topic_vehicle_alarm"]
+    tmq_group_id: "jte_consumer_group" # 消费者组
+    tmq_client_id: "jte_consumer_1"    # 消费者客户端 ID
+    tmq_auto_commit: true     # 自动提交 offset
+    tmq_auto_commit_interval_ms: 5000 # 自动提交间隔（毫秒）
+    tmq_poll_timeout_ms: 500  # 单次 Poll 阻塞时长（毫秒）
+
+  # 缓存层：在线状态/最新位置/会话/限流（文档第二章）
+  cache:
+    driver: ""              # redis，留空则不启用缓存层
+    mode: single            # single | sentinel | cluster，默认 single
+    addr: "127.0.0.1:6379"
+    # sentinel 模式
+    master_name: ""
+    sentinel_addrs: []
+    # cluster 模式
+    cluster_addrs: []
+    password: ""
+    db: 0
+    pool_size: 10
+    key_prefix: "jte:"       # 多租户/多实例隔离前缀
+    latest_location_ttl: 300 # 最新位置缓存 TTL（秒）
+    online_status_ttl: 120    # 在线状态缓存 TTL（秒）
+
+  # 对象存储：归档轨迹/原始视频（文档第二/五章）
+  object:
+    driver: ""              # minio / s3，留空则不启用对象存储
+    endpoint: "127.0.0.1:9000"
+    access_key: ""
+    secret_key: ""
+    bucket: "jte-archive"
+    region: ""
+    use_ssl: false
+    archive_bucket: "jte-archive"  # 历史轨迹归档 Bucket
+    video_bucket: "jte-video"     # 1078 原始录像 Bucket
+
+  # AUTO-FIX-2026-06-28: 离线归档任务（TDengine→MinIO jsonl）
+  # 启用后自动将时序库中超过 keep_days 的轨迹数据
+  # 按 batch_days 时间窗口导出为 NDJSON 上传到 object.archive_bucket，并从时序库删除
+  #
+  # AUTO-FIX-2026-07-02: enabled 默认改为 true，确保 3 年以上历史轨迹归档自动生效
+  # 归档流程：扫描设备 → 查询 TDengine → 序列化 JSONL → 上传 MinIO → 写标记 → 延迟删除
+  # 查询 fallback：当 TDengine 数据已删除时，自动从 MinIO 下载归档数据返回
+  archive:
+    enabled: true               # 是否启用归档任务（默认 true，确保历史数据自动迁移）
+    interval_hours: 24          # 调度间隔（小时，仅当 schedule_hour<=0 时生效）
+    keep_days: 0                # 保留天数（0 时回退到 time_series.keep_days）
+    ttl_buffer_days: 35         # TTL 保留缓冲天数，TTL = keep_days + ttl_buffer_days
+    batch_days: 1               # 单次归档时间窗口（天，默认 1）
+    dry_run: false              # 仅上传不删除，用于首次验证归档链路
+    schedule_hour: 2            # 每日定点调度小时（0-23，默认 2=凌晨2点；0=回退间隔调度）
+    max_device_scan: 0          # 单次最多扫描设备数（0=不限制，大规模车队建议 500）
+    delete_delay_days: 7        # 归档完成后延迟删除天数（默认 7，确保查询 fallback 窗口）
+    # 归档失败告警（钉钉/企业微信/通用 webhook）
+    # 配置 webhook_url 后，归档上传/删除失败时自动发送告警
+    alert:
+      webhook_url: ""           # 告警 webhook 地址（留空则不告警）
+      # 钉钉示例: https://oapi.dingtalk.com/robot/send?access_token=xxx
+      # 企业微信示例: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
+      alert_on_upload_fail: true   # 上传 MinIO 失败时告警
+      alert_on_delete_fail: true   # 从 TDengine 删除失败时告警
+      alert_threshold: 1           # 连续失败次数达到阈值才告警（默认 1=首次即告警）
+
+# 日志配置（等保2.0 三级要求：结构化 JSON + 敏感信息脱敏 + 日志分级）
+# AUTO-FIX-2026-07-02 [可观测性/日志规范]: 所有日志包含 trace_id/device_id/org_id
+logging:
+  level: "info"                    # 日志级别：debug/info/warn/error/fatal
+  format: "json"                   # 输出格式：json（等保2.0推荐）/ console（开发环境）
+  output: "stdout"                 # 输出目标：stdout/stderr/文件路径
+  file_path: ""                    # 文件路径（output 为文件路径时生效，权限 0640）
+  # 敏感信息脱敏（自动对日志字段值脱敏，业务代码无需修改）
+  # 敏感字段：phone/mobile/id_card/plate/email/password/token/auth_code 等
+  mask_sensitive: true             # 是否启用敏感字段自动脱敏
+  # 日志分级说明：
+  #   DEBUG — 调试信息（仅开发环境开启，生产环境关闭）
+  #   INFO  — 正常业务日志（消息接收/发送、连接建立/断开、归档任务等）
+  #   WARN  — 异常但可恢复（解析失败、重连、限流等）
+  #   ERROR — 业务错误（存储写入失败、API 调用失败等）
+  #   FATAL — 致命错误（配置加载失败、端口占用等，进程退出）
+
+# 可观测性配置（Prometheus 指标 + 健康检查 + OpenTelemetry 链路追踪）
+# AUTO-FIX-2026-07-02 [可观测性完善]: 监控/告警/健康检查/链路追踪
+telemetry:
+  # OpenTelemetry 链路追踪（可选，需 -tags otel 编译）
+  # 启用后 span 数据导出到 OTLP Collector / Jaeger
+  # 默认构建（无 otel tag）仅使用自研 trace_id 机制（注入 zap 日志字段）
+  otel_endpoint: ""                # OTLP collector 地址（如 "localhost:4318"），空则不启用
+  otel_service_name: "jte"         # 服务名（Jaeger 中显示的服务标识）
+  otel_sample_rate: 1.0            # 采样率 0-1（1.0 = 全采样，生产环境建议 0.1）
+
+  # 健康检查端点
+  # /health       — 基础健康状态（200=ok / 503=degraded）
+  # /health/live  — 存活检查（livenessProbe，进程存活即 200）
+  # /health/ready — 就绪检查（readinessProbe，依赖服务全部健康才 200）
+  # /healthz      — 兼容旧端点（等同 /health）
+  # /readyz       — 兼容旧端点（等同 /health/ready）
+  health_check:
+    enabled: true                  # 是否启用扩展健康检查
+    timeout: "3s"                  # 依赖服务检查超时（MySQL/Redis/TDengine/MinIO 并行检查）
+
+  # Prometheus 指标端点 /metrics
+  # 暴露指标（30+，按层级分类）：
+  #   协议层：jte_messages_received_total / jte_messages_sent_total /
+  #           jte_message_parse_errors_total / jte_active_connections
+  #   视频层：jte_video_packet_loss_rate / jte_video_bitrate_kbps /
+  #           jte_video_latency_ms / jte_video_concurrent_plays
+  #   AI 层：jte_ai_inference_duration_ms / jte_ai_model_hit_rate /
+  #          jte_ai_fallback_total / jte_ai_requests_total
+  #   存储层：jte_storage_write_failures_total / jte_tdengine_write_rate /
+  #           jte_tdengine_query_duration_seconds / jte_archive_progress
+  metrics:
+    enabled: true                  # 是否启用 /metrics 端点
+    path: "/metrics"               # 指标端点路径
+
+modules:
+  dir: "./modules"
+  signature_verify: true
+
+website:
+  url: "https://jte.dev"
+  api_url: "https://jte.dev/api/v1"
+
+# 鉴权与授权配置
+auth:
+  # 模块下载/激活时用于标识客户的 license key（可选，留空走试用）。
+  license_key: ""
+  # AUTO-FIX-2026-06-29 [P2]: 离线解绑凭证 HMAC 降级路径的应用密钥。
+  # 替换 license_manager.go 中原硬编码的 "jte-offline-unbind-v1-secret"。
+  #   - 留空：回退到内置默认值（仅向后兼容已签发的旧凭证，新部署不推荐）
+  #   - 配置后：必须 ≥32 字节随机值，且不得为已知占位符
+  # 生成命令：openssl rand -base64 48
+  # 校验规则见 config.go Load()，开发环境可设 JTE_ALLOW_INSECURE_JWT=1 跳过。
+  offline_unbind_secret: ""
+
+jt809:
+  platforms: []
+  server_port: 0
+
+zlmediakit:
+  url: "http://127.0.0.1:80"
+  secret: ""
+  # AUTO-FIX-2026-06-29 [P2]: openRtpServer 的 tcp_mode 配置化。
+  #   0 = 仅 UDP（不传 tcp_mode）
+  #   1 = TCP 主动模式（默认，ZLM 主动连接上游 1078 引擎）
+  #   2 = TCP 被动模式（ZLM 监听等待上游连接）
+  # 缺省时 media.NewZLMediaKitClient 兜底为 1，保持修复前硬编码行为。
+  tcp_mode: 1
+
+# AUTO-FIX-2026-06-26: TCP-RTP支持配置（按第一轮.txt要求）[2026-06-26]
+video:
+  rtp_mode: "udp"        # udp/tcp/auto，tcp时启动TCP-RTP监听器
+  stream_port: 0         # TCP-RTP监听端口，0=不启动，推荐9000
+  srtp:
+    enabled: false              # 是否启用 SRTP 加密
+    cipher_suite: "AES-128-CM"  # 加密套件：AES-128-CM | SM4-CBC
+    key_rotate_hours: 24        # 密钥轮换周期（小时）
+
+ai:
+  deepseek_api_key: ""
+  deepseek_url: "https://api.deepseek.com/v1"
+  ollama_url: "http://127.0.0.1:11434"
+  qwen_api_key: ""
+  timeout_seconds: 3            # 单次调用超时（秒）
+  retry_count: 3                # 失败重试次数
+  fallback_chain:               # 降级链路
+    - deepseek
+    - qwen
+    - ollama
+    - onnx
+    - rule
+  ratelimit:
+    per_customer_per_second: 10   # 单客户每秒请求上限
+    per_customer_per_day: 10000   # 单客户每日请求上限
+    global_per_second: 100        # 全局每秒请求上限
+  cache:
+    enabled: true               # 是否启用 AI 结果缓存
+    ttl_minutes: 60             # 缓存 TTL（分钟）
+
+ai_nlp:
+  deepseek_api_key: ""
+  deepseek_url: "https://api.deepseek.com/v1"
+
+# 国密配置（SM2/SM3/SM4）—— 等保2.0 三级要求
+# 启用后：
+#   1. 密码哈希使用 SM3（10000 次迭代 + 随机盐），向后兼容 bcrypt/SHA256 旧方案
+#   2. 关键数据（手机号/身份证/车牌）落库使用 SM4-GCM 加密，密文前缀 "enc:v1:"
+#   3. 审计日志启用 HMAC-SM3 链式防篡改（每条日志含 prevHash + hash）
+#   4. SM2 用于 JWT 签名/验签（需配置 sm2_cert_path/sm2_key_path）
+crypto:
+  enabled: false                # 是否启用国密（生产环境建议 true）
+  sm2_cert_path: ""             # SM2 证书路径（PEM 格式，JWT 签名用）
+  sm2_key_path: ""              # SM2 私钥路径（PEM 格式，JWT 签名用）
+  # SM4 对称密钥（16 字节 = 32 hex 字符）；为空时从环境变量 JTE_SM4_KEY 读取
+  # 生成命令：openssl rand -hex 16
+  sm4_key: ""                   # 例："" 或 "00112233445566778899aabbccddeeff"
+  hash_algorithm: "sm3"         # 哈希算法：sm3 | sha256
+
+# 等保2.0 登录安全配置（防克隆加固）
+# 登录失败锁定 + 设备指纹绑定 + 多IP/异地/新设备登录告警
+login_guard:
+  max_failures: 5               # 最大失败次数（超过锁定）
+  lockout_duration: "15m"       # 锁定时长
+  history_limit: 20             # 登录历史保留条数
+  remote_login_threshold_km: 500 # 异地登录告警阈值（公里）
+  # GeoIP 查询服务（可选，异地登录检测需要）
+  geoip_provider: ""            # maxmind | ipapi | ip2region，为空则不检测异地登录
+  geoip_db_path: ""             # MaxMind GeoIP2 数据库路径
+
+# 监控告警配置
+monitor:
+  enabled: true                 # 是否启用监控告警
+  alert_channels:
+    dingtalk:
+      enabled: false            # 是否启用钉钉告警
+      webhook: ""               # 钉钉机器人 webhook
+    wechat:
+      enabled: false            # 是否启用企业微信告警
+      webhook: ""               # 企业微信机器人 webhook
+    email:
+      enabled: false            # 是否启用邮件告警
+      smtp_host: ""             # SMTP 主机
+      smtp_port: 587            # SMTP 端口
+      username: ""              # 发件账号
+      password: ""              # 发件密码
+      to: []                    # 收件人列表
+    webhook:
+      enabled: false            # 是否启用通用 webhook 告警
+      url: ""                   # 通用 webhook 地址
+
+# 地图配置
+map:
+  provider: "tianditu"          # tianditu | amap | baidu
+  tianditu_key: ""              # 天地图 API Key
+  amap_key: ""                  # 高德地图 API Key
+  baidu_key: ""                 # 百度地图 API Key
+  center_longitude: 116.3974    # 默认中心点经度
+  center_latitude: 39.9093      # 默认中心点纬度
+  zoom: 5                       # 默认缩放级别
+
+# 优雅停机 / 蓝绿部署排空配置 [P1-1/P1-2]
+shutdown:
+  drain_timeout_seconds: 300          # 等待设备连接排空最长时间（秒），超时强制关闭。蓝绿部署 Blue 节点最大存活窗口
+  api_shutdown_timeout_seconds: 10    # HTTP API 优雅停机超时（秒），等待在途请求完成
+  reconnect_backoff_max_seconds: 300  # 下发终端重连退避上限（秒）。安全场景 300；蓝绿部署可设 60 加速重连
+  drain_check_interval_seconds: 5     # 排空检查间隔（秒），每隔此时间检查剩余连接数

@@ -1,0 +1,71 @@
+# ============================================================================
+# JTE Engine Prometheus 抓取配置
+#
+# 使用方式：
+#   1. 将本文件放到 Prometheus 配置目录
+#   2. 启动 Prometheus: prometheus --config.file=/path/to/prometheus.yml
+#   3. 告警规则通过 rule_files 加载 alerts.yaml
+# ============================================================================
+
+global:
+  scrape_interval: 15s        # 默认抓取间隔
+  evaluation_interval: 15s    # 告警规则评估间隔
+  external_labels:
+    monitor: 'jte-monitor'
+
+# 告警规则文件
+rule_files:
+  - alerts.yaml
+  # - /etc/prometheus/rules/*.yaml
+
+# Alertmanager 配置（告警通知）
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'alertmanager:9093'  # Alertmanager 地址
+
+# 抓取目标
+scrape_configs:
+  # JTE Engine 主服务指标
+  - job_name: 'jte-engine'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets:
+          - 'localhost:8080'  # JTE API 服务地址
+        labels:
+          service: 'jte'
+          env: 'production'
+
+  # JTE 模块进程指标（进程模式部署时各模块独立暴露）
+  - job_name: 'jte-modules'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets:
+          - 'localhost:9101'  # module-protocol-808
+          - 'localhost:9102'  # module-protocol-809
+          - 'localhost:9103'  # module-protocol-1078
+          - 'localhost:9104'  # module-storage
+          - 'localhost:9105'  # module-ai
+        labels:
+          service: 'jte-module'
+
+  # Node Exporter（主机指标）
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+
+  # MySQL Exporter
+  - job_name: 'mysql'
+    static_configs:
+      - targets: ['mysql-exporter:9104']
+
+  # Redis Exporter
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  # TDengine 指标（内置 taosKeeper）
+  - job_name: 'tdengine'
+    static_configs:
+      - targets: ['tdengine:6043']

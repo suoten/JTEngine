@@ -1,0 +1,18 @@
+{
+  "title": "报警管理",
+  "list": "报警列表",
+  "type": "报警类型",
+  "level": "报警级别",
+  "source": "报警来源",
+  "time": "报警时间",
+  "location": "报警位置",
+  "filter": "报警筛选",
+  "startTime": "开始时间",
+  "endTime": "结束时间",
+  "levelLow": "低",
+  "levelMedium": "中",
+  "levelHigh": "高",
+  "levelCritical": "紧急",
+  "handleAlarm": "处理报警",
+  "alarmStats": "报警统计"
+}

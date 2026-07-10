@@ -1,0 +1,16 @@
+{
+  "title": "Video Monitoring",
+  "live": "Live Monitoring",
+  "playback": "Video Playback",
+  "channel": "Channel",
+  "streamType": "Stream Type",
+  "mainStream": "Main Stream",
+  "subStream": "Sub Stream",
+  "startStream": "Start Stream",
+  "stopStream": "Stop Stream",
+  "mediaType": "Media Type",
+  "video": "Video",
+  "audio": "Audio",
+  "avBoth": "Audio & Video",
+  "historyQuery": "History Query"
+}

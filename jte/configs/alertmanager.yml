@@ -1,0 +1,91 @@
+# ============================================================================
+# JTE Engine Alertmanager 告警通知配置
+#
+# 验收标准 v3.0 §14.9：告警 — Alertmanager 5分钟内通知
+#
+# 告警通道：钉钉/企业微信 Webhook + 邮件
+# ============================================================================
+
+global:
+  resolve_timeout: 5m
+  # SMTP 邮件配置（按需启用，凭据通过环境变量注入，禁止在配置文件中明文存储）
+  # smtp_smarthost: 'smtp.example.com:587'
+  # smtp_from: 'alert@jte.dev'
+  # smtp_auth_username: 'alert@jte.dev'
+  # smtp_auth_password: '${SMTP_CREDENTIAL}'  # 从环境变量 SMTP_CREDENTIAL 读取
+
+# 告警路由规则
+route:
+  group_by: ['alertname', 'service', 'severity']
+  group_wait: 10s        # 首次告警等待 10s（聚合同类告警）
+  group_interval: 30s    # 同组告警间隔
+  repeat_interval: 4h    # 重复告警间隔
+  receiver: 'default'
+  routes:
+    # Critical 级别 → 立即发送到所有通道
+    - match:
+        severity: critical
+      receiver: 'critical-all'
+      group_wait: 0s
+      repeat_interval: 1h
+    # Warning 级别 → 钉钉+邮件
+    - match:
+        severity: warning
+      receiver: 'warning-notify'
+      repeat_interval: 4h
+    # Info 级别 → 仅记录
+    - match:
+        severity: info
+      receiver: 'info-log'
+
+receivers:
+  # 默认接收器（记录到日志）
+  - name: 'default'
+    webhook_configs:
+      - url: 'http://jte:8080/api/v1/webhook/alert'
+        send_resolved: true
+
+  # Critical 级别：钉钉 + 企业微信 + 邮件
+  - name: 'critical-all'
+    webhook_configs:
+      # 钉钉机器人（access_token 通过环境变量注入）
+      - url: 'https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_ACCESS_TOKEN}'
+        send_resolved: true
+        max_alerts: 0
+      # 企业微信群机器人（key 通过环境变量注入）
+      - url: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${WECOM_BOT_KEY}'
+        send_resolved: true
+    # email_configs:
+    #   - to: 'ops@jte.dev'
+    #     headers:
+    #       Subject: '[JTE Critical] {{ .GroupLabels.alertname }}'
+
+  # Warning 级别：钉钉 + 邮件
+  - name: 'warning-notify'
+    webhook_configs:
+      - url: 'https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_ACCESS_TOKEN}'
+        send_resolved: true
+    # email_configs:
+    #   - to: 'ops@jte.dev'
+
+  # Info 级别：仅 webhook 记录
+  - name: 'info-log'
+    webhook_configs:
+      - url: 'http://jte:8080/api/v1/webhook/alert'
+        send_resolved: false
+
+# 告警抑制规则
+inhibit_rules:
+  # 如果某服务有 Critical 告警，抑制同服务的 Warning
+  - source_match:
+      severity: critical
+    target_match:
+      severity: warning
+    equal: ['service', 'instance']
+
+  # 如果模块崩溃（Critical），抑制该模块的其他 Warning
+  - source_match:
+      alertname: JTEModuleDown
+    target_match_re:
+      alertname: 'JTE.*'
+    equal: ['module']

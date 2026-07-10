@@ -1,0 +1,124 @@
+# ============================================================================
+# JTE Engine 可观测性基础设施 Docker Compose
+#
+# 验收标准 v3.0 §14.9：可观测性验收
+#   - Prometheus：指标采集
+#   - Loki + Promtail：日志聚合
+#   - Alertmanager：告警通知
+#   - Grafana：可视化面板
+#
+# 使用方式：
+#   docker-compose -f docker-compose-observability.yml up -d
+#
+# 端口映射：
+#   Prometheus:  http://localhost:9090
+#   Loki:        http://localhost:3100
+#   Promtail:    http://localhost:9080
+#   Alertmanager: http://localhost:9093
+#   Grafana:     http://localhost:3000  (admin/admin)
+# ============================================================================
+
+version: "3.8"
+
+services:
+  # ---------- Prometheus 指标采集 ----------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: jte-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./configs/alerts.yaml:/etc/prometheus/alerts.yaml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - jte-observability
+
+  # ---------- Loki 日志聚合 ----------
+  loki:
+    image: grafana/loki:2.9.4
+    container_name: jte-loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+      - "9096:9096"
+    volumes:
+      - ./configs/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - jte-observability
+
+  # ---------- Promtail 日志采集 ----------
+  promtail:
+    image: grafana/promtail:2.9.4
+    container_name: jte-promtail
+    restart: unless-stopped
+    ports:
+      - "9080:9080"
+    volumes:
+      - ./configs/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    networks:
+      - jte-observability
+
+  # ---------- Alertmanager 告警通知 ----------
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: jte-alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./configs/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    networks:
+      - jte-observability
+
+  # ---------- Grafana 可视化面板 ----------
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: jte-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./configs/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./configs/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - jte-observability
+
+volumes:
+  prometheus-data:
+  loki-data:
+  alertmanager-data:
+  grafana-data:
+
+networks:
+  jte-observability:
+    driver: bridge

@@ -1,0 +1,120 @@
+# JTE Prometheus 监控配置
+# 
+# 本文件定义 JTE 引擎的 Prometheus 监控指标采集规则。
+# JTE 引擎通过 GET /metrics 端点暴露 Prometheus 格式指标。
+
+groups:
+  - name: jte_engine
+    interval: 15s
+    rules:
+      # === 网关指标 ===
+      - record: jte:online_devices
+        expr: jte_gateway_online_devices
+      
+      - record: jte:total_connections
+        expr: jte_gateway_total_connections
+      
+      - record: jte:connection_rate
+        expr: rate(jte_gateway_connections_total[5m])
+      
+      - record: jte:disconnection_rate
+        expr: rate(jte_gateway_disconnections_total[5m])
+      
+      # === 协议指标 ===
+      - record: jte:messages_received_rate
+        expr: rate(jte_protocol_messages_total[5m])
+      
+      - record: jte:messages_sent_rate
+        expr: rate(jte_protocol_messages_sent_total[5m])
+      
+      - record: jte:message_parse_errors_rate
+        expr: rate(jte_protocol_parse_errors_total[5m])
+      
+      # === 存储指标 ===
+      - record: jte:storage_write_rate
+        expr: rate(jte_storage_writes_total[5m])
+      
+      - record: jte:storage_read_latency_p99
+        expr: histogram_quantile(0.99, rate(jte_storage_read_duration_seconds_bucket[5m]))
+      
+      - record: jte:storage_write_latency_p99
+        expr: histogram_quantile(0.99, rate(jte_storage_write_duration_seconds_bucket[5m]))
+      
+      # === 报警指标 ===
+      - record: jte:alarm_rate
+        expr: rate(jte_alarms_total[5m])
+      
+      - record: jte:alarms_by_type
+        expr: sum by (type) (jte_alarms_total)
+      
+      # === 内存指标 ===
+      - record: jte:memory_mb
+        expr: process_resident_memory_bytes / (1024 * 1024)
+      
+      - record: jte:goroutines
+        expr: go_goroutines
+      
+      # === HTTP API 指标 ===
+      - record: jte:http_request_rate
+        expr: rate(jte_http_requests_total[5m])
+      
+      - record: jte:http_error_rate
+        expr: rate(jte_http_requests_total{status=~"5.."}[5m]) / rate(jte_http_requests_total[5m])
+
+  - name: jte_alerts
+    interval: 30s
+    rules:
+      # === 告警规则 ===
+      - alert: JTEHighMemoryUsage
+        expr: jte:memory_mb > 2048
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JTE 内存使用过高"
+          description: "JTE 引擎内存使用 {{ $value }}MB，超过 2048MB 阈值"
+      
+      - alert: JTEGoroutineLeak
+        expr: jte:goroutines > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JTE goroutine 数量异常"
+          description: "goroutine 数量 {{ $value }}，可能存在泄漏"
+      
+      - alert: JTEHighDisconnectionRate
+        expr: jte:disconnection_rate > 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "JTE 设备断连率过高"
+          description: "设备断连率 {{ $value }}/s，超过 10/s 阈值"
+      
+      - alert: JTEStorageLatencyHigh
+        expr: jte:storage_write_latency_p99 > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JTE 存储写入延迟过高"
+          description: "P99 延迟 {{ $value }}s，超过 0.5s 阈值"
+      
+      - alert: JTEHighHTTPErrRate
+        expr: jte:http_error_rate > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "JTE HTTP 错误率过高"
+          description: "5xx 错误率 {{ $value | humanizePercentage }}，超过 5%"
+      
+      - alert: JTEServiceDown
+        expr: up{job="jte-engine"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "JTE 服务不可达"
+          description: "JTE 引擎 {{ $labels.instance }} 已离线超过 1 分钟"

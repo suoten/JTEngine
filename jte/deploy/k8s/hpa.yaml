@@ -1,0 +1,59 @@
+# JTE 主引擎 HPA 自动扩缩容配置
+# 基于 CPU/内存使用率自动扩缩容
+#
+# 前置条件：
+#   1. 集群已安装 metrics-server
+#   2. 目标 Deployment 已设置 resources.requests
+#
+# 使用：kubectl apply -f hpa.yaml
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: jte-hpa
+  namespace: jte
+  labels:
+    app: jte
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: jte-blue  # 蓝绿部署中指向 active 的 Deployment
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    # CPU 使用率超过 70% 扩容
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # 内存使用率超过 80% 扩容
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    # 扩容策略：快速扩容应对突发流量
+    scaleUp:
+      stabilizationWindowSeconds: 30  # 30 秒稳定窗口
+      policies:
+        - type: Percent
+          value: 100  # 每次最多翻倍
+          periodSeconds: 30
+        - type: Pods
+          value: 4  # 或每次最多加 4 个 Pod
+          periodSeconds: 30
+      selectPolicy: Max
+    # 缩容策略：缓慢缩容避免抖动
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 分钟稳定窗口
+      policies:
+        - type: Percent
+          value: 25  # 每次最多缩 25%
+          periodSeconds: 60
+      selectPolicy: Min

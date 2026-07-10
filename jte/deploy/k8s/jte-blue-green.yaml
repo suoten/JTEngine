@@ -1,0 +1,297 @@
+# JTE 蓝绿部署 Kubernetes 清单
+# AUTO-FIX-2026-06-30 [P1-1]: 零停机部署
+#
+# 架构：
+#   - Service (jte-svc) 指向 active 的 Deployment（Blue 或 Green）
+#   - 两个 Deployment：jte-blue（当前生产）+ jte-green（新版本，不接流量）
+#   - 切换流程：Green 健康检查通过 → Service selector 切到 green → Blue 排空 → Blue 下线
+#
+# 使用：
+#   1. 部署：kubectl apply -f jte-blue-green.yaml
+#   2. 切换：./blue-green-switch.sh (Green 健康检查通过后切流量)
+#   3. 回滚：./blue-green-switch.sh --rollback (切回 Blue)
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jte
+
+---
+# ConfigMap 共享配置（Blue/Green 共用）
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jte-config
+  namespace: jte
+data:
+  jte.yaml: |
+    server:
+      host: "0.0.0.0"
+      port: 7611
+    gateway:
+      tcp_port: 7611
+      max_connections: 120000
+    api:
+      enabled: true
+      port: 8080
+    shutdown:
+      drain_timeout_seconds: 300
+      api_shutdown_timeout_seconds: 10
+      reconnect_backoff_max_seconds: 60
+      drain_check_interval_seconds: 5
+
+---
+# Secret 敏感配置（生产环境用 SealedSecrets/External Secrets 替代）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jte-secrets
+  namespace: jte
+type: Opaque
+stringData:
+  mysql_dsn: "jte:${MYSQL_PASSWORD}@tcp(mysql:3306)/jte?parseTime=true"
+  redis_addr: "redis:6379"
+  tdengine_dsn: "root:${TDENGINE_PASSWORD}@ws(tdengine1:6041,tdengine2:6041,tdengine3:6041)/jte_ts"
+
+---
+# Blue Deployment（当前生产版本）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jte-blue
+  namespace: jte
+  labels:
+    app: jte
+    slot: blue
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: jte
+      slot: blue
+  template:
+    metadata:
+      labels:
+        app: jte
+        slot: blue
+    spec:
+      terminationGracePeriodSeconds: 330  # drain_timeout(300) + 30s buffer
+      containers:
+      - name: jte
+        image: jte-engine:latest
+        ports:
+        - containerPort: 7611
+          name: gateway
+        - containerPort: 8080
+          name: api
+        env:
+        - name: JTE_ACTIVE_SLOT
+          value: "blue"
+        envFrom:
+        - secretRef:
+            name: jte-secrets
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+        - name: data
+          mountPath: /app/data
+        - name: spool
+          mountPath: /app/spool
+        # 就绪探针：维护模式期间返回 503，自动摘流
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 3
+        # 存活探针：进程卡死时重启
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+        # 启动探针：慢启动场景（加载模块/连 DB）给足时间
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 60  # 最多等 5 分钟启动
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "2Gi"
+          limits:
+            cpu: "4000m"
+            memory: "8Gi"
+        # 优雅停机：SIGTERM → 拒绝新连接 → 下发退避 → 排空 5 分钟 → 退出
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]
+      volumes:
+      - name: config
+        configMap:
+          name: jte-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: jte-data-blue
+      - name: spool
+        emptyDir: {}
+
+---
+# Green Deployment（新版本，初始不接流量）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jte-green
+  namespace: jte
+  labels:
+    app: jte
+    slot: green
+spec:
+  replicas: 0  # 初始 0 副本，切换时扩容
+  selector:
+    matchLabels:
+      app: jte
+      slot: green
+  template:
+    metadata:
+      labels:
+        app: jte
+        slot: green
+    spec:
+      terminationGracePeriodSeconds: 330
+      containers:
+      - name: jte
+        image: jte-engine:latest  # 切换前更新为新版本 tag
+        ports:
+        - containerPort: 7611
+          name: gateway
+        - containerPort: 8080
+          name: api
+        env:
+        - name: JTE_ACTIVE_SLOT
+          value: "green"
+        envFrom:
+        - secretRef:
+            name: jte-secrets
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+        - name: data
+          mountPath: /app/data
+        - name: spool
+          mountPath: /app/spool
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 60
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "2Gi"
+          limits:
+            cpu: "4000m"
+            memory: "8Gi"
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]
+      volumes:
+      - name: config
+        configMap:
+          name: jte-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: jte-data-green
+      - name: spool
+        emptyDir: {}
+
+---
+# Service 通过 selector 切换 Blue/Green
+apiVersion: v1
+kind: Service
+metadata:
+  name: jte-svc
+  namespace: jte
+  labels:
+    app: jte
+spec:
+  type: ClusterIP
+  selector:
+    app: jte
+    slot: blue  # 初始指向 Blue，切换时改为 green
+  ports:
+  - name: gateway
+    port: 7611
+    targetPort: 7611
+  - name: api
+    port: 8080
+    targetPort: 8080
+
+---
+# PVC for Blue
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jte-data-blue
+  namespace: jte
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# PVC for Green
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jte-data-green
+  namespace: jte
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# PodDisruptionBudget 保障 voluntary disruption 期间最少可用副本
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: jte-pdb
+  namespace: jte
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: jte

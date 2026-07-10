@@ -1,0 +1,328 @@
+package handler
+
+// ===================================================================
+// AUTO-FIX-2026-07-02 [可观测性完善]: 健康检查端点（等保2.0 + 云原生）
+//
+// 端点设计（Kubernetes/蓝绿部署兼容）：
+//   /health        — 基础健康状态（进程存活 + 版本 + 运行时长）
+//   /health/live   — 存活检查（进程存活即 200，不检查依赖）
+//   /health/ready  — 就绪检查（依赖服务检查：MySQL/Redis/TDengine/MinIO）
+//   /healthz       — 兼容旧端点（等价 /health/live）
+//   /readyz        — 兼容旧端点（等价 /health/ready，含维护模式检查）
+//
+// 依赖检查器（DependencyChecker）：
+//   - MySQL/达梦：SELECT 1
+//   - Redis：PING
+//   - TDengine：SHOW DATABASES
+//   - MinIO：ListBuckets
+//
+// 响应格式：
+//   200 OK    {"status":"ok","checks":{"mysql":"ok","redis":"ok",...}}
+//   503 Down  {"status":"degraded","checks":{"mysql":"down","redis":"ok",...}}
+// ===================================================================
+
+import (
+	"context"
+	"database/sql"
+	"net/http"
+	"runtime"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/jte-engine/jte/internal/gateway"
+	"github.com/jte-engine/jte/internal/maintenance"
+	"go.uber.org/zap"
+)
+
+// DependencyChecker 依赖服务健康检查接口
+// 每个依赖服务（MySQL/Redis/TDengine/MinIO）实现该接口，
+// HealthHandler 在 /health/ready 时并行调用所有检查器。
+type DependencyChecker interface {
+	// Name 返回依赖服务名（如 "mysql"、"redis"、"tdengine"、"minio"）
+	Name() string
+	// Check 执行健康检查，返回 nil 表示健康，error 表示不健康
+	Check(ctx context.Context) error
+}
+
+// ==================== 内置依赖检查器 ====================
+
+// SQLChecker MySQL/达梦/SQLite 健康检查器
+type SQLChecker struct {
+	name string
+	db   *sql.DB
+}
+
+func NewSQLChecker(name string, db *sql.DB) *SQLChecker {
+	return &SQLChecker{name: name, db: db}
+}
+
+func (c *SQLChecker) Name() string { return c.name }
+func (c *SQLChecker) Check(ctx context.Context) error {
+	if c.db == nil {
+		return errDependencyNotConfigured(c.name)
+	}
+	return c.db.PingContext(ctx)
+}
+
+// RedisChecker Redis 健康检查器（通过通用 ping 函数注入，避免硬依赖 redis 客户端）
+type RedisChecker struct {
+	name string
+	ping func(ctx context.Context) error
+}
+
+func NewRedisChecker(name string, ping func(ctx context.Context) error) *RedisChecker {
+	return &RedisChecker{name: name, ping: ping}
+}
+
+func (c *RedisChecker) Name() string { return c.name }
+func (c *RedisChecker) Check(ctx context.Context) error {
+	if c.ping == nil {
+		return errDependencyNotConfigured(c.name)
+	}
+	return c.ping(ctx)
+}
+
+// HTTPChecker 通用 HTTP 健康检查器（MinIO/TDengine REST API 等）
+type HTTPChecker struct {
+	name string
+	url  string
+}
+
+func NewHTTPChecker(name, url string) *HTTPChecker {
+	return &HTTPChecker{name: name, url: url}
+}
+
+func (c *HTTPChecker) Name() string { return c.name }
+func (c *HTTPChecker) Check(ctx context.Context) error {
+	if c.url == "" {
+		return errDependencyNotConfigured(c.name)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		return errHTTPStatus(c.name, resp.StatusCode)
+	}
+	return nil
+}
+
+// errDependencyNotConfigured 依赖未配置错误
+func errDependencyNotConfigured(name string) error {
+	return &dependencyError{name: name, reason: "not configured"}
+}
+
+// errHTTPStatus HTTP 状态码异常
+func errHTTPStatus(name string, code int) error {
+	return &dependencyError{name: name, reason: "http status " + http.StatusText(code)}
+}
+
+type dependencyError struct {
+	name   string
+	reason string
+}
+
+func (e *dependencyError) Error() string { return e.name + ": " + e.reason }
+
+// ==================== 健康检查 Handler ====================
+
+// ExtendedHealthHandler 扩展健康检查处理器
+// 提供 /health、/health/live、/health/ready 端点，支持依赖服务检查。
+type ExtendedHealthHandler struct {
+	*HealthHandler
+	checkers      []DependencyChecker
+	checkTimeout  time.Duration
+	startTime     time.Time
+	version       string
+	logger        *zap.Logger
+	dependencies  map[string]bool // 配置的依赖名集合（用于区分"未配置"和"未检查"）
+}
+
+// NewExtendedHealthHandler 创建扩展健康检查处理器
+// checkers: 依赖服务检查器列表（MySQL/Redis/TDengine/MinIO）
+// version: 应用版本号
+// dependencies: 已配置的依赖名集合（用于 /health/ready 报告配置状态）
+func NewExtendedHealthHandler(
+	sessions *gateway.SessionManager,
+	mm *maintenance.Mode,
+	startTime time.Time,
+	version string,
+	logger *zap.Logger,
+	checkers ...DependencyChecker,
+) *ExtendedHealthHandler {
+	deps := make(map[string]bool, len(checkers))
+	for _, c := range checkers {
+		deps[c.Name()] = true
+	}
+	return &ExtendedHealthHandler{
+		HealthHandler: NewHealthHandler(sessions, mm, startTime),
+		checkers:      checkers,
+		checkTimeout:  3 * time.Second,
+		startTime:     startTime,
+		version:       version,
+		logger:        logger,
+		dependencies:  deps,
+	}
+}
+
+// Health 基础健康状态端点 /health
+// 返回进程存活状态 + 版本 + 运行时长 + 连接数 + 内存使用
+func (h *ExtendedHealthHandler) Health(c *gin.Context) {
+	uptime := int64(time.Since(h.startTime).Seconds())
+	connections := 0
+	if h.sessions != nil {
+		connections = h.sessions.OnlineCount()
+	}
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	memoryMB := ms.Sys / (1024 * 1024)
+	goroutines := runtime.NumGoroutine()
+
+	status := "ok"
+	httpCode := http.StatusOK
+	if h.maintenanceMode != nil && h.maintenanceMode.IsActive() {
+		status = "maintenance"
+	}
+
+	c.JSON(httpCode, gin.H{
+		"status":      status,
+		"version":     h.version,
+		"uptime":      uptime,
+		"connections": connections,
+		"memory_mb":   memoryMB,
+		"goroutines":  goroutines,
+		"timestamp":   time.Now().Format(time.RFC3339),
+	})
+}
+
+// Live 存活检查端点 /health/live
+// 仅检查进程存活（不检查依赖），用于 Kubernetes livenessProbe
+func (h *ExtendedHealthHandler) Live(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "alive",
+		"uptime":    int64(time.Since(h.startTime).Seconds()),
+		"timestamp": time.Now().Format(time.RFC3339),
+	})
+}
+
+// Ready 就绪检查端点 /health/ready
+// 检查所有依赖服务健康状态，任一依赖不健康返回 503
+// 用于 Kubernetes readinessProbe 和蓝绿部署流量切换
+func (h *ExtendedHealthHandler) Ready(c *gin.Context) {
+	// 维护模式期间不就绪
+	if h.maintenanceMode != nil && h.maintenanceMode.IsActive() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status":    "not_ready",
+			"reason":    "maintenance mode active",
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+		return
+	}
+
+	// 并行执行所有依赖检查
+	checks := h.runChecks(c.Request.Context())
+
+	// 汇总状态
+	allHealthy := true
+	for _, result := range checks {
+		if result["status"] != "ok" {
+			allHealthy = false
+		}
+	}
+
+	httpCode := http.StatusOK
+	status := "ready"
+	if !allHealthy {
+		httpCode = http.StatusServiceUnavailable
+		status = "degraded"
+	}
+
+	c.JSON(httpCode, gin.H{
+		"status":    status,
+		"checks":    checks,
+		"timestamp": time.Now().Format(time.RFC3339),
+	})
+}
+
+// checkResult 单个依赖检查结果
+type checkResult struct {
+	name    string
+	status  string // "ok" / "down" / "skipped"
+	err     error
+	latency time.Duration
+}
+
+// runChecks 并行执行所有依赖检查，返回结果 map
+func (h *ExtendedHealthHandler) runChecks(parent context.Context) map[string]map[string]interface{} {
+	if len(h.checkers) == 0 {
+		return map[string]map[string]interface{}{
+			"_summary": {"status": "ok", "message": "no dependencies configured"},
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(parent, h.checkTimeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	results := make([]checkResult, len(h.checkers))
+
+	for i, checker := range h.checkers {
+		wg.Add(1)
+		go func(idx int, ck DependencyChecker) {
+			defer wg.Done()
+			start := time.Now()
+			err := ck.Check(ctx)
+			latency := time.Since(start)
+
+			result := checkResult{
+				name:    ck.Name(),
+				latency: latency,
+			}
+			if err != nil {
+				result.status = "down"
+				result.err = err
+			} else {
+				result.status = "ok"
+			}
+			results[idx] = result
+		}(i, checker)
+	}
+	wg.Wait()
+
+	// 转为 map
+	checks := make(map[string]map[string]interface{}, len(results))
+	for _, r := range results {
+		entry := map[string]interface{}{
+			"status":  r.status,
+			"latency": r.latency.String(),
+		}
+		if r.err != nil {
+			entry["error"] = r.err.Error()
+		}
+		checks[r.name] = entry
+	}
+	return checks
+}
+
+// AddChecker 动态添加依赖检查器（供 SetStorageLayers 后注入 TDengine/MinIO 检查器）
+func (h *ExtendedHealthHandler) AddChecker(checker DependencyChecker) {
+	if checker == nil {
+		return
+	}
+	h.checkers = append(h.checkers, checker)
+	h.dependencies[checker.Name()] = true
+}
+
+// SetCheckTimeout 设置依赖检查超时时间（默认 3 秒）
+func (h *ExtendedHealthHandler) SetCheckTimeout(d time.Duration) {
+	if d > 0 {
+		h.checkTimeout = d
+	}
+}

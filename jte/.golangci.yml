@@ -1,0 +1,76 @@
+# golangci-lint 配置 — JTE 项目代码质量规范
+# 运行: golangci-lint run ./...
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - errcheck       # 检查未处理的错误
+    - gosimple       # 简化代码
+    - govet          # go vet 检查
+    - ineffassign    # 检查无效赋值
+    - staticcheck    # 综合静态检查
+    - typecheck      # 类型检查
+    - unused         # 未使用代码检查
+    - misspell       # 拼写检查
+    - revive         # 代码规范（替代 golint）
+    - gofmt          # 格式化检查
+    - goimports      # import 排序检查
+    - bodyclose      # http.Response.Body.Close 检查
+    - dupl           # 重复代码检测
+    - funlen         # 函数长度限制
+    - gocognit       # 认知复杂度
+    - gocritic       # 代码评审建议
+    - gocyclo        # 圈复杂度
+    - nakedret       # 裸 return 检查
+    - prealloc       # 切片预分配建议
+    - unconvert      # 不必要的类型转换
+    - unparam        # 未使用的函数参数
+    - whitespace     # 多余空行
+
+linters-settings:
+  funlen:
+    lines: 80
+    statements: 50
+  gocyclo:
+    min-complexity: 25
+  gocognit:
+    min-complexity: 30
+  dupl:
+    threshold: 120
+  misspell:
+    locale: US
+  revive:
+    rules:
+      - name: exported
+        disabled: true  # 允许未注释导出函数（渐进式启用）
+
+issues:
+  exclude-rules:
+    # 测试文件放宽限制
+    - path: _test\.go
+      linters:
+        - funlen
+        - gocyclo
+        - gocognit
+        - dupl
+        - errcheck
+    # main 包放宽限制
+    - path: cmd/
+      linters:
+        - funlen
+        - gocyclo
+    # 生成代码跳过
+    - path: ".*\\.gen\\.go$"
+      linters:
+        - all
+  max-issues-per-linter: 50
+  max-same-issues: 10
+
+output:
+  formats:
+    - format: colored-line-number
+  sort-results: true

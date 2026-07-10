@@ -1,0 +1,63 @@
+# JTE 开源仓库 .gitignore
+
+# 构建产物
+jte/bin/
+jte/jte
+jte/jte.exe
+jte/loadtest
+jte/loadtest.exe
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+
+# 运行时数据（永不提交）
+jte/data/
+jte/modules/*.so
+jte/modules/*.sig
+jte/modules/*.dll
+jte/spool/
+jte/logs/
+
+# 前端构建产物
+jte/web/node_modules/
+jte/web/dist/
+
+# 覆盖率
+jte/coverage.out
+jte/coverage.html
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 敏感文件（永不提交）
+*.pem
+*.key
+.env
+.env.local
+.env.production
+jte/configs/jte.local.yaml
+
+# 开发工具配置（不进开源仓库）
+.trae/
+.codeartsdoer/
+.loopengine/
+.mypy_cache/
+.ruff_cache/
+.uploads/
+
+# 临时文件
+*.tmp
+*.bak
+*.log

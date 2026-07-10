@@ -1,0 +1,19 @@
+{
+  "title": "AI Analysis",
+  "alarmFilter": "Alarm Smart Filter",
+  "riskScore": "Risk Score",
+  "fatigueDetect": "Fatigue Detection",
+  "anomalyDetect": "Anomaly Detection",
+  "trajectoryPredict": "Trajectory Prediction",
+  "filterAccuracy": "Filter Accuracy",
+  "fatigueLevel": "Fatigue Level",
+  "fatigueSuggestion": "Suggestion",
+  "riskFactors": "Risk Factors",
+  "anomalyType": "Anomaly Type",
+  "suddenAccel": "Sudden Acceleration",
+  "suddenDecel": "Sudden Deceleration",
+  "sharpTurn": "Sharp Turn",
+  "deviation": "Deviation",
+  "abnormalStop": "Abnormal Stop",
+  "updateRules": "Update Rules"
+}

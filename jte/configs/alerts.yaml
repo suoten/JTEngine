@@ -1,0 +1,317 @@
+# ============================================================================
+# JTE Engine Prometheus 告警规则（等保2.0 + 车联网监控）
+#
+# 使用方式：
+#   在 prometheus.yml 中通过 rule_files 加载本文件：
+#   rule_files:
+#     - /path/to/jte/configs/alerts.yaml
+#
+# 告警分级：
+#   critical — 需立即处理（P0）：服务不可用、数据丢失风险
+#   warning  — 需及时处理（P1/P2）：性能降级、阈值告警
+#   info     — 记录观察（P3）：容量规划、趋势分析
+#
+# 告警接收：需配置 Alertmanager → 钉钉/企业微信/邮件 webhook
+# ============================================================================
+
+groups:
+  # ====================================================================
+  # 协议层告警
+  # ====================================================================
+  - name: jte_protocol_alerts
+    rules:
+      # 设备连接数异常（超过阈值）
+      - alert: JTEActiveConnectionsHigh
+        expr: jte_active_connections > 5000
+        for: 5m
+        labels:
+          severity: warning
+          layer: protocol
+        annotations:
+          summary: "活跃连接数过高 ({{ $value }})"
+          description: "实例 {{ $labels.instance }} 活跃连接数 {{ $value }} 超过 5000 阈值，可能存在连接泄漏或设备重连风暴"
+
+      # 在线设备数突降（可能网关故障）
+      - alert: JTEOnlineDevicesDrop
+        expr: jte_online_devices < (jte_online_devices offset 10m) * 0.5
+        for: 2m
+        labels:
+          severity: critical
+          layer: protocol
+        annotations:
+          summary: "在线设备数突降超过 50%"
+          description: "在线设备从 {{ $value | humanize }} (10分钟前) 降至当前值，疑似网关故障或网络中断"
+
+      # 消息解析错误率 > 1%
+      - alert: JTEMessageParseErrorRateHigh
+        expr: |
+          sum(rate(jte_message_parse_errors_total[5m])) by (instance, protocol)
+          /
+          clamp_min(sum(rate(jte_messages_received_total[5m])) by (instance, protocol), 1)
+          > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          layer: protocol
+        annotations:
+          summary: "消息解析错误率 > 1% (协议: {{ $labels.protocol }})"
+          description: "协议 {{ $labels.protocol }} 解析错误率 {{ $value | humanizePercentage }}，超过 1% 阈值，可能固件不兼容或协议实现缺陷"
+
+      # 消息接收速率突降
+      - alert: JTEMessageRateDrop
+        expr: |
+          sum(rate(jte_messages_received_total[5m])) by (instance)
+          < sum(rate(jte_messages_received_total[1h])) by (instance) * 0.2
+        for: 10m
+        labels:
+          severity: warning
+          layer: protocol
+        annotations:
+          summary: "消息接收速率突降至历史均值 20% 以下"
+          description: "可能存在设备大规模离线或网关接收链路故障"
+
+  # ====================================================================
+  # 视频层告警
+  # ====================================================================
+  - name: jte_video_alerts
+    rules:
+      # RTP 丢包率 > 5%
+      - alert: JTEVideoPacketLossHigh
+        expr: jte_video_packet_loss_percent > 5
+        for: 2m
+        labels:
+          severity: warning
+          layer: video
+        annotations:
+          summary: "视频丢包率 > 5% (设备: {{ $labels.device_id }})"
+          description: "设备 {{ $labels.device_id }} 通道 {{ $labels.channel }} 丢包率 {{ $value }}%，画面可能出现马赛克/卡顿"
+
+      # 视频码率过低（可能黑屏）
+      - alert: JTEVideoBitrateLow
+        expr: jte_video_bitrate > 0 and jte_video_bitrate < 100
+        for: 3m
+        labels:
+          severity: warning
+          layer: video
+        annotations:
+          summary: "视频码率 < 100kbps (设备: {{ $labels.device_id }})"
+          description: "设备 {{ $labels.device_id }} 码率仅 {{ $value }}kbps，可能黑屏或摄像头故障"
+
+      # 视频延迟过高
+      - alert: JTEVideoLatencyHigh
+        expr: jte_video_latency_ms > 3000
+        for: 2m
+        labels:
+          severity: warning
+          layer: video
+        annotations:
+          summary: "视频延迟 > 3s (设备: {{ $labels.device_id }})"
+          description: "设备 {{ $labels.device_id }} 端到端延迟 {{ $value }}ms，影响实时监控体验"
+
+      # UDP→TCP fallback 频繁（网络质量问题）
+      - alert: JTERTPFallbackFrequent
+        expr: increase(jte_rtp_fallback_total[10m]) > 10
+        for: 5m
+        labels:
+          severity: info
+          layer: video
+        annotations:
+          summary: "10分钟内 UDP→TCP fallback 超过 10 次"
+          description: "网络 UDP 传输质量差，频繁降级到 TCP，建议检查网络带宽和防火墙规则"
+
+      # 并发播放数过高
+      - alert: JTEConcurrentPlaysHigh
+        expr: jte_video_concurrent_plays > 500
+        for: 5m
+        labels:
+          severity: warning
+          layer: video
+        annotations:
+          summary: "并发播放数 > 500 ({{ $value }})"
+          description: "并发视频播放数 {{ $value }}，接近或超过 ZLMediaKit 容量，可能需要扩容"
+
+  # ====================================================================
+  # AI 层告警
+  # ====================================================================
+  - name: jte_ai_alerts
+    rules:
+      # AI 推理延迟 > 500ms
+      - alert: JTEAIInferenceLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(jte_ai_inference_duration_ms_bucket[5m])) by (le, instance)
+          ) > 500
+        for: 5m
+        labels:
+          severity: warning
+          layer: ai
+        annotations:
+          summary: "AI 推理 P95 延迟 > 500ms"
+          description: "AI 推理 P95 延迟 {{ $value }}ms，超过 500ms 阈值，可能需要优化模型或扩容 GPU"
+
+      # AI 模型命中率低（过度依赖 API 兜底）
+      - alert: JTEAIModelHitRateLow
+        expr: jte_ai_model_hit_rate < 0.5
+        for: 10m
+        labels:
+          severity: info
+          layer: ai
+        annotations:
+          summary: "AI 模型命中率 < 50%"
+          description: "本地 ONNX 模型命中率仅 {{ $value | humanizePercentage }}，过度依赖 DeepSeek API 兜底，建议检查模型版本或增加训练数据"
+
+      # AI fallback 次数激增
+      - alert: JTEAIFallbackSpike
+        expr: increase(jte_ai_fallback_total[10m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+          layer: ai
+        annotations:
+          summary: "10分钟内 AI fallback 超过 100 次"
+          description: "AI 分层推理频繁降级，可能 ONNX Runtime 故障或 DeepSeek API 限流"
+
+  # ====================================================================
+  # 存储层告警
+  # ====================================================================
+  - name: jte_storage_alerts
+    rules:
+      # 存储写入失败率 > 0.1%
+      - alert: JTEStorageWriteFailureRateHigh
+        expr: |
+          sum(rate(jte_storage_write_failures_total[5m])) by (instance)
+          /
+          clamp_min(sum(rate(jte_storage_write_total[5m])) by (instance), 1)
+          > 0.001
+        for: 5m
+        labels:
+          severity: critical
+          layer: storage
+        annotations:
+          summary: "存储写入失败率 > 0.1%"
+          description: "存储写入失败率 {{ $value | humanizePercentage }}，超过 0.1% 阈值，存在数据丢失风险"
+
+      # 存储写入延迟过高
+      - alert: JTEStorageWriteLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(jte_storage_write_duration_seconds_bucket[5m])) by (le, instance)
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          layer: storage
+        annotations:
+          summary: "存储写入 P99 延迟 > 1s"
+          description: "存储写入 P99 延迟 {{ $value }}s，可能数据库负载过高或磁盘 IO 瓶颈"
+
+      # TDengine 查询延迟过高
+      - alert: JTETDengineQueryLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(jte_tdengine_query_duration_seconds_bucket[5m])) by (le, instance)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          layer: storage
+        annotations:
+          summary: "TDengine 查询 P95 延迟 > 2s"
+          description: "TDengine 查询 P95 延迟 {{ $value }}s，可能需要优化查询或增加缓存"
+
+      # 归档任务失败
+      - alert: JTEArchiveTaskFailed
+        expr: increase(jte_archive_failures_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          layer: storage
+        annotations:
+          summary: "归档任务失败"
+          description: "过去 1 小时内有归档任务失败，可能 MinIO 不可用或 TDengine 查询超时，历史数据迁移受阻"
+
+      # 归档进度停滞
+      - alert: JTEArchiveProgressStalled
+        expr: jte_archive_progress < 1 and jte_archive_progress == (jte_archive_progress offset 1h)
+        for: 0m
+        labels:
+          severity: info
+          layer: storage
+        annotations:
+          summary: "归档进度停滞超过 1 小时"
+          description: "归档进度 {{ $value | humanizePercentage }} 在过去 1 小时无变化，可能任务卡死"
+
+  # ====================================================================
+  # 系统层告警
+  # ====================================================================
+  - name: jte_system_alerts
+    rules:
+      # 模块崩溃
+      - alert: JTEModuleDown
+        expr: jte_module_status == -1
+        for: 1m
+        labels:
+          severity: critical
+          layer: system
+        annotations:
+          summary: "模块 {{ $labels.module }} 崩溃"
+          description: "模块 {{ $labels.module }} 状态为 failed，supervisor 正在尝试重启"
+
+      # 模块频繁重启（1小时内重启超过 3 次）
+      - alert: JTEModuleRestartFrequent
+        expr: jte_module_restart_count > 3
+        for: 5m
+        labels:
+          severity: warning
+          layer: system
+        annotations:
+          summary: "模块 {{ $labels.module }} 1 小时内重启 {{ $value }} 次"
+          description: "模块频繁崩溃重启，可能存在内存泄漏或死锁，需排查日志"
+
+      # 主机 CPU 使用率 > 80%（5 分钟内通知）
+      # 验收标准：CPU>80% 告警
+      - alert: JTEHostCPUHigh
+        expr: |
+          100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+          layer: system
+        annotations:
+          summary: "主机 CPU 使用率 > 80% ({{ $value | printf \"%.1f\" }}%)"
+          description: "实例 {{ $labels.instance }} CPU 使用率 {{ $value | printf \"%.1f\" }}% 超过 80% 阈值，持续 5 分钟"
+
+      # 主机内存使用率 > 90%（5 分钟内通知）
+      # 验收标准：内存>90% 告警
+      - alert: JTEHostMemoryHigh
+        expr: |
+          (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 90
+        for: 5m
+        labels:
+          severity: critical
+          layer: system
+        annotations:
+          summary: "主机内存使用率 > 90% ({{ $value | printf \"%.1f\" }}%)"
+          description: "实例 {{ $labels.instance }} 内存使用率 {{ $value | printf \"%.1f\" }}% 超过 90% 阈值，存在 OOM 风险"
+
+      # JTE 进程内存使用过高
+      - alert: JTEMemoryHigh
+        expr: process_resident_memory_bytes / 1024 / 1024 > 4096
+        for: 5m
+        labels:
+          severity: warning
+          layer: system
+        annotations:
+          summary: "进程内存 > 4GB ({{ $value }}MB)"
+          description: "JTE 进程内存使用 {{ $value }}MB，可能存在内存泄漏"
+
+      # goroutine 数过多
+      - alert: JTEGoroutinesHigh
+        expr: go_goroutines > 10000
+        for: 5m
+        labels:
+          severity: warning
+          layer: system
+        annotations:
+          summary: "goroutine 数 > 10000 ({{ $value }})"
+          description: "goroutine 数 {{ $value }}，可能存在 goroutine 泄漏"

@@ -1,0 +1,16 @@
+{
+  "title": "轨迹回放",
+  "subtitle": "车辆实时位置监控与轨迹回放",
+  "query": "轨迹查询",
+  "playback": "轨迹回放",
+  "export": "导出轨迹",
+  "startTime": "开始时间",
+  "endTime": "结束时间",
+  "speed": "速度",
+  "direction": "方向",
+  "mileage": "里程",
+  "totalPoints": "轨迹点数",
+  "playSpeed": "播放速度",
+  "pause": "暂停",
+  "play": "播放"
+}

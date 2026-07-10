@@ -1,0 +1,19 @@
+{
+  "title": "AI 分析",
+  "alarmFilter": "报警智能过滤",
+  "riskScore": "风险评分",
+  "fatigueDetect": "疲劳驾驶识别",
+  "anomalyDetect": "异常驾驶检测",
+  "trajectoryPredict": "轨迹异常预测",
+  "filterAccuracy": "过滤准确率",
+  "fatigueLevel": "疲劳等级",
+  "fatigueSuggestion": "建议",
+  "riskFactors": "风险因素",
+  "anomalyType": "异常类型",
+  "suddenAccel": "急加速",
+  "suddenDecel": "急减速",
+  "sharpTurn": "急转弯",
+  "deviation": "偏航",
+  "abnormalStop": "异常停留",
+  "updateRules": "更新规则"
+}

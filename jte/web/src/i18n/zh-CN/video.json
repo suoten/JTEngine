@@ -1,0 +1,16 @@
+{
+  "title": "视频监控",
+  "live": "实时监控",
+  "playback": "视频回放",
+  "channel": "通道",
+  "streamType": "码流类型",
+  "mainStream": "主码流",
+  "subStream": "子码流",
+  "startStream": "开始推流",
+  "stopStream": "停止推流",
+  "mediaType": "媒体类型",
+  "video": "视频",
+  "audio": "音频",
+  "avBoth": "音视频",
+  "historyQuery": "历史查询"
+}

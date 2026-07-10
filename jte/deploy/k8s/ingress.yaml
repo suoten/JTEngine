@@ -1,0 +1,87 @@
+# JTE Ingress 配置
+# 统一外部入口，支持 HTTP/HTTPS、TLS 终止、路径路由
+#
+# 前置条件：
+#   1. 集群已安装 Ingress Controller（nginx-ingress 或 traefik）
+#   2. TLS 证书已通过 cert-manager 或手动创建 Secret
+#
+# 使用：kubectl apply -f ingress.yaml
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jte-ingress
+  namespace: jte
+  labels:
+    app: jte
+  annotations:
+    # nginx-ingress 注解
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # WebSocket 支持（视频流/实时推送）
+    nginx.ingress.kubernetes.io/websocket-services: jte-svc
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+    # 限流：每秒 20 请求，突发 40
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+    nginx.ingress.kubernetes.io/limit-burst: "40"
+    # HSTS
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+    # cert-manager 自动证书（可选）
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+    - hosts:
+        - jte.example.com
+        - api.jte.example.com
+        - ws.jte.example.com
+      secretName: jte-tls-secret
+  rules:
+    # 官网前端
+    - host: jte.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jte-website-svc
+                port:
+                  number: 8081
+          # 官网 API
+          - path: /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: jte-website-svc
+                port:
+                  number: 8081
+    # 主引擎 API
+    - host: api.jte.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jte-svc
+                port:
+                  number: 8080
+    # WebSocket / 视频流
+    - host: ws.jte.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jte-svc
+                port:
+                  number: 7611

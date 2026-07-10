@@ -1,0 +1,81 @@
+# JTE 主引擎 .dockerignore
+# 减小构建上下文体积，加速 docker build
+
+# === 版本控制 ===
+.git
+.gitignore
+.gitattributes
+
+# === IDE / 编辑器 ===
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# === 编译产物（二进制） ===
+*.exe
+*.exe~
+jte
+jte.exe
+loadtest
+loadtest.exe
+sqlite.test
+sqlite.test.exe
+dist/
+*.o
+*.a
+*.so
+
+# === 测试与覆盖率 ===
+coverage.out
+coverage.html
+*.test
+.coverage
+
+# === 文档 ===
+docs/
+*.md
+!README.md
+LICENSE
+
+# === 运行时数据（不应进入镜像） ===
+data/
+spool/
+.uploads/
+.arts/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+logs/
+*.log
+
+# === Docker 自身文件 ===
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# === CI/CD ===
+.github/
+.gitlab-ci.yml
+
+# === 部署文件 ===
+deploy/
+scripts/
+
+# === 前端构建缓存 ===
+web/node_modules/
+web/dist/
+web/.vite/
+
+# === 密钥文件（不应进入镜像） ===
+keys/
+*.pem
+*.key
+*.crt
+
+# === 操作系统文件 ===
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 80" width="320" height="80">
+  <defs>
+    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#6366f1;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#8b5cf6;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="grad2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#60a5fa;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a78bfa;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#6366f1" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+  
+  <g transform="translate(0, 0)" filter="url(#shadow)">
+    <polygon points="40,6 69.28,23 69.28,57 40,74 10.72,57 10.72,23" 
+             fill="none" stroke="url(#grad1)" stroke-width="1.5" opacity="0.3"/>
+    <polygon points="40,10 65.82,25 65.82,55 40,70 14.18,55 14.18,25" 
+             fill="url(#grad1)" opacity="0.1"/>
+  </g>
+  
+  <g transform="translate(0, 0)" filter="url(#glow)">
+    <path d="M28 22 L28 46 Q28 58 40 58 Q52 58 52 46 L52 38" 
+          fill="none" stroke="url(#grad1)" stroke-width="3.5" stroke-linecap="round"/>
+    <path d="M52 38 L60 38" 
+          fill="none" stroke="url(#grad2)" stroke-width="3" stroke-linecap="round"/>
+  </g>
+  
+  <circle cx="40" cy="22" r="3.5" fill="url(#grad2)" filter="url(#glow)"/>
+  
+  <circle cx="20" cy="28" r="1.5" fill="#60a5fa" opacity="0.8"/>
+  <circle cx="60" cy="28" r="1.5" fill="#a78bfa" opacity="0.8"/>
+  <circle cx="16" cy="44" r="1.2" fill="#60a5fa" opacity="0.6"/>
+  <circle cx="64" cy="44" r="1.2" fill="#a78bfa" opacity="0.6"/>
+  
+  <line x1="20" y1="28" x2="28" y2="32" stroke="#60a5fa" stroke-width="0.5" opacity="0.4"/>
+  <line x1="60" y1="28" x2="52" y2="32" stroke="#a78bfa" stroke-width="0.5" opacity="0.4"/>
+  <line x1="16" y1="44" x2="26" y2="46" stroke="#60a5fa" stroke-width="0.5" opacity="0.3"/>
+  <line x1="64" y1="44" x2="54" y2="46" stroke="#a78bfa" stroke-width="0.5" opacity="0.3"/>
+  
+  <circle cx="40" cy="58" r="4" fill="none" stroke="url(#grad2)" stroke-width="1" opacity="0.8"/>
+  <circle cx="40" cy="58" r="1.8" fill="url(#grad2)"/>
+  
+  <text x="85" y="38" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" 
+        font-size="32" font-weight="800" fill="url(#grad1)" letter-spacing="-1">JTE</text>
+  <text x="85" y="58" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" 
+        font-size="12" font-weight="500" fill="#64748b" letter-spacing="0.5">JT ENGINE</text>
+</svg>

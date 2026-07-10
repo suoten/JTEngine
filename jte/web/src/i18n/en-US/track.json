@@ -1,0 +1,16 @@
+{
+  "title": "Track Playback",
+  "subtitle": "Real-time vehicle monitoring and track playback",
+  "query": "Track Query",
+  "playback": "Track Playback",
+  "export": "Export Track",
+  "startTime": "Start Time",
+  "endTime": "End Time",
+  "speed": "Speed",
+  "direction": "Direction",
+  "mileage": "Mileage",
+  "totalPoints": "Total Points",
+  "playSpeed": "Play Speed",
+  "pause": "Pause",
+  "play": "Play"
+}

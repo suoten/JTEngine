@@ -16,7 +16,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/jte-engine/jte/pkg/crypto/gmsm"
+	"github.com/suoten/jt-engine/pkg/crypto/gmsm"
 )
 
 type Role string

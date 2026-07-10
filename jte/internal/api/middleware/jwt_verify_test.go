@@ -10,7 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/jte-engine/jte/internal/config"
+	"github.com/suoten/jt-engine/internal/config"
 )
 
 func init() {

@@ -20,7 +20,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jte-engine/jte/pkg/crypto/gmsm"
+	"github.com/suoten/jt-engine/pkg/crypto/gmsm"
 )
 
 // CipherPrefix 加密数据前缀，用于识别密文（向后兼容明文数据）

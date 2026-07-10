@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jte-engine/jte/pkg/storage"
+	"github.com/suoten/jt-engine/pkg/storage"
 )
 
 // migrateGeofence 创建电子围栏表（在 migrate 之后调用）

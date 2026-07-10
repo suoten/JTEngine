@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jte-engine/jte/pkg/protocol"
+	"github.com/suoten/jt-engine/pkg/protocol"
 )
 
 // makeFragHeader 构造分片消息头辅助函数

@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/jte-engine/jte/pkg/protocol"
+	"github.com/suoten/jt-engine/pkg/protocol"
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
 

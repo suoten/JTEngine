@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/jte-engine/jte/pkg/protocol"
+	"github.com/suoten/jt-engine/pkg/protocol"
 	"go.uber.org/zap"
 )
 

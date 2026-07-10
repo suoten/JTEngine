@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jte-engine/jte/internal/registry"
+	"github.com/suoten/jt-engine/internal/registry"
 	"go.uber.org/zap"
 )
 

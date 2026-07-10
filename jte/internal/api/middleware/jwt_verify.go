@@ -6,7 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/jte-engine/jte/internal/config"
+	"github.com/suoten/jt-engine/internal/config"
 )
 
 // VerifyJWT 验证 JWT token 的签名和过期时间，返回解析后的 token。

@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jte-engine/jte/internal/gateway"
-	"github.com/jte-engine/jte/internal/maintenance"
+	"github.com/suoten/jt-engine/internal/gateway"
+	"github.com/suoten/jt-engine/internal/maintenance"
 	"go.uber.org/zap"
 )
 

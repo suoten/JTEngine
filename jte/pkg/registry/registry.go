@@ -4,7 +4,7 @@
 // This package lives under pkg/ (not internal/) so that external Go modules
 // (jte-modules/module-*) can import it. Go's internal package rule would
 // prevent modules whose module path is github.com/jte-engine/jte-modules/*
-// from importing github.com/jte-engine/jte/internal/registry, which caused
+// from importing github.com/suoten/jt-engine/internal/registry, which caused
 // each module to define its own shadow FeatureRegistry type — breaking the
 // runtime type assertion app.(JTEApp) in module.Init().
 //

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jte-engine/jte/pkg/storage"
-	"github.com/jte-engine/jte/pkg/storage/memory"
+	"github.com/suoten/jt-engine/pkg/storage"
+	"github.com/suoten/jt-engine/pkg/storage/memory"
 	"go.uber.org/zap"
 )
 

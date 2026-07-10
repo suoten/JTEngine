@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jte-engine/jte/internal/config"
+	"github.com/suoten/jt-engine/internal/config"
 	"go.uber.org/zap"
 )
 

@@ -19,7 +19,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/jte-engine/jte/pkg/crypto/gmsm"
+	"github.com/suoten/jt-engine/pkg/crypto/gmsm"
 )
 
 // AuditEntry 等保2.0 三级合规审计日志条目。

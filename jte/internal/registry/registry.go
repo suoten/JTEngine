@@ -5,7 +5,7 @@
 // to Go's internal package rule, so each defined its own shadow FeatureRegistry
 // type — breaking the runtime type assertion app.(JTEApp) in module.Init().
 //
-// The canonical implementation now lives in github.com/jte-engine/jte/pkg/registry
+// The canonical implementation now lives in github.com/suoten/jt-engine/pkg/registry
 // (public, importable by all modules). This file re-exports everything via type
 // aliases and var/const re-declarations so existing internal callers
 // (internal/gateway, internal/api, cmd/jte, etc.) continue to work unchanged.
@@ -15,7 +15,7 @@
 package registry
 
 import (
-	pkgregistry "github.com/jte-engine/jte/pkg/registry"
+	pkgregistry "github.com/suoten/jt-engine/pkg/registry"
 )
 
 // Type aliases — make internal/registry types identical to pkg/registry types.

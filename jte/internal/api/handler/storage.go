@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jte-engine/jte/internal/config"
-	"github.com/jte-engine/jte/internal/util"
-	"github.com/jte-engine/jte/pkg/storage"
+	"github.com/suoten/jt-engine/internal/config"
+	"github.com/suoten/jt-engine/internal/util"
+	"github.com/suoten/jt-engine/pkg/storage"
 	"go.uber.org/zap"
 )
 

@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jte-engine/jte/internal/registry"
-	"github.com/jte-engine/jte/pkg/merge"
-	"github.com/jte-engine/jte/pkg/storage"
-	"github.com/jte-engine/jte/pkg/storage/memory"
+	"github.com/suoten/jt-engine/internal/registry"
+	"github.com/suoten/jt-engine/pkg/merge"
+	"github.com/suoten/jt-engine/pkg/storage"
+	"github.com/suoten/jt-engine/pkg/storage/memory"
 	"go.uber.org/zap"
 	"golang.org/x/text/encoding/simplifiedchinese"
 )

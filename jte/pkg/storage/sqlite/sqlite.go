@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jte-engine/jte/pkg/storage"
-	"github.com/jte-engine/jte/pkg/storage/safesql"
+	"github.com/suoten/jt-engine/pkg/storage"
+	"github.com/suoten/jt-engine/pkg/storage/safesql"
 	_ "github.com/mattn/go-sqlite3"
 	"go.uber.org/zap"
 )

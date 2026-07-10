@@ -12,10 +12,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	ws "github.com/jte-engine/jte/internal/api/websocket"
-	"github.com/jte-engine/jte/internal/util"
-	"github.com/jte-engine/jte/pkg/protocol/jt808"
-	"github.com/jte-engine/jte/pkg/storage"
+	ws "github.com/suoten/jt-engine/internal/api/websocket"
+	"github.com/suoten/jt-engine/internal/util"
+	"github.com/suoten/jt-engine/pkg/protocol/jt808"
+	"github.com/suoten/jt-engine/pkg/storage"
 	"go.uber.org/zap"
 )
 

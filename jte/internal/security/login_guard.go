@@ -16,7 +16,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/jte-engine/jte/pkg/crypto/gmsm"
+	"github.com/suoten/jt-engine/pkg/crypto/gmsm"
 )
 
 // LoginGuard 登录安全守卫

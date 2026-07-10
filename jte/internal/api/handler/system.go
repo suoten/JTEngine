@@ -5,9 +5,9 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jte-engine/jte/internal/gateway"
-	"github.com/jte-engine/jte/internal/registry"
-	"github.com/jte-engine/jte/pkg/storage"
+	"github.com/suoten/jt-engine/internal/gateway"
+	"github.com/suoten/jt-engine/internal/registry"
+	"github.com/suoten/jt-engine/pkg/storage"
 	"go.uber.org/zap"
 )
 

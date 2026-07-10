@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jte-engine/jte/pkg/protocol/jt808"
+	"github.com/suoten/jt-engine/pkg/protocol/jt808"
 	"go.uber.org/zap"
 )
 

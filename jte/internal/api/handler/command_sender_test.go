@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jte-engine/jte/internal/gateway"
-	"github.com/jte-engine/jte/pkg/protocol"
-	"github.com/jte-engine/jte/pkg/protocol/jt808"
+	"github.com/suoten/jt-engine/internal/gateway"
+	"github.com/suoten/jt-engine/pkg/protocol"
+	"github.com/suoten/jt-engine/pkg/protocol/jt808"
 	"go.uber.org/zap"
 )
 

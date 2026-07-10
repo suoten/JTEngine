@@ -18,9 +18,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jte-engine/jte/internal/metrics"
-	"github.com/jte-engine/jte/internal/util"
-	"github.com/jte-engine/jte/pkg/merge"
+	"github.com/suoten/jt-engine/internal/metrics"
+	"github.com/suoten/jt-engine/internal/util"
+	"github.com/suoten/jt-engine/pkg/merge"
 	"go.uber.org/zap"
 )
 

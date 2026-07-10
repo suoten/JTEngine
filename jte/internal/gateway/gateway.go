@@ -11,13 +11,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jte-engine/jte/internal/config"
-	"github.com/jte-engine/jte/internal/metrics"
-	"github.com/jte-engine/jte/internal/registry"
-	"github.com/jte-engine/jte/internal/util"
-	"github.com/jte-engine/jte/pkg/protocol"
-	"github.com/jte-engine/jte/pkg/protocol/jt808"
-	"github.com/jte-engine/jte/pkg/storage"
+	"github.com/suoten/jt-engine/internal/config"
+	"github.com/suoten/jt-engine/internal/metrics"
+	"github.com/suoten/jt-engine/internal/registry"
+	"github.com/suoten/jt-engine/internal/util"
+	"github.com/suoten/jt-engine/pkg/protocol"
+	"github.com/suoten/jt-engine/pkg/protocol/jt808"
+	"github.com/suoten/jt-engine/pkg/storage"
 	"go.uber.org/zap"
 )
 

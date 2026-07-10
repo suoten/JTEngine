@@ -22,7 +22,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jte-engine/jte/pkg/masking"
+	"github.com/suoten/jt-engine/pkg/masking"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )

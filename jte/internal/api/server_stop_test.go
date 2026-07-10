@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jte-engine/jte/internal/api/websocket"
+	"github.com/suoten/jt-engine/internal/api/websocket"
 	"go.uber.org/zap"
 )
 

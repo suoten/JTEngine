@@ -6,7 +6,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/jte-engine/jte/internal/util"
+	"github.com/suoten/jt-engine/internal/util"
 )
 
 type EventType string

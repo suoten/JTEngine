@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jte-engine/jte/pkg/storage"
+	"github.com/suoten/jt-engine/pkg/storage"
 )
 
 func TestGeofence_CRUD(t *testing.T) {

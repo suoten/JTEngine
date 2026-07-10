@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	jt808 "github.com/jte-engine/jte/pkg/protocol/jt808"
+	jt808 "github.com/suoten/jt-engine/pkg/protocol/jt808"
 	"go.uber.org/zap"
 )
 

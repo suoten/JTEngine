@@ -1,4 +1,4 @@
-module github.com/jte-engine/jte
+module github.com/suoten/jt-engine
 
 go 1.22
 

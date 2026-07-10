@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jte-engine/jte/internal/util"
-	"github.com/jte-engine/jte/pkg/protocol"
+	"github.com/suoten/jt-engine/internal/util"
+	"github.com/suoten/jt-engine/pkg/protocol"
 )
 
 // PacketReassembler 808 分包重组器。

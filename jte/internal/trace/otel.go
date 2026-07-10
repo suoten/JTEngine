@@ -106,7 +106,7 @@ func InitOTel(endpoint, serviceName string, sampleRate float64) error {
 
 	otel.SetTracerProvider(tp)
 	otelProvider = tp
-	otelTracer = tp.Tracer("github.com/jte-engine/jte")
+	otelTracer = tp.Tracer("github.com/suoten/jt-engine")
 	otelReady.Store(true)
 
 	return nil

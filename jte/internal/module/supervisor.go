@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jte-engine/jte/internal/metrics"
+	"github.com/suoten/jt-engine/internal/metrics"
 	"go.uber.org/zap"
 )
 

@@ -4,7 +4,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jte-engine/jte/internal/gateway"
+	"github.com/suoten/jt-engine/internal/gateway"
 	"go.uber.org/zap"
 )
 

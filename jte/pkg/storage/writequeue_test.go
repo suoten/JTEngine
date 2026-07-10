@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jte-engine/jte/pkg/storage"
-	"github.com/jte-engine/jte/pkg/storage/mock"
+	"github.com/suoten/jt-engine/pkg/storage"
+	"github.com/suoten/jt-engine/pkg/storage/mock"
 	"go.uber.org/zap"
 )
 

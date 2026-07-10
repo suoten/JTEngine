@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jte-engine/jte/internal/util"
+	"github.com/suoten/jt-engine/internal/util"
 	"go.uber.org/zap"
 )
 

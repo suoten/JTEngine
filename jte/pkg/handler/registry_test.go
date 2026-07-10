@@ -3,7 +3,7 @@ package handler
 import (
 	"testing"
 
-	"github.com/jte-engine/jte/pkg/protocol"
+	"github.com/suoten/jt-engine/pkg/protocol"
 )
 
 func TestHandlerRegistry_RegisterAndGet(t *testing.T) {

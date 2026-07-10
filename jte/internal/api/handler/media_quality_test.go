@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	jt1078 "github.com/jte-engine/jte/pkg/protocol/jt1078"
+	jt1078 "github.com/suoten/jt-engine/pkg/protocol/jt1078"
 	"go.uber.org/zap"
 )
 

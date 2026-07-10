@@ -1,7 +1,7 @@
 package handler
 
 import (
-	"github.com/jte-engine/jte/pkg/storage"
+	"github.com/suoten/jt-engine/pkg/storage"
 )
 
 // ForwardChecker 转发规则检查器接口（AUTO-FIX-2026-07-02 [P1]）。

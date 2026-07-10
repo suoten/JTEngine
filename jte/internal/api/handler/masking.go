@@ -15,8 +15,8 @@ package handler
 import (
 	"reflect"
 
-	"github.com/jte-engine/jte/pkg/masking"
-	"github.com/jte-engine/jte/pkg/storage"
+	"github.com/suoten/jt-engine/pkg/masking"
+	"github.com/suoten/jt-engine/pkg/storage"
 )
 
 // maskString 对敏感字段按类型脱敏，返回脱敏后的字符串

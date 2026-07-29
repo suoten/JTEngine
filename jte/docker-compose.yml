@@ -1,5 +1,8 @@
 version: "3.8"
 
+# AUTO-FIX-2026-07-14 [ConvergeLoop-P0]: 补全生产部署所需的全量服务定义
+# .env.example 引用了 mysql/redis/tdengine/minio 4 个后端服务，原 compose 缺失会导致部署失败。
+
 services:
   jte:
     build:
@@ -11,23 +14,186 @@ services:
     volumes:
       - ./configs:/app/configs
       - ./modules:/app/modules
+      - jte-logs:/app/logs
+      - jte-spool:/app/spool
     depends_on:
-      - zlmediakit
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      tdengine:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      zlmediakit:
+        condition: service_healthy
     environment:
-      - JTE_GATEWAY_TCPPORT=7611
+      # AUTO-FIX-2026-07-15 [ConvergeLoop-语义一致性]: 环境变量名对齐 viper 映射
+      # jte.yaml 中字段为 gateway.tcp_port，viper SetEnvKeyReplacer(".", "_")
+      # 原 JTE_GATEWAY_TCPPORT 无下划线不会被识别；改为 JTE_GATEWAY_TCP_PORT
+      - JTE_GATEWAY_TCP_PORT=7611
       - JTE_API_PORT=8080
-      - JTE_STORAGE_TYPE=memory
+      # AUTO-FIX-2026-07-15 [ConvergeLoop-语义一致性]: 默认存储类型对齐 .env.example=sqlite
+      # 原默认 mysql 但 main.go 不支持 mysql 会显式报错启动失败
+      - JTE_STORAGE_TYPE=${JTE_STORAGE_TYPE:-sqlite}
       - JTE_ZLMEDIAKIT_URL=http://zlmediakit:80
+      - JTE_MYSQL_HOST=mysql
+      - JTE_MYSQL_PORT=3306
+      - JTE_MYSQL_DATABASE=${MYSQL_DATABASE:-jte}
+      - JTE_MYSQL_USER=${MYSQL_USER:-jte}
+      - JTE_MYSQL_PASSWORD=${MYSQL_PASSWORD:-jte}
+      - JTE_REDIS_HOST=redis
+      - JTE_REDIS_PORT=6379
+      - JTE_REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - JTE_TDENGINE_HOST=tdengine
+      - JTE_TDENGINE_PORT=6030
+      - JTE_TDENGINE_WS_PORT=6041
+      - JTE_MINIO_ENDPOINT=minio:9000
+      - JTE_MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - JTE_MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+    restart: unless-stopped
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P3]: 优雅关闭宽限期
+    # SIGTERM 后等待 30s 让 GracefulShutdown 完成（关闭连接、刷写队列、释放资源）
+    # 超时后 Docker 发送 SIGKILL 强制终止
+    stop_grace_period: 30s
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 日志轮转，防止磁盘满
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: jte 服务健康检查
+    # AUTO-FIX-2026-07-15 [ConvergeLoop-兼容性]: 与 Dockerfile HEALTHCHECK 对齐
+    # 原始终用 http + --no-check-certificate（--no-check-certificate 对 http 无效）
+    # 现根据 JTE_API_TLS_ENABLED 选择协议，与 Dockerfile L46-51 一致
+    healthcheck:
+      test: ["CMD-SHELL", "if [ \"$$JTE_API_TLS_ENABLED\" = \"true\" ]; then wget -qO- --no-check-certificate https://localhost:8080/healthz; else wget -qO- http://localhost:8080/healthz; fi || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - jte-net
+
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-root}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-jte}
+      - MYSQL_USER=${MYSQL_USER:-jte}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-jte}
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - jte-net
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 修复 Redis 健康检查在密码模式下的失败
+    # 原 test: ["CMD", "redis-cli", "ping"] 在 REDIS_PASSWORD 非空时返回 NOAUTH 而非 PONG，
+    # 导致 healthcheck 永远失败，jte 服务因 depends_on: condition: service_healthy 无法启动。
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ${REDIS_PASSWORD:+-a $$REDIS_PASSWORD} ping | grep PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - jte-net
+
+  tdengine:
+    image: tdengine/tdengine:3.3.2.0
+    ports:
+      - "6030:6030"
+      - "6041:6041"
+      - "6043-6049:6043-6049"
+      - "6043-6049:6043-6049/udp"
+    volumes:
+      - tdengine-data:/var/lib/taos
+      - tdengine-log:/var/log/taos
+    environment:
+      - TAOS_FQDN=tdengine
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: healthcheck 确保 TDengine 就绪后再启动 jte
+    healthcheck:
+      test: ["CMD", "taos", "-s", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - jte-net
+
+  minio:
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 锁定 MinIO 版本，避免 :latest 滚动标签导致部署不可重现
+    # :latest 标签每次拉取可能获取不同版本，引发兼容性问题或数据格式变更
+    image: minio/minio:RELEASE.2024-07-16T15-48-33Z
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - jte-net
 
   zlmediakit:
-    image: zlmediakit/zlmediakit:master
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 锁定 ZLMediaKit 版本，避免 :master 滚动标签
+    # :master 是开发分支最新构建，可能包含未测试的破坏性变更
+    image: zlmediakit/zlmediakit:release-12.0.0
     ports:
       - "80:80"
       - "1935:1935"
       - "554:554"
       - "8000:8000/udp"
+      - "10000:10000/udp"
     volumes:
       - zlm-data:/opt/media
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: healthcheck 确保 ZLMediaKit 就绪
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/index/api/getServerConfig || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - jte-net
 
 volumes:
   zlm-data:
+  mysql-data:
+  redis-data:
+  tdengine-data:
+  tdengine-log:
+  minio-data:
+  jte-logs:
+  jte-spool:
+
+networks:
+  jte-net:
+    driver: bridge

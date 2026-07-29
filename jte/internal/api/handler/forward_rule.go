@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -50,6 +51,11 @@ func (h *ForwardRuleHandler) RegisterReloader(platformID string, r ForwardRuleRe
 }
 
 // notifyReload 通知指定平台的客户端重新加载转发规则。
+// AUTO-FIX-2026-07-15 [ConvergeLoop-语义一致性]: 修复注释与代码行为不符
+// 原注释"添加 context 超时取消机制"但 select 只检查一次 ctx，10s 超时形同虚设。
+// 现在真正实现：内部 goroutine 执行 ReloadForwardRules，外部 select 等待完成或超时。
+// 超时则记录日志并返回，ReloadForwardRules 仍可能在后台继续执行（无法强制终止 Go goroutine），
+// 但至少 API 调用方不会无限期等待，且日志可观测超时事件。
 func (h *ForwardRuleHandler) notifyReload(platformID string) {
 	h.reloadersMu.RLock()
 	r, ok := h.reloaders[platformID]
@@ -58,7 +64,9 @@ func (h *ForwardRuleHandler) notifyReload(platformID string) {
 		return
 	}
 	// 异步调用避免 API 阻塞；ReloadForwardRules 内部为同步读 storage+原子写指针，耗时极短
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	go func() {
+		defer cancel()
 		defer func() {
 			if rv := recover(); rv != nil {
 				h.logger.Error("reload forward rules panic",
@@ -66,24 +74,66 @@ func (h *ForwardRuleHandler) notifyReload(platformID string) {
 					zap.Any("panic", rv))
 			}
 		}()
-		r.ReloadForwardRules()
+		// 启动 ReloadForwardRules 并等待完成或超时
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer func() {
+				if rv := recover(); rv != nil {
+					h.logger.Error("reload forward rules inner panic",
+						zap.String("platform_id", platformID),
+						zap.Any("panic", rv))
+				}
+			}()
+			r.ReloadForwardRules()
+		}()
+		select {
+		case <-done:
+			// 正常完成
+		case <-ctx.Done():
+			h.logger.Warn("reload forward rules timeout",
+				zap.String("platform_id", platformID),
+				zap.Duration("timeout", 10*time.Second))
+		}
 	}()
 }
 
 // List 列出转发规则
-// GET /api/v1/forward-rules?platform_id=xxx
+// GET /api/v1/forward-rules?platform_id=xxx&page=1&page_size=20
 // platform_id 为空时返回全部规则（管理后台审计用）
+// AUTO-FIX-2026-07-15 [ConvergeLoop-语义一致性]: 添加分页支持
+// 原先直接返回全部规则，10 倍流量场景下规则数增长会导致响应包过大和内存飙升
 func (h *ForwardRuleHandler) List(c *gin.Context) {
 	platformID := c.Query("platform_id")
 	rules, err := h.store.ListForwardRules(context.Background(), platformID)
 	if err != nil {
-		h.logger.Error("list forward rules failed", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		respondInternalError(c, h.logger, err, "ForwardRule.List")
 		return
 	}
+	// 软分页（规则数量通常较少，内存切片即可）
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 1000 {
+		pageSize = 20
+	}
+	total := len(rules)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"code": 0,
-		"data": rules,
+		"code":      0,
+		"data":      rules[start:end],
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
 	})
 }
 
@@ -107,8 +157,7 @@ func (h *ForwardRuleHandler) Create(c *gin.Context) {
 		rule.ID = fmt.Sprintf("fr_%s_%d", rule.PlatformID, time.Now().UnixNano())
 	}
 	if err := h.store.SaveForwardRule(context.Background(), &rule); err != nil {
-		h.logger.Error("create forward rule failed", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		respondInternalError(c, h.logger, err, "ForwardRule.Create.SaveForwardRule")
 		return
 	}
 	h.notifyReload(rule.PlatformID)
@@ -125,7 +174,7 @@ func (h *ForwardRuleHandler) Get(c *gin.Context) {
 	id := c.Param("id")
 	rule, err := h.store.GetForwardRule(context.Background(), id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "forward rule not found"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": rule})
@@ -138,7 +187,7 @@ func (h *ForwardRuleHandler) Update(c *gin.Context) {
 	// 先校验存在性
 	existing, err := h.store.GetForwardRule(context.Background(), id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "forward rule not found"})
 		return
 	}
 	var rule storage.ForwardRule
@@ -154,8 +203,7 @@ func (h *ForwardRuleHandler) Update(c *gin.Context) {
 		return
 	}
 	if err := h.store.SaveForwardRule(context.Background(), &rule); err != nil {
-		h.logger.Error("update forward rule failed", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		respondInternalError(c, h.logger, err, "ForwardRule.Update.SaveForwardRule")
 		return
 	}
 	h.notifyReload(rule.PlatformID)
@@ -172,12 +220,11 @@ func (h *ForwardRuleHandler) Delete(c *gin.Context) {
 	// 先查询以获取 platformID 用于触发 reload
 	rule, err := h.store.GetForwardRule(context.Background(), id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "forward rule not found"})
 		return
 	}
 	if err := h.store.DeleteForwardRule(context.Background(), id); err != nil {
-		h.logger.Error("delete forward rule failed", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		respondInternalError(c, h.logger, err, "ForwardRule.Delete.DeleteForwardRule")
 		return
 	}
 	h.notifyReload(rule.PlatformID)

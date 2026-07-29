@@ -1,0 +1,35 @@
+# JTE Pod Disruption Budget
+# [工业级加固] 确保 K8s 集群维护（节点驱逐、滚动升级）时至少保持 2 个副本可用
+#
+# 使用：kubectl apply -f pdb.yaml
+#
+# 工作原理：
+#   - minAvailable: 2 表示在任何自愿中断（voluntary disruption）期间，
+#     至少保持 2 个 Pod 处于 Available 状态
+#   - 自愿中断包括：节点排空（drain）、集群自动缩容、K8s 版本升级等
+#   - 非自愿中断（节点故障、OOM Kill）不受 PDB 保护
+#
+# 注意事项：
+#   1. 如果 replicas < minAvailable，PDB 会阻止所有自愿驱逐
+#   2. 蓝绿部署中 Blue 和 Green 共享此 PDB（通过 app=jte 标签匹配）
+#   3. 切换期间 Green 扩容到目标副本数后，Blue 逐步缩容，
+#      PDB 确保整个过程至少 2 个 Pod 可用
+#   4. 本文件与 jte-blue-green.yaml 中的 PDB 互斥，请仅使用其中一个
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: jte-pdb
+  namespace: jte
+  labels:
+    app: jte
+  annotations:
+    jte.io/description: "Ensure at least 2 JTE pods available during voluntary disruptions"
+spec:
+  # 至少保持 2 个副本可用
+  # 对于 3 副本部署：允许 1 个被驱逐（33% 不可用）
+  # 对于 5 副本部署：允许 3 个被驱逐（60% 不可用）
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: jte

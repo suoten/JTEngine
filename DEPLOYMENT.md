@@ -1,4 +1,4 @@
-# JTE 生产部署指南
+﻿# JTE 生产部署指南
 
 本指南详细说明 JTE 车联网部标协议引擎的生产环境部署步骤，涵盖 Docker Compose 一键部署和裸机部署两种方式。
 
@@ -52,7 +52,7 @@
 ### 1. 准备配置
 
 ```bash
-git clone https://github.com/jte-engine/jte.git
+git clone https://github.com/suoten/jt-engine.git
 cd jte
 ```
 
@@ -133,7 +133,7 @@ export PATH=$PATH:/usr/local/go/bin
 ### 2. 编译 JTE
 
 ```bash
-git clone https://github.com/jte-engine/jte.git
+git clone https://github.com/suoten/jt-engine.git
 cd jte/jte
 make build-binary
 # 产物：bin/jte

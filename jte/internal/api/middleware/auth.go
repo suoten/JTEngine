@@ -55,15 +55,25 @@ func Auth(jwtSecret string, jwtCfg *config.JWTConfig) gin.HandlerFunc {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 			}
-			// 根据 token header 中的 kid 查找对应密钥
+			// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 显式区分三种 kid 路径
+			// 1) token 有 kid 且配置中找到 → 用对应 secret
+			// 2) token 有 kid 但配置中找不到 → 拒绝（避免密钥回退降级攻击）
+			// 3) token 无 kid（旧版本兼容）→ 用默认 jwtSecret
 			if kid, ok := token.Header["kid"].(string); ok && kid != "" {
 				if jwtCfg != nil {
 					if secret, found := jwtCfg.GetSecret(kid); found {
 						return []byte(secret), nil
 					}
+					// 显式拒绝未注册的 kid，防止密钥回退降级
+					return nil, fmt.Errorf("token kid '%s' not found in kms, possible key rotation or tampering", kid)
 				}
+				// 配置了 kid 但 jwtCfg 为 nil（KMS 未启用），拒绝带 kid 的 token
+				return nil, fmt.Errorf("token carries kid '%s' but KMS not configured", kid)
 			}
-			// 无 kid 或 kid 未找到，回退到默认 secret（平滑过渡）
+			// 无 kid 的旧 token，回退到默认 secret（仅当默认 secret 已配置时）
+			if jwtSecret == "" {
+				return nil, fmt.Errorf("no kid in token and default jwtSecret is empty, refuse to accept token")
+			}
 			return []byte(jwtSecret), nil
 		})
 
@@ -129,11 +139,13 @@ func RequirePermission(perm string) gin.HandlerFunc {
 
 		perms, exists := c.Get("permissions")
 		if !exists {
+			// AUTO-FIX-2026-07-14 [ConvergeLoop-UX]: 说明需要的权限与联系管理员路径
 			c.JSON(http.StatusForbidden, gin.H{
-				"code":    403,
-				"message": "permission denied",
-				"error":   "insufficient permissions",
+				"code":     403,
+				"message":  "permission denied: require permission '" + perm + "', contact system administrator to grant",
+				"error":    "insufficient permissions",
 				"required": perm,
+				"hint":     "ask super_admin to assign the '" + perm + "' permission via /api/v1/admin/users",
 			})
 			c.Abort()
 			return
@@ -142,10 +154,11 @@ func RequirePermission(perm string) gin.HandlerFunc {
 		permList, ok := perms.([]string)
 		if !ok {
 			c.JSON(http.StatusForbidden, gin.H{
-				"code":    403,
-				"message": "permission denied",
-				"error":   "insufficient permissions",
+				"code":     403,
+				"message":  "permission denied: require permission '" + perm + "', but permission list type invalid",
+				"error":    "permission list type mismatch",
 				"required": perm,
+				"hint":     "re-login to refresh token, or ask super_admin to assign the '" + perm + "' permission",
 			})
 			c.Abort()
 			return
@@ -159,10 +172,11 @@ func RequirePermission(perm string) gin.HandlerFunc {
 		}
 
 		c.JSON(http.StatusForbidden, gin.H{
-			"code":    403,
-			"message": "permission denied",
-			"error":   "insufficient permissions",
+			"code":     403,
+			"message":  "permission denied: current role lacks '" + perm + "' permission",
+			"error":    "insufficient permissions",
 			"required": perm,
+			"hint":     "ask super_admin to assign the '" + perm + "' permission via /api/v1/admin/users",
 		})
 		c.Abort()
 	}

@@ -41,110 +41,85 @@ func TestRealtimeRequestMessage_MarshalUnmarshal(t *testing.T) {
 	}
 }
 
-// AUTO-FIX-2026-06-27: 0x9105 改为单条音视频检索请求测试（原 ControlRequestMessage 测试）
-func TestSingleAVRetrievalRequestMessage_MarshalUnmarshal(t *testing.T) {
+// FIXED-2026-07-17 [P0]: 0x9105 实时音视频传输状态通知测试（原 SingleAVRetrievalRequest 测试已废弃）
+func TestAVStatusNotificationMessage_MarshalUnmarshal(t *testing.T) {
 	codec := NewCodec()
-	original := &SingleAVRetrievalRequestMessage{
-		LogicChannel: 1,
-		StartTime:    "240101000000",
-		EndTime:      "240101010000",
-		AlarmFlag:    0x12345678,
-		MediaType:    0,
-		StreamType:   0,
-		StorageType:  1,
-		SeqNum:       0x4242,
+	original := &AVStatusNotificationMessage{
+		SeqNum:         0x4242,
+		LogicChannel:   1,
+		LostPackets:    10,
+		DisorderPackets: 3,
+		LossRate:       50, // 5.0%
+		CurrentBitrate: 2000000, // 2Mbps
+		TerminalStatus: 0x0001, // bit0=视频丢帧
 	}
 	data, err := codec.EncodeBody(original)
 	if err != nil {
 		t.Fatalf("EncodeBody failed: %v", err)
 	}
-	if len(data) != 22 {
-		t.Fatalf("encoded length = %d, want 22", len(data))
+	if len(data) != 15 {
+		t.Fatalf("encoded length = %d, want 15", len(data))
 	}
 
-	body, err := codec.ParseBody(MsgIDSingleAVRetrievalRequest, data)
+	body, err := codec.ParseBody(MsgIDAVStatusNotification, data)
 	if err != nil {
 		t.Fatalf("ParseBody failed: %v", err)
 	}
-	parsed, ok := body.(*SingleAVRetrievalRequestMessage)
+	parsed, ok := body.(*AVStatusNotificationMessage)
 	if !ok {
-		t.Fatalf("expected *SingleAVRetrievalRequestMessage, got %T", body)
+		t.Fatalf("expected *AVStatusNotificationMessage, got %T", body)
+	}
+	if parsed.SeqNum != original.SeqNum {
+		t.Errorf("SeqNum = 0x%04X, want 0x%04X", parsed.SeqNum, original.SeqNum)
 	}
 	if parsed.LogicChannel != original.LogicChannel {
 		t.Errorf("LogicChannel = %d, want %d", parsed.LogicChannel, original.LogicChannel)
 	}
-	if parsed.StartTime != original.StartTime {
-		t.Errorf("StartTime = %q, want %q", parsed.StartTime, original.StartTime)
+	if parsed.LostPackets != original.LostPackets {
+		t.Errorf("LostPackets = %d, want %d", parsed.LostPackets, original.LostPackets)
 	}
-	if parsed.EndTime != original.EndTime {
-		t.Errorf("EndTime = %q, want %q", parsed.EndTime, original.EndTime)
+	if parsed.DisorderPackets != original.DisorderPackets {
+		t.Errorf("DisorderPackets = %d, want %d", parsed.DisorderPackets, original.DisorderPackets)
 	}
-	if parsed.AlarmFlag != original.AlarmFlag {
-		t.Errorf("AlarmFlag = 0x%08X, want 0x%08X", parsed.AlarmFlag, original.AlarmFlag)
+	if parsed.LossRate != original.LossRate {
+		t.Errorf("LossRate = %d, want %d", parsed.LossRate, original.LossRate)
 	}
-	if parsed.MediaType != original.MediaType {
-		t.Errorf("MediaType = %d, want %d", parsed.MediaType, original.MediaType)
+	if parsed.CurrentBitrate != original.CurrentBitrate {
+		t.Errorf("CurrentBitrate = %d, want %d", parsed.CurrentBitrate, original.CurrentBitrate)
 	}
-	if parsed.StreamType != original.StreamType {
-		t.Errorf("StreamType = %d, want %d", parsed.StreamType, original.StreamType)
-	}
-	if parsed.StorageType != original.StorageType {
-		t.Errorf("StorageType = %d, want %d", parsed.StorageType, original.StorageType)
-	}
-	if parsed.SeqNum != original.SeqNum {
-		t.Errorf("SeqNum = 0x%04X, want 0x%04X", parsed.SeqNum, original.SeqNum)
+	if parsed.TerminalStatus != original.TerminalStatus {
+		t.Errorf("TerminalStatus = 0x%04X, want 0x%04X", parsed.TerminalStatus, original.TerminalStatus)
 	}
 }
 
-// AUTO-FIX-2026-06-27: 0x9106 单条音视频检索应答测试
-func TestSingleAVRetrievalResponseMessage_MarshalUnmarshal(t *testing.T) {
+// FIXED-2026-07-17 [P0]: 0x9106 实时音视频传输状态通知应答测试
+func TestAVStatusNotificationResponseMessage_MarshalUnmarshal(t *testing.T) {
 	codec := NewCodec()
-	original := &SingleAVRetrievalResponseMessage{
-		SeqNum: 0x1111,
-		Items: []SingleAVRetrievalItem{
-			{
-				ChannelID:   1,
-				StartTime:   "240101000000",
-				EndTime:     "240101010000",
-				AlarmFlag:   0xDEADBEEF,
-				MediaType:   0,
-				StreamType:  0,
-				StorageType: 1,
-				FileSize:    1024 * 1024,
-			},
-		},
+	original := &AVStatusNotificationResponseMessage{
+		SeqNum:       0x1111,
+		LogicChannel: 1,
 	}
 	data, err := codec.EncodeBody(original)
 	if err != nil {
 		t.Fatalf("EncodeBody failed: %v", err)
 	}
-	// 4B header + 28B per item
-	if len(data) != 4+28 {
-		t.Fatalf("encoded length = %d, want %d", len(data), 4+28)
+	if len(data) != 3 {
+		t.Fatalf("encoded length = %d, want 3", len(data))
 	}
 
-	body, err := codec.ParseBody(MsgIDSingleAVRetrievalResponse, data)
+	body, err := codec.ParseBody(MsgIDAVStatusNotificationResponse, data)
 	if err != nil {
 		t.Fatalf("ParseBody failed: %v", err)
 	}
-	parsed, ok := body.(*SingleAVRetrievalResponseMessage)
+	parsed, ok := body.(*AVStatusNotificationResponseMessage)
 	if !ok {
-		t.Fatalf("expected *SingleAVRetrievalResponseMessage, got %T", body)
+		t.Fatalf("expected *AVStatusNotificationResponseMessage, got %T", body)
 	}
 	if parsed.SeqNum != original.SeqNum {
 		t.Errorf("SeqNum = 0x%04X, want 0x%04X", parsed.SeqNum, original.SeqNum)
 	}
-	if len(parsed.Items) != 1 {
-		t.Fatalf("Items count = %d, want 1", len(parsed.Items))
-	}
-	if parsed.Items[0].ChannelID != 1 {
-		t.Errorf("Items[0].ChannelID = %d, want 1", parsed.Items[0].ChannelID)
-	}
-	if parsed.Items[0].AlarmFlag != 0xDEADBEEF {
-		t.Errorf("Items[0].AlarmFlag = 0x%08X, want 0xDEADBEEF", parsed.Items[0].AlarmFlag)
-	}
-	if parsed.Items[0].FileSize != 1024*1024 {
-		t.Errorf("Items[0].FileSize = %d, want %d", parsed.Items[0].FileSize, 1024*1024)
+	if parsed.LogicChannel != original.LogicChannel {
+		t.Errorf("LogicChannel = %d, want %d", parsed.LogicChannel, original.LogicChannel)
 	}
 }
 

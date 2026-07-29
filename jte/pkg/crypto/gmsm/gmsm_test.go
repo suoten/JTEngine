@@ -66,6 +66,42 @@ func TestSM3_HMAC(t *testing.T) {
 	}
 }
 
+func TestSM3_HMACEqual(t *testing.T) {
+	key := []byte("audit-hmac-key")
+	msg := []byte("sensitive audit entry")
+
+	mac := SM3HMAC(key, msg)
+
+	// 正确的 MAC 应通过验证
+	if !SM3HMACEqual(key, msg, mac) {
+		t.Error("SM3HMACEqual should return true for valid MAC")
+	}
+
+	// 篡改的 MAC 应失败
+	tampered := make([]byte, len(mac))
+	copy(tampered, mac)
+	tampered[0] ^= 0xff
+	if SM3HMACEqual(key, msg, tampered) {
+		t.Error("SM3HMACEqual should return false for tampered MAC")
+	}
+
+	// 错误的 key 应失败
+	if SM3HMACEqual([]byte("wrong-key"), msg, mac) {
+		t.Error("SM3HMACEqual should return false for wrong key")
+	}
+
+	// 错误的 msg 应失败
+	if SM3HMACEqual(key, []byte("wrong-msg"), mac) {
+		t.Error("SM3HMACEqual should return false for wrong message")
+	}
+
+	// 长度不匹配的 MAC 应失败
+	shortMAC := mac[:16]
+	if SM3HMACEqual(key, msg, shortMAC) {
+		t.Error("SM3HMACEqual should return false for short MAC")
+	}
+}
+
 // ============================================================================
 // SM4 测试向量（GB/T 32907-2016 标准附录 A.1）
 // ============================================================================
@@ -156,23 +192,13 @@ func TestSM4_GCM_TamperDetection(t *testing.T) {
 }
 
 func TestSM4_CBC_InvalidPadding(t *testing.T) {
+	key, _ := SM4GenerateKey()
 	iv := make([]byte, 16)
-	// 构造无效填充的密文
+	// 构造无效填充
 	bad := make([]byte, 16)
 	bad[15] = 99 // 填充值超过块大小
-
-	// 由于 SM4 随机密钥解密后可能碰巧产生有效 PKCS#7 填充（~0.4% 概率），
-	// 最多尝试 50 次确保至少检测到一次无效填充拒绝（全通过概率 ≈ 10^-130）
-	found := false
-	for i := 0; i < 50; i++ {
-		key, _ := SM4GenerateKey()
-		if _, err := SM4DecryptCBC(key, iv, bad); err != nil {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("SM4 CBC should reject invalid padding (no failure in 50 random attempts)")
+	if _, err := SM4DecryptCBC(key, iv, bad); err == nil {
+		t.Error("SM4 CBC should reject invalid padding")
 	}
 }
 

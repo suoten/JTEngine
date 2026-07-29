@@ -45,6 +45,20 @@ import (
 //   - GET /reports/driving-behavior 驾驶行为分析
 // ===================================================================
 
+// AUTO-FIX-2026-07-14 [ConvergeLoop-可读性]: 提取魔法数字为命名常量
+// 这些阈值在 api_extended.go、extended.go、trip.go 中重复使用，
+// 修改阈值时只需改一处，避免不一致风险。
+const (
+	overspeedThresholdKMH  = 120.0  // 超速阈值（km/h），中国高速限速 120km/h
+	rapidAccelThresholdKMH = 30.0   // 急加速阈值（km/h in 1s）
+	rapidDecelThresholdKMH = -30.0  // 急减速阈值（km/h in 1s）
+	harshBrakeThresholdKMH = -10.0  // 急刹车阈值（km/h speed diff）
+	harshAccelThresholdKMH = 10.0   // 急起步阈值（km/h speed diff）
+	trackCompressMinPoints = 500    // 轨迹压缩最小点数阈值
+	douglasPeuckerEpsilon  = 0.0001 // Douglas-Peucker 容差（≈11米）
+	maxReportTimeRangeDays = 31     // 报表最大查询天数
+)
+
 // -------------------------------------------------------------------
 // 1. 轨迹数据模块扩展
 // -------------------------------------------------------------------
@@ -128,17 +142,17 @@ func (h *TrackHandler) GetTrackPlayback(c *gin.Context) {
 
 	// 轨迹压缩：若 compress=true 且点数超过阈值，执行 Douglas-Peucker 简化
 	compress := c.Query("compress") == "true"
-	if compress && len(locations) > 500 {
-		locations = douglasPeuckerCompress(locations, 0.0001)
+	if compress && len(locations) > trackCompressMinPoints {
+		locations = douglasPeuckerCompress(locations, douglasPeuckerEpsilon)
 	}
 
 	// 计算轨迹统计信息
 	stats := computeTrackStats(locations)
 
 	c.JSON(http.StatusOK, gin.H{
-		"track":  locations,
-		"total":  len(locations),
-		"stats":  stats,
+		"track": locations,
+		"total": len(locations),
+		"stats": stats,
 	})
 }
 
@@ -181,8 +195,10 @@ func (h *TrackHandler) ExportTrack(c *gin.Context) {
 	if format == "xlsx" {
 		ext = "xls"
 	}
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 清洗 vehicleID 防止 Content-Disposition 头注入
+	safeVehicleID := sanitizeFilename(vehicleID)
 	filename := fmt.Sprintf("track_%s_%s_%s.%s",
-		vehicleID,
+		safeVehicleID,
 		startTime.Format("20060102"),
 		endTime.Format("20060102"),
 		ext)
@@ -269,6 +285,33 @@ func writeExcelCell(w io.Writer, dataType, value string) {
 func xmlEscape(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", `'`, "&apos;")
 	return r.Replace(s)
+}
+
+// sanitizeFilename 清洗文件名中的危险字符，防止 Content-Disposition 头注入和路径遍历。
+// 移除 CR/LF（HTTP 响应拆分）、路径分隔符（路径遍历）、控制字符，保留可读的 ASCII 和中文。
+// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 数据流安全 - 用户输入到 HTTP 头
+func sanitizeFilename(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	// 移除 CR/LF 防止 HTTP 响应拆分，移除路径分隔符防止路径遍历
+	r := strings.NewReplacer(
+		"\r", "", "\n", "",
+		"/", "_", "\\", "_",
+		":", "_", "*", "_",
+		"?", "_", "\"", "_",
+		"<", "_", ">", "_",
+		"|", "_",
+	)
+	cleaned := r.Replace(s)
+	// 截断过长文件名（防止 HTTP 头过长）
+	if len(cleaned) > 64 {
+		cleaned = cleaned[:64]
+	}
+	if cleaned == "" {
+		return "unknown"
+	}
+	return cleaned
 }
 
 // GetMileageStats godoc
@@ -556,13 +599,13 @@ func (h *AlarmHandler) GetAlarmReport(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"total":     total,
-		"group_by":  groupBy,
-		"jt808":     jt808Count,
-		"jt1045":    jt1045Count,
-		"daily":     dailyStats,
-		"start":     startTime.Format(time.RFC3339),
-		"end":       endTime.Format(time.RFC3339),
+		"total":    total,
+		"group_by": groupBy,
+		"jt808":    jt808Count,
+		"jt1045":   jt1045Count,
+		"daily":    dailyStats,
+		"start":    startTime.Format(time.RFC3339),
+		"end":      endTime.Format(time.RFC3339),
 	})
 }
 
@@ -641,11 +684,11 @@ func (h *DeviceHandler) BatchImportDevices(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"code":     0,
-		"success":  successCount,
-		"failed":   failCount,
-		"errors":   errors,
-		"total":    len(records) - 1,
+		"code":    0,
+		"success": successCount,
+		"failed":  failCount,
+		"errors":  errors,
+		"total":   len(records) - 1,
 	})
 }
 
@@ -752,10 +795,10 @@ func (h *ReportHandler) GetOnlineRateReport(c *gin.Context) {
 	for d := startTime; d.Before(endTime); d = d.AddDate(0, 0, 1) {
 		// 当前实现无历史在线率存储，返回估算值
 		dailyStats = append(dailyStats, map[string]interface{}{
-			"date":         d.Format("2006-01-02"),
-			"online":       onlineCount,
-			"offline":      offlineCount,
-			"online_rate":  computeOnlineRate(onlineCount, total),
+			"date":        d.Format("2006-01-02"),
+			"online":      onlineCount,
+			"offline":     offlineCount,
+			"online_rate": computeOnlineRate(onlineCount, total),
 		})
 	}
 
@@ -972,11 +1015,11 @@ func aggregateMileage(locations []*storage.LocationData, period string, start, e
 
 // trackStats 轨迹统计信息
 type trackStats struct {
-	TotalPoints int     `json:"total_points"`
+	TotalPoints   int     `json:"total_points"`
 	TotalDistance float64 `json:"total_distance"`
-	Duration    float64 `json:"duration_hours"`
-	MaxSpeed    float64 `json:"max_speed"`
-	AvgSpeed    float64 `json:"avg_speed"`
+	Duration      float64 `json:"duration_hours"`
+	MaxSpeed      float64 `json:"max_speed"`
+	AvgSpeed      float64 `json:"avg_speed"`
 }
 
 // computeTrackStats 计算轨迹统计信息
@@ -998,12 +1041,20 @@ func computeTrackStats(locations []*storage.LocationData) trackStats {
 		duration = locations[len(locations)-1].Time.Sub(locations[0].Time).Hours()
 	}
 
+	// AUTO-FIX-2026-07-15 [ConvergeLoop-一般]: 里程表回退保护，防止负数
+	distance := locations[len(locations)-1].Mileage - locations[0].Mileage
+	if distance < 0 {
+		distance = 0
+	}
 	return trackStats{
-		TotalPoints:  len(locations),
-		TotalDistance: locations[len(locations)-1].Mileage,
-		Duration:    duration,
-		MaxSpeed:    maxSpeed,
-		AvgSpeed:    totalSpeed / float64(len(locations)),
+		TotalPoints: len(locations),
+		// AUTO-FIX-2026-07-14 [ConvergeLoop-严重]: 使用首末点里程差计算行驶距离
+		// Mileage 是车辆总里程表读数（累计值），原代码直接用末点读数作为"总行驶距离"，
+		// 导致查询1小时轨迹返回50000km（车辆总里程）而非实际行驶的50km。
+		TotalDistance: distance,
+		Duration:      duration,
+		MaxSpeed:      maxSpeed,
+		AvgSpeed:      totalSpeed / float64(len(locations)),
 	}
 }
 
@@ -1054,7 +1105,7 @@ func perpendicularDistance(p, start, end *storage.LocationData) float64 {
 	if denom == 0 {
 		return 0
 	}
-	return absVal(A*p.Longitude + B*p.Latitude + C) / denom
+	return absVal(A*p.Longitude+B*p.Latitude+C) / denom
 }
 
 func sqrt(x float64) float64 {
@@ -1094,9 +1145,10 @@ func analyzeDrivingBehavior(locations []*storage.LocationData) drivingBehavior {
 
 	var behavior drivingBehavior
 	var totalSpeed float64
-	overspeedThreshold := 120.0 // km/h
-	rapidAccelThreshold := 30.0 // km/h in 1s
-	rapidDecelThreshold := -30.0
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-可读性]: 使用命名常量替代魔法数字
+	overspeedThreshold := overspeedThresholdKMH
+	rapidAccelThreshold := rapidAccelThresholdKMH
+	rapidDecelThreshold := rapidDecelThresholdKMH
 
 	for i, loc := range locations {
 		if loc.Speed > behavior.maxSpeed {
@@ -1133,7 +1185,8 @@ func analyzeDrivingBehavior(locations []*storage.LocationData) drivingBehavior {
 func writeGPX(w http.ResponseWriter, vehicleID string, locations []*storage.LocationData) {
 	fmt.Fprintln(w, `<?xml version="1.0" encoding="UTF-8"?>`)
 	fmt.Fprintln(w, `<gpx version="1.1" creator="JTE" xmlns="http://www.topografix.com/GPX/1/1">`)
-	fmt.Fprintf(w, "  <trk><name>%s</name><trkseg>\n", vehicleID)
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: XML 转义防止 vehicleID 注入（XSS）
+	fmt.Fprintf(w, "  <trk><name>%s</name><trkseg>\n", xmlEscape(vehicleID))
 	for _, loc := range locations {
 		fmt.Fprintf(w, `    <trkpt lat="%.6f" lon="%.6f">`+"\n", loc.Latitude, loc.Longitude)
 		fmt.Fprintf(w, "      <ele>%.1f</ele>\n", loc.Altitude)
@@ -1150,7 +1203,8 @@ func writeKML(w http.ResponseWriter, vehicleID string, locations []*storage.Loca
 	fmt.Fprintln(w, `<?xml version="1.0" encoding="UTF-8"?>`)
 	fmt.Fprintln(w, `<kml xmlns="http://www.opengis.net/kml/2.2">`)
 	fmt.Fprintln(w, "  <Document>")
-	fmt.Fprintf(w, "    <name>%s</name>\n", vehicleID)
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: XML 转义防止 vehicleID 注入（XSS）
+	fmt.Fprintf(w, "    <name>%s</name>\n", xmlEscape(vehicleID))
 	fmt.Fprintln(w, "    <Placemark>")
 	fmt.Fprintln(w, "      <LineString>")
 	fmt.Fprintln(w, "        <coordinates>")

@@ -37,7 +37,7 @@ func TestAuthManagerLoginLogout(t *testing.T) {
 	}
 
 	info, ok := mgr.GetAuthInfo("JTE-TEST-1234-5678-ABCD")
-	if ok && info != nil {
+	if ok {
 		t.Logf("Auth info: key=%s, valid=%v", info.LicenseKey, info.Valid)
 	}
 }

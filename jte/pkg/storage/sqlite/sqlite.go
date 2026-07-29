@@ -27,6 +27,9 @@ func NewSQLiteStore(dbPath string, logger *zap.Logger) (*SQLiteStore, error) {
 
 	db.SetMaxOpenConns(0)
 	db.SetMaxIdleConns(5)
+	// FIXED: [连接池生命周期] 添加连接最大存活时间和空闲超时，防止长期运行的连接累积问题 [2026-07-17]
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 
 	// WAL 模式提升并发读性能；CGO 禁用时 go-sqlite3 为 stub，PRAGMA 可能失败，此处 best-effort
 	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
@@ -331,8 +334,9 @@ func (s *SQLiteStore) ListVehicles(ctx context.Context, opts storage.ListOptions
 	args := []interface{}{}
 
 	if opts.Phone != "" {
-		where = append(where, "phone LIKE ?")
-		args = append(args, opts.Phone+"%")
+		// FIXED: [LIKE 通配符注入] 使用 SanitizeLikeValue 转义用户输入中的 % 和 _ [2026-07-17]
+		where = append(where, "phone LIKE ? ESCAPE '\\'")
+		args = append(args, safesql.SanitizeLikeValue(opts.Phone)+"%")
 	}
 	if opts.Online != nil {
 		where = append(where, "online = ?")
@@ -418,9 +422,12 @@ func (s *SQLiteStore) GetLatestLocation(ctx context.Context, vehicleID string) (
 }
 
 func (s *SQLiteStore) GetLocationTrack(ctx context.Context, vehicleID string, start, end time.Time) ([]*storage.LocationData, error) {
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-严重]: 添加安全 LIMIT 防止大时间范围查询导致 OOM
+	// 5秒上报间隔下 100000 行 ≈ 5.8 天数据，足以满足轨迹回放需求。
+	// 用户请求 1 年数据时原查询返回 630 万行，内存消耗 ~2GB，必然 OOM。
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT vehicle_id, phone, latitude, longitude, altitude, speed, direction, time, alarm_flag, status_flag, mileage, fuel, received_at, source
-		 FROM locations WHERE vehicle_id = ? AND received_at BETWEEN ? AND ? ORDER BY received_at`,
+		 FROM locations WHERE vehicle_id = ? AND received_at BETWEEN ? AND ? ORDER BY received_at LIMIT 100000`,
 		vehicleID, start, end)
 	if err != nil {
 		return nil, err
@@ -462,8 +469,14 @@ func (s *SQLiteStore) ListAlarms(ctx context.Context, opts storage.ListOptions) 
 	args := []interface{}{}
 
 	if opts.Phone != "" {
-		where = append(where, "phone LIKE ?")
-		args = append(args, opts.Phone+"%")
+		// FIXED: [LIKE 通配符注入] 使用 SanitizeLikeValue 转义用户输入中的 % 和 _ [2026-07-17]
+		where = append(where, "phone LIKE ? ESCAPE '\\'")
+		args = append(args, safesql.SanitizeLikeValue(opts.Phone)+"%")
+	}
+	// FIXED-2026-07-17 [P0]: 支持按报警 ID 精确查询
+	if opts.AlarmID != "" {
+		where = append(where, "id = ?")
+		args = append(args, opts.AlarmID)
 	}
 	if opts.Start != "" && opts.End != "" {
 		where = append(where, "received_at BETWEEN ? AND ?")
@@ -614,10 +627,16 @@ func (s *SQLiteStore) GetAlarmCountBySource(ctx context.Context, source string, 
 }
 
 func (s *SQLiteStore) ListOnlineLocations(ctx context.Context) ([]*storage.LocationData, error) {
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-严重]: 消除关联子查询，改用派生表 JOIN
+	// 原查询 `l.id = (SELECT MAX(id) FROM locations WHERE vehicle_id = l.vehicle_id)` 是关联子查询，
+	// 对 locations 每行都执行一次子查询。1000万行 locations + 1000 辆在线车 = 100亿次子查询。
+	// 改用派生表 GROUP BY 一次性计算每车最大 id，再 JOIN 取对应行，复杂度降为 O(n)。
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT l.vehicle_id, l.phone, l.latitude, l.longitude, l.altitude, l.speed, l.direction, l.time, l.alarm_flag, l.status_flag, l.mileage, l.fuel, l.received_at, l.source
-		 FROM locations l INNER JOIN vehicles v ON l.vehicle_id = v.id
-		 WHERE v.online = 1 AND l.id = (SELECT MAX(id) FROM locations WHERE vehicle_id = l.vehicle_id)`)
+		 FROM locations l
+		 INNER JOIN vehicles v ON l.vehicle_id = v.id
+		 INNER JOIN (SELECT vehicle_id, MAX(id) AS max_id FROM locations GROUP BY vehicle_id) m ON l.id = m.max_id
+		 WHERE v.online = 1`)
 	if err != nil {
 		return nil, err
 	}
@@ -648,8 +667,9 @@ func (s *SQLiteStore) ListProtocolLogs(ctx context.Context, opts storage.ListOpt
 	args := []interface{}{}
 
 	if opts.Phone != "" {
-		where = append(where, "phone LIKE ?")
-		args = append(args, opts.Phone+"%")
+		// FIXED: [LIKE 通配符注入] 使用 SanitizeLikeValue 转义用户输入中的 % 和 _ [2026-07-17]
+		where = append(where, "phone LIKE ? ESCAPE '\\'")
+		args = append(args, safesql.SanitizeLikeValue(opts.Phone)+"%")
 	}
 
 	whereClause := strings.Join(where, " AND ")
@@ -933,14 +953,49 @@ func (s *SQLiteStore) SaveAVParam(ctx context.Context, param *storage.AVParamDat
 }
 
 func (s *SQLiteStore) ListTerminalProps(ctx context.Context, opts storage.ListOptions) (*storage.ListResult, error) {
-	query := `SELECT id, phone, manufacturer_id, model, hardware_version, firmware_version, gnss_support, comm_module, received_at FROM terminal_props ORDER BY received_at DESC`
-	rows, err := s.db.QueryContext(ctx, query)
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-严重]: 添加分页和过滤，原实现忽略 opts 参数返回全表
+	// terminal_props 表无 LIMIT 时全表扫描+排序，10万行时内存 ~50MB 且查询耗时 >2s。
+	// Total 原为 len(items)（加载后计算），分页后 Total < 实际总数导致前端分页器失效。
+	where := []string{"1=1"}
+	args := []interface{}{}
+
+	if opts.Phone != "" {
+		// FIXED: [LIKE 通配符注入] 使用 SanitizeLikeValue 转义用户输入中的 % 和 _ [2026-07-17]
+		where = append(where, "phone LIKE ? ESCAPE '\\'")
+		args = append(args, safesql.SanitizeLikeValue(opts.Phone)+"%")
+	}
+
+	whereClause := strings.Join(where, " AND ")
+
+	var total int64
+	countSQL := fmt.Sprintf("SELECT COUNT(*) FROM terminal_props WHERE %s", whereClause)
+	if err := s.db.QueryRowContext(ctx, countSQL, args...).Scan(&total); err != nil {
+		return nil, err
+	}
+
+	offset := opts.Offset
+	if offset == 0 && opts.Page > 0 {
+		offset = (opts.Page - 1) * opts.PageSize
+	}
+	pageSize := opts.PageSize
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+
+	orderBy := "received_at DESC"
+	if opts.OrderBy != "" {
+		orderBy = safesql.ValidateOrderBy(opts.OrderBy, "received_at DESC")
+	}
+
+	querySQL := fmt.Sprintf("SELECT id, phone, manufacturer_id, model, hardware_version, firmware_version, gnss_support, comm_module, received_at FROM terminal_props WHERE %s ORDER BY %s LIMIT ? OFFSET ?", whereClause, orderBy)
+	queryArgs := append(args, pageSize, offset)
+	rows, err := s.db.QueryContext(ctx, querySQL, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var items []*storage.TerminalPropData
+	items := make([]*storage.TerminalPropData, 0)
 	for rows.Next() {
 		p := &storage.TerminalPropData{}
 		if err := rows.Scan(&p.ID, &p.Phone, &p.ManufacturerID, &p.Model, &p.HardwareVersion,
@@ -949,7 +1004,7 @@ func (s *SQLiteStore) ListTerminalProps(ctx context.Context, opts storage.ListOp
 		}
 		items = append(items, p)
 	}
-	return &storage.ListResult{Items: items, Total: int64(len(items))}, nil
+	return &storage.ListResult{Items: items, Total: total, Page: opts.Page, Size: pageSize}, nil
 }
 
 func (s *SQLiteStore) SaveInfoMenuResp(ctx context.Context, resp *storage.InfoMenuRespData) error {

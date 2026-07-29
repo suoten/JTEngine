@@ -14,7 +14,7 @@ import (
 // jwtSecret 为默认密钥，jwtCfg 为多密钥轮换配置（可为 nil）。
 // 安全措施：
 //  1. 强制 HMAC 签名方法，防止 alg=none 攻击
-//  2. 支持 kid 多密钥轮换，未找到则回退到 jwtSecret
+//  2. 支持 kid 多密钥轮换，未知 kid 显式拒绝（防密钥降级攻击）
 //  3. 验证 token.Valid（包含 exp 过期检查）
 func VerifyJWT(tokenStr string, jwtSecret string, jwtCfg *config.JWTConfig) (*jwt.Token, error) {
 	if tokenStr == "" {
@@ -25,12 +25,21 @@ func VerifyJWT(tokenStr string, jwtSecret string, jwtCfg *config.JWTConfig) (*jw
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
+		// FIXED: [密钥降级攻击] 与 auth middleware 一致，显式拒绝未知 kid [2026-07-17]
 		if kid, ok := token.Header["kid"].(string); ok && kid != "" {
 			if jwtCfg != nil {
 				if secret, found := jwtCfg.GetSecret(kid); found {
 					return []byte(secret), nil
 				}
+				// 显式拒绝未注册的 kid，防止密钥回退降级
+				return nil, fmt.Errorf("token kid '%s' not found in kms, possible key rotation or tampering", kid)
 			}
+			// 配置了 kid 但 JWT KMS 未启用，拒绝带 kid 的 token
+			return nil, fmt.Errorf("token carries kid '%s' but KMS not configured", kid)
+		}
+		// 无 kid 的旧 token，回退到默认 secret
+		if jwtSecret == "" {
+			return nil, fmt.Errorf("no kid in token and default jwtSecret is empty, refuse to accept token")
 		}
 		return []byte(jwtSecret), nil
 	})

@@ -102,7 +102,22 @@ func (h *GeofenceHandler) Update(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P2]: Update 必须校验必填字段，
+	// 防止空值覆盖现有数据破坏完整性（与 Create 校验一致）
+	if g.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "name is required"})
+		return
+	}
+	if g.Type < 1 || g.Type > 3 {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "type must be 1(circle)/2(rect)/3(polygon)"})
+		return
+	}
+	if g.Params == "" {
+		g.Params = "{}"
+	}
 	g.ID = id
+	now := time.Now()
+	g.UpdatedAt = now
 	if err := h.store.SaveGeofence(context.Background(), &g); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return

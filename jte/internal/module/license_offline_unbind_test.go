@@ -58,18 +58,15 @@ func TestDeriveOfflineUnbindKey_InjectedSecretDiffersFromDefault(t *testing.T) {
 	}
 }
 
-// TestDeriveOfflineUnbindKey_NilSecretFallsBackToDefault 验证未注入 secret
-// （nil）时回退到 defaultOfflineUnbindHMACSecret，保持向后兼容。
-func TestDeriveOfflineUnbindKey_NilSecretFallsBackToDefault(t *testing.T) {
+// TestDeriveOfflineUnbindKey_NilSecretReturnsNil 验证未注入 secret
+// （nil）时返回 nil，拒绝生成 HMAC 密钥（P0-FIX：移除硬编码 secret 后的安全行为）。
+func TestDeriveOfflineUnbindKey_NilSecretReturnsNil(t *testing.T) {
 	const fp = "test-fingerprint-xyz"
 	mNil := newTestLicenseManager(nil, fp)
 
-	// 直接用默认 secret 派生，作为基准
-	keyRef := sha256.Sum256(append([]byte(fp), defaultOfflineUnbindHMACSecret...))
 	keyGot := mNil.deriveOfflineUnbindKey(fp)
-
-	if fmt.Sprintf("%x", keyGot) != fmt.Sprintf("%x", keyRef[:]) {
-		t.Fatal("nil secret must fall back to defaultOfflineUnbindHMACSecret")
+	if keyGot != nil {
+		t.Fatal("nil secret must return nil key (P0-FIX: hardcoded secret removed)")
 	}
 }
 

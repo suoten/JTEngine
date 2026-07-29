@@ -89,6 +89,7 @@ func (s *Supervisor) Stop() {
 }
 
 // run supervisor 主循环：周期性探活 + 重启失败模块。
+// FIXED: [P1] run 循环中 checkAll 缺少 recover()，单次检查 panic 会导致 supervisor 永久退出 [2026-07-17]
 func (s *Supervisor) run() {
 	defer close(s.doneCh)
 
@@ -100,7 +101,16 @@ func (s *Supervisor) run() {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-			s.checkAll()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						s.loader.logger.Error("supervisor checkAll panic recovered",
+							zap.Any("panic", r),
+							zap.Stack("stack"))
+					}
+				}()
+				s.checkAll()
+			}()
 		}
 	}
 }

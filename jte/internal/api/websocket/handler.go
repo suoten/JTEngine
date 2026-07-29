@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -33,7 +34,8 @@ var upgrader = websocket.Upgrader{
 var defaultUpgraderOrigins = newOriginSet()
 
 type originSet struct {
-	origins map[string]bool
+	mu       sync.RWMutex // [P2-1] 并发保护：set() 加写锁，isAllowed() 加读锁
+	origins  map[string]bool
 	allowAll bool
 }
 
@@ -42,7 +44,10 @@ func newOriginSet() *originSet {
 }
 
 func (o *originSet) set(origins []string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.origins = make(map[string]bool, len(origins))
+	o.allowAll = false
 	for _, origin := range origins {
 		o.origins[origin] = true
 		if origin == "*" {
@@ -52,6 +57,8 @@ func (o *originSet) set(origins []string) {
 }
 
 func (o *originSet) isAllowed(origin string) bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	if o.allowAll || len(o.origins) == 0 {
 		return true
 	}
@@ -89,12 +96,22 @@ func (h *Handler) verifyToken(tokenStr string) (*jwt.Token, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
+		// FIXED: [密钥降级攻击] 与 auth middleware 一致，显式拒绝未知 kid [2026-07-17]
+		// 原实现对未知 kid 回退到默认 secret，攻击者可伪造 kid 绕过密钥轮换。
 		if kid, ok := token.Header["kid"].(string); ok && kid != "" {
 			if h.cfg.API.JWT != nil {
 				if secret, found := h.cfg.API.JWT.GetSecret(kid); found {
 					return []byte(secret), nil
 				}
+				// 显式拒绝未注册的 kid，防止密钥回退降级
+				return nil, fmt.Errorf("token kid '%s' not found in kms, possible key rotation or tampering", kid)
 			}
+			// 配置了 kid 但 JWT KMS 未启用，拒绝带 kid 的 token
+			return nil, fmt.Errorf("token carries kid '%s' but KMS not configured", kid)
+		}
+		// 无 kid 的旧 token，回退到默认 secret
+		if h.cfg.API.JWTSecret == "" {
+			return nil, fmt.Errorf("no kid in token and default jwtSecret is empty, refuse to accept token")
 		}
 		return []byte(h.cfg.API.JWTSecret), nil
 	})

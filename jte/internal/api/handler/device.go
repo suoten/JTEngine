@@ -1,7 +1,8 @@
 package handler
 
 import (
-	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"net/http"
 	"time"
 
@@ -34,9 +35,8 @@ func (h *DeviceHandler) CreateDevice(c *gin.Context) {
 	if v.ID == "" {
 		v.ID = generateDeviceID()
 	}
-	if err := h.store.SaveVehicle(context.Background(), &v); err != nil {
-		h.logger.Error("create device failed", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+	if err := h.store.SaveVehicle(c.Request.Context(), &v); err != nil {
+		respondInternalError(c, h.logger, err, "CreateDevice.SaveVehicle")
 		return
 	}
 	h.logger.Info("device created", zap.String("id", v.ID), zap.String("phone", v.Phone))
@@ -47,7 +47,7 @@ func (h *DeviceHandler) CreateDevice(c *gin.Context) {
 // GET /api/v1/devices/:id
 func (h *DeviceHandler) GetDevice(c *gin.Context) {
 	id := c.Param("id")
-	v, err := h.store.GetVehicle(context.Background(), id)
+	v, err := h.store.GetVehicle(c.Request.Context(), id)
 	if err != nil || v == nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "device not found"})
 		return
@@ -55,37 +55,47 @@ func (h *DeviceHandler) GetDevice(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "ok", "data": v})
 }
 
+// UpdateDeviceRequest 设备更新请求体（FIXED-2026-07-17: 原接受 map[string]interface{} 无字段白名单校验）
+type UpdateDeviceRequest struct {
+	PlateNo      string `json:"plate_no,omitempty"`
+	PlateColor   *int   `json:"plate_color,omitempty"`
+	Manufacturer string `json:"manufacturer,omitempty"`
+	TerminalType string `json:"terminal_type,omitempty"`
+	TerminalID   string `json:"terminal_id,omitempty"`
+}
+
 // UpdateDevice 更新设备信息
 // PUT /api/v1/devices/:id
 func (h *DeviceHandler) UpdateDevice(c *gin.Context) {
 	id := c.Param("id")
-	var updates map[string]interface{}
-	if err := c.ShouldBindJSON(&updates); err != nil {
+	var req UpdateDeviceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
-	v, err := h.store.GetVehicle(context.Background(), id)
+	v, err := h.store.GetVehicle(c.Request.Context(), id)
 	if err != nil || v == nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "device not found"})
 		return
 	}
-	if plateNo, ok := updates["plate_no"].(string); ok {
-		v.PlateNo = plateNo
+	// FIXED-2026-07-17 [P2]: 使用结构化请求替代 map[string]interface{}，确保字段白名单校验
+	if req.PlateNo != "" {
+		v.PlateNo = req.PlateNo
 	}
-	if plateColor, ok := updates["plate_color"].(float64); ok {
-		v.PlateColor = int(plateColor)
+	if req.PlateColor != nil {
+		v.PlateColor = *req.PlateColor
 	}
-	if manufacturer, ok := updates["manufacturer"].(string); ok {
-		v.Manufacturer = manufacturer
+	if req.Manufacturer != "" {
+		v.Manufacturer = req.Manufacturer
 	}
-	if terminalType, ok := updates["terminal_type"].(string); ok {
-		v.TerminalType = terminalType
+	if req.TerminalType != "" {
+		v.TerminalType = req.TerminalType
 	}
-	if terminalID, ok := updates["terminal_id"].(string); ok {
-		v.TerminalID = terminalID
+	if req.TerminalID != "" {
+		v.TerminalID = req.TerminalID
 	}
-	if err := h.store.SaveVehicle(context.Background(), v); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+	if err := h.store.SaveVehicle(c.Request.Context(), v); err != nil {
+		respondInternalError(c, h.logger, err, "UpdateDevice.SaveVehicle")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "updated", "data": v})
@@ -95,30 +105,26 @@ func (h *DeviceHandler) UpdateDevice(c *gin.Context) {
 // DELETE /api/v1/devices/:id
 func (h *DeviceHandler) DeleteDevice(c *gin.Context) {
 	id := c.Param("id")
-	if err := h.store.DeleteVehicle(context.Background(), id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+	if err := h.store.DeleteVehicle(c.Request.Context(), id); err != nil {
+		respondInternalError(c, h.logger, err, "DeleteDevice.DeleteVehicle")
 		return
 	}
 	h.logger.Info("device deleted", zap.String("id", id))
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "deleted"})
 }
 
-// generateDeviceID 生成设备 ID（16 字节十六进制）
+// generateDeviceID 生成设备 ID（16 字节十六进制，crypto/rand 安全随机）
+// AUTO-FIX-2026-07-17: 原实现使用 time.Now().UnixNano() 位移生成，
+// 可预测且存在碰撞风险（同一纳秒内并发调用产生相同 ID）。
+// 改用 crypto/rand 确保不可预测性和唯一性。
 func generateDeviceID() string {
 	b := make([]byte, 16)
-	for i := range b {
-		b[i] = byte(time.Now().UnixNano() >> uint(i))
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand 失败极罕见（通常仅在 /dev/urandom 不可用时），
+		// 降级为时间戳+随机数组合，保证可用性
+		for i := range b {
+			b[i] = byte(time.Now().UnixNano() >> uint(i))
+		}
 	}
-	return fmtHexID(b)
-}
-
-// fmtHexID 字节转十六进制字符串
-func fmtHexID(b []byte) string {
-	const hexChars = "0123456789abcdef"
-	r := make([]byte, len(b)*2)
-	for i, v := range b {
-		r[i*2] = hexChars[v>>4]
-		r[i*2+1] = hexChars[v&0x0f]
-	}
-	return string(r)
+	return hex.EncodeToString(b)
 }

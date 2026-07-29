@@ -1,5 +1,14 @@
 version: "3.8"
 
+# AUTO-FIX-2026-07-21 [P0-安全]: 移除所有弱密码默认值，生产环境强制通过环境变量传入
+# 使用前请确保 .env 文件已配置以下必需变量：
+#   MYSQL_ROOT_PASSWORD  - MySQL root 密码（必需）
+#   MINIO_ACCESS_KEY    - MinIO 访问密钥（必需）
+#   MINIO_SECRET_KEY    - MinIO 秘密密钥（必需）
+#   REDIS_PASSWORD      - Redis 密码（必需）
+#   TDENGINE_PASSWORD   - TDengine 密码（必需）
+# 任一缺失将导致容器启动失败（见下方校验）
+
 services:
   jte:
     build:
@@ -11,42 +20,187 @@ services:
     volumes:
       - ./configs:/app/configs
       - ./modules:/app/modules
+      - jte-logs:/app/logs
+      - jte-spool:/app/spool
     depends_on:
-      - mysql
-      - redis
-      - zlmediakit
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      tdengine:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      zlmediakit:
+        condition: service_healthy
     environment:
-      - JTE_GATEWAY_TCPPORT=7611
+      - JTE_GATEWAY_TCP_PORT=7611
       - JTE_API_PORT=8080
       - JTE_STORAGE_TYPE=mysql
-      - JTE_STORAGE_DSN=root:jte123@tcp(mysql:3306)/jte?charset=utf8mb4&parseTime=True&loc=Local
+      # [P0-安全] 移除密码默认值，强制通过环境变量注入
+      - JTE_STORAGE_DSN=root:${MYSQL_ROOT_PASSWORD}@tcp(mysql:3306)/jte?charset=utf8mb4&parseTime=True&loc=Local
       - JTE_ZLMEDIAKIT_URL=http://zlmediakit:80
+      - JTE_TDENGINE_DSN=ws://tdengine:6041
+      - JTE_TDENGINE_HOST=tdengine
+      - JTE_TDENGINE_PORT=6030
+      - JTE_TDENGINE_WS_PORT=6041
+      - JTE_TDENGINE_PASSWORD=${TDENGINE_PASSWORD}
+      - JTE_REDIS_HOST=redis
+      - JTE_REDIS_PORT=6379
+      - JTE_REDIS_PASSWORD=${REDIS_PASSWORD}
+      - JTE_MINIO_ENDPOINT=minio:9000
+      # [P0-安全] 移除密钥默认值，强制通过环境变量注入
+      - JTE_MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - JTE_MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - JTE_MINIO_BUCKET=${MINIO_BUCKET:-jte}
+      - JTE_MINIO_USE_SSL=false
+      - JTE_ENV=production
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+    healthcheck:
+      test: ["CMD-SHELL", "if [ \"$$JTE_API_TLS_ENABLED\" = \"true\" ]; then wget -qO- --no-check-certificate https://localhost:8080/healthz; else wget -qO- http://localhost:8080/healthz; fi || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - jte-net
 
   mysql:
     image: mysql:8.0
+    # [P0-安全] 移除默认密码 jte123，强制通过环境变量传入
+    # MYSQL_ROOT_PASSWORD 未设置时 MySQL 容器会拒绝启动并报错
     environment:
-      MYSQL_ROOT_PASSWORD: jte123
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:?ERROR: MYSQL_ROOT_PASSWORD is required in production}"
       MYSQL_DATABASE: jte
     volumes:
       - mysql-data:/var/lib/mysql
-    ports:
-      - "3306:3306"
+    # FIXED: [P2-2] 生产环境不暴露 MySQL 端口到宿主机，仅通过 jte-net 内部访问
+    # 开发环境需要时取消注释下方 ports
+    # ports:
+    #   - "3306:3306"
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - jte-net
 
   redis:
     image: redis:7-alpine
+    # [P0-安全] 添加密码保护，强制通过环境变量传入
+    # REDIS_PASSWORD 未设置时容器启动失败并提示
+    command: >
+      sh -c 'if [ -z "$$REDIS_PASSWORD" ]; then echo "ERROR: REDIS_PASSWORD is required in production" >&2; exit 1; fi && redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru'
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?ERROR:REDIS_PASSWORD_is_required_in_production}
+    # FIXED: [P2-2] 生产环境不暴露 Redis 端口到宿主机
+    # 开发环境需要时取消注释下方 ports
+    # ports:
+    #   - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - jte-net
+
+  tdengine:
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 锁定版本，3.3.x 是通配符不是具体版本
+    image: tdengine/tdengine:3.3.2.0
+    # [P0-安全] 生产环境强制配置密码，通过环境变量传入
+    # TDengine 镜像默认使用 root/taosdata，生产环境必须通过 init 脚本修改
+    environment:
+      TAOS_FQDN: tdengine
+      TDENGINE_PASSWORD: "${TDENGINE_PASSWORD:?ERROR: TDENGINE_PASSWORD is required in production}"
+    # FIXED: [P2-2] 生产环境不暴露 TDengine 端口到宿主机
+    # 开发环境需要时取消注释下方 ports
+    # ports:
+    #   - "6030:6030"
+    #   - "6041:6041"
+    #   - "6043-6049:6043-6049"
+    #   - "6043-6049:6043-6049/udp"
+    volumes:
+      - tdengine-data:/var/lib/taos
+      - tdengine-log:/var/log/taos
+      - ./deploy/tdengine-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "taos", "-s", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - jte-net
+
+  minio:
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 锁定 MinIO 版本
+    image: minio/minio:RELEASE.2024-07-16T15-48-33Z
+    command: server /data --console-address ":9001"
+    # [P0-安全] 移除默认密钥 jte_minio/jte_minio_secret，强制通过环境变量传入
+    # MINIO_ACCESS_KEY/MINIO_SECRET_KEY 未设置时 MinIO 容器会拒绝启动并报错
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ACCESS_KEY:?ERROR: MINIO_ACCESS_KEY is required in production}"
+      MINIO_ROOT_PASSWORD: "${MINIO_SECRET_KEY:?ERROR: MINIO_SECRET_KEY is required in production}"
     ports:
-      - "6379:6379"
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - jte-net
 
   zlmediakit:
-    image: zlmediakit/zlmediakit:master
+    # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 锁定 ZLMediaKit 版本
+    image: zlmediakit/zlmediakit:release-12.0.0
     ports:
       - "80:80"
       - "1935:1935"
       - "554:554"
       - "8000:8000/udp"
+      - "10000:10000/udp"
     volumes:
       - zlm-data:/opt/media
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/index/api/getServerConfig || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - jte-net
 
 volumes:
   mysql-data:
+  redis-data:
+  tdengine-data:
+  tdengine-log:
+  minio-data:
   zlm-data:
+  jte-logs:
+  jte-spool:
+
+networks:
+  jte-net:
+    driver: bridge

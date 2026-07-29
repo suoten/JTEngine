@@ -82,12 +82,15 @@ func deriveSubKey(masterKey []byte, label byte, length int) []byte {
 }
 
 // SRTPSession SRTP 会话状态（每流一个），维护 ROC 和密钥材料。
+// FIXED-2026-07-23 [P0]: roc/lastSeq 在 Encrypt/Decrypt 中被并发读写，
+// 添加 sync.Mutex 保护，防止数据竞争导致 IV 复用或 ROC 错乱。
 type SRTPSession struct {
-	km        *SRTPKeyMaterial
-	cipher    string // "AES-128-CM" 或 "SM4-CBC"
-	block     cipher.Block
-	roc       uint16 // Rollover Counter，SeqNum 回绕时自增，防止 IV 复用
-	lastSeq   uint16 // 上一个 SeqNum，用于检测回绕
+	mu      sync.Mutex
+	km      *SRTPKeyMaterial
+	cipher  string // "AES-128-CM" 或 "SM4-CBC"
+	block   cipher.Block
+	roc     uint16 // Rollover Counter，SeqNum 回绕时自增，防止 IV 复用
+	lastSeq uint16 // 上一个 SeqNum，用于检测回绕
 }
 
 // NewSRTPSession 创建 SRTP 会话，派生密钥材料并初始化加密块。
@@ -140,20 +143,23 @@ func NewSRTPSession(masterKey []byte, cipherSuite string) (*SRTPSession, error) 
 //   - bytes 14-15: 0x0000               (salt 仅 14B，左移 16 位)
 //
 // 这样 (SSRC, ROC, SEQ) 三元组唯一确定 IV，彻底消除回绕导致的 IV 复用。
-func (s *SRTPSession) buildIV(ssrc uint32, seqNum uint16) []byte {
+//
+// FIXED-2026-07-23 [P0]: 接受 roc 参数（快照值），在锁外安全调用。
+func (s *SRTPSession) buildIV(ssrc uint32, seqNum uint16, roc uint16) []byte {
 	iv := make([]byte, 16)
 	// Salt 前 14 字节，bytes 14-15 保持 0（k_s * 2^16）
 	copy(iv[0:14], s.km.Salt)
 	// SSRC XOR salt[0:4]
 	binary.BigEndian.PutUint32(iv[0:4], binary.BigEndian.Uint32(iv[0:4])^ssrc)
 	// ROC XOR salt[4:8] —— 防 IV 复用的关键
-	binary.BigEndian.PutUint32(iv[4:8], binary.BigEndian.Uint32(iv[4:8])^uint32(s.roc))
+	binary.BigEndian.PutUint32(iv[4:8], binary.BigEndian.Uint32(iv[4:8])^uint32(roc))
 	// SEQ XOR salt[8:10]
 	binary.BigEndian.PutUint16(iv[8:10], binary.BigEndian.Uint16(iv[8:10])^seqNum)
 	return iv
 }
 
 // updateROC 检测 SeqNum 回绕：新 SeqNum 远小于上一个（差值 > 32768）时 ROC++。
+// FIXED-2026-07-23 [P0]: 调用方需持有锁。
 func (s *SRTPSession) updateROC(seqNum uint16) {
 	if s.lastSeq > 0x8000 && seqNum < 0x8000 {
 		// 从高半区跳到低半区 = 回绕
@@ -164,6 +170,9 @@ func (s *SRTPSession) updateROC(seqNum uint16) {
 
 // Encrypt 加密 RTP 包：保留 RTP 头，加密 payload，追加 HMAC-SHA1-80 认证标签。
 // 返回加密后的完整 SRTP 包（header + enc_payload + auth_tag）。
+//
+// FIXED-2026-07-23 [P0]: 并发安全修复
+// roc/lastSeq 在锁内更新并获取快照，HMAC 计算和 cipher.NewCTR 在锁外执行。
 func (s *SRTPSession) Encrypt(rtpData []byte) ([]byte, error) {
 	if len(rtpData) < RTPHeaderMinLen {
 		return rtpData, nil
@@ -175,9 +184,15 @@ func (s *SRTPSession) Encrypt(rtpData []byte) ([]byte, error) {
 
 	ssrc := binary.BigEndian.Uint32(rtpData[8:12])
 	seqNum := binary.BigEndian.Uint16(rtpData[2:4])
-	s.updateROC(seqNum)
 
-	iv := s.buildIV(ssrc, seqNum)
+	// 锁内：更新 ROC 并获取快照
+	s.mu.Lock()
+	s.updateROC(seqNum)
+	roc := s.roc
+	s.mu.Unlock()
+
+	// 锁外：使用 roc 快照构造 IV（不影响并发安全）
+	iv := s.buildIV(ssrc, seqNum, roc)
 
 	// 加密 payload（CTR 模式，AES-128-CM；SM4 也用 CTR 模式以保证流加密）
 	stream := cipher.NewCTR(s.block, iv)
@@ -189,7 +204,7 @@ func (s *SRTPSession) Encrypt(rtpData []byte) ([]byte, error) {
 	mac := hmac.New(sha1.New, s.km.AuthKey)
 	mac.Write(out[:len(rtpData)])
 	rocBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(rocBytes, uint32(s.roc))
+	binary.BigEndian.PutUint32(rocBytes, uint32(roc))
 	mac.Write(rocBytes)
 	tag := mac.Sum(nil)[:SRTPAuthTagLen]
 	out = append(out, tag...)
@@ -197,8 +212,27 @@ func (s *SRTPSession) Encrypt(rtpData []byte) ([]byte, error) {
 	return out, nil
 }
 
+// verifyAuthTag 用指定 ROC 值计算认证标签并与 tag 比较。
+// FIXED-2026-07-23 [P1]: 提取为独立函数，支持 ROC 回绕重试。
+func (s *SRTPSession) verifyAuthTag(rtpAndPayload, tag []byte, roc uint16) bool {
+	mac := hmac.New(sha1.New, s.km.AuthKey)
+	mac.Write(rtpAndPayload)
+	rocBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(rocBytes, uint32(roc))
+	mac.Write(rocBytes)
+	expectedTag := mac.Sum(nil)[:SRTPAuthTagLen]
+	return hmac.Equal(tag, expectedTag)
+}
+
 // Decrypt 解密 SRTP 包：校验认证标签，解密 payload，返回原始 RTP 包。
 // AUTO-FIX-2026-06-30 [P2-8]: 新增解密路径，支持接收加密流。
+//
+// FIXED-2026-07-23 [P0]: 并发安全修复
+// roc/lastSeq 在锁内更新并获取快照，HMAC 计算和 cipher.NewCTR 在锁外执行。
+//
+// FIXED-2026-07-23 [P1]: ROC 回绕认证失败修复
+// 先用当前 ROC 验证标签，失败则尝试 ROC+1（回绕边界）和 ROC-1（乱序包），
+// 三次都失败才返回认证错误。验证成功后更新 ROC 状态。
 func (s *SRTPSession) Decrypt(srtpData []byte) ([]byte, error) {
 	if len(srtpData) < RTPHeaderMinLen+SRTPAuthTagLen {
 		return nil, fmt.Errorf("srtp packet too short: %d bytes", len(srtpData))
@@ -213,21 +247,44 @@ func (s *SRTPSession) Decrypt(srtpData []byte) ([]byte, error) {
 
 	ssrc := binary.BigEndian.Uint32(rtpAndPayload[8:12])
 	seqNum := binary.BigEndian.Uint16(rtpAndPayload[2:4])
-	s.updateROC(seqNum)
 
-	// 1. 校验认证标签（防篡改）
-	mac := hmac.New(sha1.New, s.km.AuthKey)
-	mac.Write(rtpAndPayload)
-	rocBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(rocBytes, uint32(s.roc))
-	mac.Write(rocBytes)
-	expectedTag := mac.Sum(nil)[:SRTPAuthTagLen]
-	if !hmac.Equal(tag, expectedTag) {
+	// 锁内：更新 ROC 并获取快照
+	s.mu.Lock()
+	s.updateROC(seqNum)
+	roc := s.roc
+	s.mu.Unlock()
+
+	// 1. 校验认证标签（防篡改）— 尝试 ROC、ROC+1、ROC-1
+	// FIXED-2026-07-23 [P1]: ROC 回绕时与发送端不一致，需重试
+	var matchedROC uint16
+	var authOK bool
+
+	if s.verifyAuthTag(rtpAndPayload, tag, roc) {
+		matchedROC = roc
+		authOK = true
+	} else if s.verifyAuthTag(rtpAndPayload, tag, roc+1) {
+		// 回绕边界：发送端 ROC 已自增但接收端尚未回绕
+		matchedROC = roc + 1
+		authOK = true
+	} else if roc > 0 && s.verifyAuthTag(rtpAndPayload, tag, roc-1) {
+		// 乱序包：此包在回绕前发送，ROC 应为旧值
+		matchedROC = roc - 1
+		authOK = true
+	}
+
+	if !authOK {
 		return nil, fmt.Errorf("srtp authentication tag mismatch (possible tampering)")
 	}
 
-	// 2. 解密 payload
-	iv := s.buildIV(ssrc, seqNum)
+	// 如果使用了 ROC±1，更新 session 的 ROC 状态
+	if matchedROC != roc {
+		s.mu.Lock()
+		s.roc = matchedROC
+		s.mu.Unlock()
+	}
+
+	// 2. 解密 payload — 锁外执行，使用匹配的 ROC
+	iv := s.buildIV(ssrc, seqNum, matchedROC)
 	stream := cipher.NewCTR(s.block, iv)
 	out := make([]byte, len(rtpAndPayload))
 	copy(out, rtpAndPayload)

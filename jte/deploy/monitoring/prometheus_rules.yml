@@ -1,4 +1,4 @@
-# JTE Prometheus 监控配置
+﻿# JTE Prometheus 监控配置
 # 
 # 本文件定义 JTE 引擎的 Prometheus 监控指标采集规则。
 # JTE 引擎通过 GET /metrics 端点暴露 Prometheus 格式指标。
@@ -111,7 +111,7 @@ groups:
           description: "5xx 错误率 {{ $value | humanizePercentage }}，超过 5%"
       
       - alert: JTEServiceDown
-        expr: up{job="jte-engine"} == 0
+        expr: up{job="jt-engine"} == 0
         for: 1m
         labels:
           severity: critical

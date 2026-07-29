@@ -1,0 +1,184 @@
+﻿# JTE CI/CD Pipeline
+# AUTO-FIX-2026-07-16: 创建 CI/CD 自动化流水线（规划 Section A.3 要求）
+# 功能：lint → test → build → docker → release
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+    branches: [master, main]
+
+env:
+  GO_VERSION: '1.22'
+  NODE_VERSION: '20'
+
+jobs:
+  # ========== 阶段1: 代码质量检查 ==========
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: jte
+          args: --timeout=5m
+
+      - name: Go vet
+        working-directory: jte
+        run: go vet ./...
+
+  # ========== 阶段2: 单元测试 ==========
+  test-core:
+    name: Test Core Engine
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jte
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run tests
+        run: go test ./... -v -coverprofile=coverage-core.out -race -timeout=10m
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-core
+          path: jte/coverage-core.out
+
+  test-modules:
+    name: Test Modules
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module:
+          - module-adapter
+          - module-ai
+          - module-ai-nlp
+          - module-cluster
+          - module-crypto
+          - module-fleet
+          - module-legacy
+          - module-loadtest
+          - module-monitor
+          - module-protocol-809
+          - module-protocol-1045
+          - module-protocol-1253
+          - module-protocol-32960
+          - module-protocol-905
+          - module-security-audit
+          - module-storage
+          - module-tts
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Test ${{ matrix.module }}
+        working-directory: jte-modules/${{ matrix.module }}
+        run: go test ./... -v -race -timeout=10m
+
+  # ========== 阶段3: 前端构建 ==========
+  frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jte/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: jte/web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: jte/web/dist
+
+  # ========== 阶段4: 构建 Docker 镜像 ==========
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [lint, test-core, test-modules, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: jte
+          push: false
+          tags: jt-engine:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ========== 阶段5: 发布 (仅 tag 触发) ==========
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [docker]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build binaries
+        env:
+          CGO_ENABLED: 0
+        run: |
+          cd jte
+          mkdir -p dist
+          GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o dist/jte-linux-amd64 ./cmd/jte/
+          GOOS=linux   GOARCH=arm64 go build -ldflags="-s -w" -o dist/jte-linux-arm64 ./cmd/jte/
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/jte-windows-amd64.exe ./cmd/jte/
+          GOOS=darwin   GOARCH=amd64 go build -ldflags="-s -w" -o dist/jte-darwin-amd64 ./cmd/jte/
+          GOOS=darwin   GOARCH=arm64 go build -ldflags="-s -w" -o dist/jte-darwin-arm64 ./cmd/jte/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: jte/dist/*
+          draft: true
+          generate_release_notes: true

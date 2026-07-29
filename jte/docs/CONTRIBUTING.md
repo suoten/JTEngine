@@ -1,4 +1,4 @@
-# JTE 贡献指南
+﻿# JTE 贡献指南
 
 感谢您对 JTE 项目的关注！本文档描述如何参与 JTE 开源项目贡献。
 
@@ -14,7 +14,7 @@
 ### 获取源码
 
 ```bash
-git clone https://github.com/jte-engine/jte.git
+git clone https://github.com/suoten/jt-engine.git
 cd jte
 ```
 
@@ -125,7 +125,7 @@ JTE 支持可插拔模块架构。开发新模块：
 ## 安全相关
 
 - 发现安全漏洞请**不要**公开提交 Issue
-- 请发送邮件至 security@jte-engine.com
+- 请发送邮件至 security@suoten.com
 - 我们会在 48 小时内响应
 
 ## 许可证

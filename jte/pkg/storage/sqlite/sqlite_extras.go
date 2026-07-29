@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/suoten/jt-engine/pkg/storage"
+	"github.com/suoten/jt-engine/pkg/storage/safesql"
 )
 
 // migrateGeofence 创建电子围栏表（在 migrate 之后调用）
@@ -35,8 +36,9 @@ func (s *SQLiteStore) QueryDrivers(ctx context.Context, opts storage.ListOptions
 	where := []string{"1=1"}
 	args := []interface{}{}
 	if opts.Phone != "" {
-		where = append(where, "phone LIKE ?")
-		args = append(args, opts.Phone+"%")
+		// FIXED: [LIKE 通配符注入] 使用 SanitizeLikeValue 转义用户输入中的 % 和 _ [2026-07-17]
+		where = append(where, "phone LIKE ? ESCAPE '\\'")
+		args = append(args, safesql.SanitizeLikeValue(opts.Phone)+"%")
 	}
 	whereClause := strings.Join(where, " AND ")
 

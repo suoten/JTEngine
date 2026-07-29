@@ -91,18 +91,18 @@ func TestSendVehicleData_GBKEncoding(t *testing.T) {
 		t.Fatalf("frame not wrapped with 0x5B/0x5D: % x", frame[:min(8, len(frame))])
 	}
 	inner := frame[1 : len(frame)-1]
-	unescaped := unescape809(inner)
+	unescaped, _ := unescape809(inner)
 
 	// 解析 header 提取 body 长度
 	if len(unescaped) < jt809HeaderLen+4 {
 		t.Fatalf("unescaped too short: %d", len(unescaped))
 	}
-	msgID := binary.BigEndian.Uint16(unescaped[0:2])
+	msgID := binary.BigEndian.Uint16(unescaped[18:20])
 	if msgID != 0x1200 {
 		t.Fatalf("expected msgID 0x1200, got 0x%04X", msgID)
 	}
-	bodyAttr := binary.BigEndian.Uint16(unescaped[2:4])
-	bodyLen := int(bodyAttr & 0x03FF)
+	msgLen := int(binary.BigEndian.Uint16(unescaped[0:2]))
+	bodyLen := msgLen - jt809HeaderLen
 	bodyStart := jt809HeaderLen
 	bodyEnd := bodyStart + bodyLen
 	if bodyEnd > len(unescaped)-4 {
@@ -177,16 +177,16 @@ func TestSendAlarm_GBKEncoding(t *testing.T) {
 	}
 
 	inner := frame[1 : len(frame)-1]
-	unescaped := unescape809(inner)
+	unescaped, _ := unescape809(inner)
 	if len(unescaped) < jt809HeaderLen+4 {
 		t.Fatalf("unescaped too short: %d", len(unescaped))
 	}
-	msgID := binary.BigEndian.Uint16(unescaped[0:2])
+	msgID := binary.BigEndian.Uint16(unescaped[18:20])
 	if msgID != 0x1400 {
 		t.Fatalf("expected msgID 0x1400, got 0x%04X", msgID)
 	}
-	bodyAttr := binary.BigEndian.Uint16(unescaped[2:4])
-	bodyLen := int(bodyAttr & 0x03FF)
+	msgLen := int(binary.BigEndian.Uint16(unescaped[0:2]))
+	bodyLen := msgLen - jt809HeaderLen
 	bodyBytes := unescaped[jt809HeaderLen : jt809HeaderLen+bodyLen]
 
 	// GBK 解码后应包含中文车牌号和中文报警类型
@@ -227,11 +227,13 @@ func TestProcessVehicleData_GBKDecoding(t *testing.T) {
 		t.Fatalf("GBK encode: %v", err)
 	}
 
-	// 构造未转义 809 帧：header(18) + body + CRC(4)
-	header := make([]byte, jt809HeaderLen)
-	binary.BigEndian.PutUint16(header[0:2], 0x1200)
-	binary.BigEndian.PutUint16(header[2:4], uint16(len(gbkBody))&0x03FF)
-	binary.BigEndian.PutUint16(header[16:18], 1) // seqNum
+	// 构造未转义 809 帧：header(22) + body + CRC(4)
+	header := make([]byte, jt809HeaderLen) // 22 bytes
+	binary.BigEndian.PutUint16(header[0:2], uint16(jt809HeaderLen+len(gbkBody))) // 报文长度
+	binary.BigEndian.PutUint16(header[2:4], 1)                                   // 报文序号
+	header[4] = 0x00                                                            // 加密方式
+	header[5] = 0x01                                                            // 车牌颜色
+	binary.BigEndian.PutUint16(header[18:20], 0x1200)                            // 子业务类型
 
 	payload := append(header, gbkBody...)
 	crc := crc32.ChecksumIEEE(payload)
@@ -285,10 +287,12 @@ func TestProcessVehicleData_UTF8InputRejected(t *testing.T) {
 	// 故意用 UTF-8 字节（"京"的 UTF-8 编码 E4 BA AC 在 GBK 中不是合法双字节序列开头）
 	utf8Body := []byte(xmlData)
 
-	header := make([]byte, jt809HeaderLen)
-	binary.BigEndian.PutUint16(header[0:2], 0x1200)
-	binary.BigEndian.PutUint16(header[2:4], uint16(len(utf8Body))&0x03FF)
-	binary.BigEndian.PutUint16(header[16:18], 1)
+	header := make([]byte, jt809HeaderLen) // 22 bytes
+	binary.BigEndian.PutUint16(header[0:2], uint16(jt809HeaderLen+len(utf8Body))) // 报文长度
+	binary.BigEndian.PutUint16(header[2:4], 1)                                   // 报文序号
+	header[4] = 0x00                                                            // 加密方式
+	header[5] = 0x01                                                            // 车牌颜色
+	binary.BigEndian.PutUint16(header[18:20], 0x1200)                            // 子业务类型
 
 	payload := append(header, utf8Body...)
 	crc := crc32.ChecksumIEEE(payload)

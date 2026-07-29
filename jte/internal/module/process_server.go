@@ -1,3 +1,4 @@
+// FIXED: [P1] process_server.go accept 循环和 ServeConn goroutine 缺少 recover()，panic 会崩溃整个模块进程 [2026-07-17]
 package module
 
 // ===================================================================
@@ -26,7 +27,9 @@ import (
 	"net/rpc"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 )
 
 // ModuleRPCServer RPC 服务端，包装 Module 接口。
@@ -87,6 +90,9 @@ func (s *ModuleRPCServer) Health(args rpcModuleArgs, reply *rpcHealthResult) err
 // ServeProcess 以进程模式运行模块。
 // 模块二进制的 main() 应调用此函数。
 // 返回时子进程退出。
+// FIXED: [P1-4] 原实现收到 SIGTERM 后直接返回，未等待活跃 ServeConn goroutine 完成，
+// 正在执行的 RPC 调用（如存储写入）被截断可能导致数据损坏。
+// 改为：关闭 listener → 停止模块 → 等待 ServeConn 退出（带超时）→ 返回
 func ServeProcess(mod Module) error {
 	socketPath := os.Getenv("JTE_MODULE_SOCKET")
 	if socketPath == "" {
@@ -112,14 +118,35 @@ func ServeProcess(mod Module) error {
 	// 通知宿主进程就绪
 	fmt.Fprintln(os.Stdout, "READY")
 
+	// FIXED: [P1-4] 使用 WaitGroup 跟踪活跃连接，优雅停机时等待
+	var connWg sync.WaitGroup
+
 	// 接受连接（每个连接一个 goroutine）
+	acceptDone := make(chan struct{})
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// FIXED: [P1] accept 循环 panic recovery，防进程崩溃 [2026-07-17]
+				fmt.Fprintf(os.Stderr, "process_server accept loop panic: %v\n", r)
+			}
+			close(acceptDone)
+		}()
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
-			go server.ServeConn(conn)
+			connWg.Add(1)
+			go func(c net.Conn) {
+				defer connWg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						// FIXED: [P1] ServeConn panic recovery，单个连接 panic 不影响其他连接 [2026-07-17]
+						fmt.Fprintf(os.Stderr, "process_server ServeConn panic: %v\n", r)
+					}
+				}()
+				server.ServeConn(c)
+			}(conn)
 		}
 	}()
 
@@ -128,7 +155,25 @@ func ServeProcess(mod Module) error {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	<-sigCh
 
-	// 优雅停止模块
+	// 1. 关闭 listener（拒绝新连接）
+	listener.Close()
+	<-acceptDone
+
+	// 2. 优雅停止模块（完成在途 RPC 逻辑）
 	_ = mod.Stop()
+
+	// 3. 等待所有 ServeConn goroutine 退出（带超时，避免无限阻塞）
+	waitDone := make(chan struct{})
+	go func() {
+		connWg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+		// 所有连接已优雅退出
+	case <-time.After(10 * time.Second):
+		fmt.Fprintln(os.Stderr, "process_server: timeout waiting for connections to drain")
+	}
+
 	return nil
 }

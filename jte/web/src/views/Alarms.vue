@@ -155,7 +155,7 @@
             <div v-for="(att, i) in detailAttachments" :key="i" class="attachment-item">
               <img v-if="att.type === 'image'" :src="att.url" @click="previewImage(att.url)" />
               <video v-else-if="att.type === 'video'" :src="att.url" controls />
-              <span v-else class="attachment-file">📎 {{ att.name || '附件' }}</span>
+              <span v-else class="attachment-file"><el-icon><Paperclip /></el-icon> {{ att.name || '附件' }}</span>
             </div>
           </div>
         </div>
@@ -256,6 +256,9 @@ const currentAlarm = ref(null)
 
 let ws = null
 let wsReconnectTimer = null
+let wsReconnectCount = 0 // FIXED: [WebSocket断连] 指数退避计数 [2026-07-17]
+let manuallyClosed = false // FIXED: [WebSocket断连] 手动关闭标志 [2026-07-17]
+let wsHeartbeatTimer = null // FIXED: [WebSocket心跳] 定时发送心跳保活 [2026-07-17]
 let refreshTimer = null
 
 function getAIFilter(row) {
@@ -334,11 +337,13 @@ async function fetchAlarms() {
       ? { page: page.value, page_size: pageSize.value }
       : { page: 1, page_size: 100 }
     const data = await alarmApi.getList(params)
-    alarms.value = data.alarms || data.data || data || []
+    // FIXED-2026-07-24: API 返回 {alarms:null} 时 data 是对象非数组，需 Array.isArray 兜底
+const _raw = data.alarms || data.data || data
+alarms.value = Array.isArray(_raw) ? _raw : []
     if (activeTab.value === 'history') {
       total.value = data.total || alarms.value.length
     }
-  } catch { alarms.value = [] }
+  } catch { alarms.value = []; ElMessage.error('加载报警列表失败，请检查网络或稍后重试') }
   finally { loading.value = false }
 
   try {
@@ -389,8 +394,9 @@ function parseAttachments(alarm) {
   detailAttachments.value = attachments
 }
 
+// FIXED: [XSS] window.open 添加 noopener,noreferrer 防止反向钓鱼 [2026-07-17]
 function previewImage(url) {
-  window.open(url, '_blank')
+  window.open(url, '_blank', 'noopener,noreferrer')
 }
 
 // 处理流程
@@ -450,16 +456,28 @@ async function reportToTerminal(alarm) {
   } catch { /* cancelled */ }
 }
 
+// FIXED: [WebSocket断连] 增加 token 鉴权 + 指数退避重连 + 手动关闭标志 [2026-07-17]
 // WebSocket 实时推送
 function connectWebSocket() {
+  if (manuallyClosed) return
+
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const wsUrl = `${protocol}//${window.location.host}/ws/v1/stream`
+  const token = localStorage.getItem('jte_token') || ''
+  // FIXED: [P0] WebSocket 连接必须携带 JWT token，否则后端返回 401 [2026-07-17]
+  const wsUrl = `${protocol}//${window.location.host}/ws/v1/stream?token=${encodeURIComponent(token)}`
   try { ws = new WebSocket(wsUrl) }
   catch { scheduleReconnect(); return }
 
   ws.onopen = () => {
+    wsReconnectCount = 0
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ action: 'subscribe', topics: ['alarm_event'] }))
+      // FIXED: [WebSocket心跳] 每30秒发送心跳保活 [2026-07-17]
+      wsHeartbeatTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: 'ping' }))
+        }
+      }, 30000)
     }
   }
   ws.onmessage = (event) => {
@@ -476,13 +494,20 @@ function connectWebSocket() {
       }
     } catch { /* ignore */ }
   }
-  ws.onclose = () => scheduleReconnect()
+  ws.onclose = () => {
+    if (manuallyClosed) return
+    if (wsHeartbeatTimer) { clearInterval(wsHeartbeatTimer); wsHeartbeatTimer = null }
+    scheduleReconnect()
+  }
   ws.onerror = () => { if (ws) ws.close() }
 }
 
 function scheduleReconnect() {
   if (wsReconnectTimer) return
-  wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; connectWebSocket() }, 5000)
+  // FIXED: [WebSocket断连] 指数退避重连（1s→2s→4s→...→30s） [2026-07-17]
+  const delay = Math.min(1000 * Math.pow(2, wsReconnectCount), 30000)
+  wsReconnectCount++
+  wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; connectWebSocket() }, delay)
 }
 
 function alarmTagType(type) {
@@ -506,7 +531,10 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (refreshTimer) clearInterval(refreshTimer)
+  // FIXED: [WebSocket断连] 清理重连定时器 + 心跳定时器 + 设置手动关闭标志 [2026-07-17]
+  manuallyClosed = true
   if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
+  if (wsHeartbeatTimer) clearInterval(wsHeartbeatTimer)
   if (ws) { ws.onclose = null; ws.close() }
 })
 </script>

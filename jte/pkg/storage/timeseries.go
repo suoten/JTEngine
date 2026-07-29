@@ -71,6 +71,9 @@ type AlarmStats struct {
 	ByLevel    map[int]int64    `json:"by_level"`
 	BySource   map[string]int64 `json:"by_source"`
 	FalseAlarm int64            `json:"false_alarm"`
+	// Partial 标识统计结果是否完整。当任一子查询失败时为 true，
+	// 表示部分统计维度可能缺失。API 层可据此返回告警 header。
+	Partial bool `json:"partial"`
 }
 
 // AlarmFilter 报警查询过滤条件

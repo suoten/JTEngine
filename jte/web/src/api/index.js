@@ -1,18 +1,30 @@
 import axios from 'axios'
 import router from '../router'
 
+// FIXED: [性能优化] 通用防抖函数，避免搜索输入频繁触发请求 [2026-07-17]
+export function debounce(fn, delay = 300) {
+  let timer = null
+  return function (...args) {
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(() => { fn.apply(this, args); timer = null }, delay)
+  }
+}
+
 const api = axios.create({
-  baseURL: '/api/v1',
+  baseURL: import.meta.env.VITE_API_BASE_URL || '/api/v1',
   timeout: 10000,
   withCredentials: true, // AUTO-FIX-2026-06-30 [P1-7]: 携带 Cookie（CSRF token + SameSite=Strict）
 })
 
 // AUTO-FIX-2026-06-30 [P1-7]: 读取 CSRF token Cookie，注入到请求头。
 // 后端 CSRFMiddleware 校验 X-CSRF-Token 头与 csrf_token Cookie 一致。
-// 登录成功后后端通过 Set-Cookie 下发 csrf_token（SameSite=Strict）。
+// 登录成功后后端通过 Set-Cookie 下发 csrf_token（SameSite=Strict，非 HttpOnly）。
+// FIXED: [CSRF] 增加 localStorage 兜底，以防 Cookie 被 SameSite 策略阻止 [2026-07-23]
 function getCSRFToken() {
   const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/)
-  return match ? decodeURIComponent(match[1]) : ''
+  if (match) return decodeURIComponent(match[1])
+  // 兜底：从 localStorage 读取（登录响应中返回的 csrf_token）
+  return localStorage.getItem('jte_csrf_token') || ''
 }
 
 // ===================================================================
@@ -318,8 +330,20 @@ export const forwardRuleApi = {
 export const systemApi = {
   getStatus: () => api.get('/system/status'),
   getModules: () => api.get('/system/modules'),
-  getUsers: () => api.get('/system/users'),
+  getUsers: (params) => api.get('/system/users', { params }),
+  getUser: (id) => api.get(`/system/users/${id}`),
+  createUser: (data) => api.post('/system/users', data),
+  updateUser: (id, data) => api.put(`/system/users/${id}`, data),
+  deleteUser: (id) => api.delete(`/system/users/${id}`),
   getConfig: () => api.get('/system/config'),
+  updateConfig: (data) => api.put('/system/config', data),
+  // 角色管理
+  getRoles: () => api.get('/system/roles'),
+  createRole: (data) => api.post('/system/roles', data),
+  updateRole: (id, data) => api.put(`/system/roles/${id}`, data),
+  deleteRole: (id) => api.delete(`/system/roles/${id}`),
+  // 审计日志
+  getLogs: (params) => api.get('/system/logs', { params }),
 }
 
 // 存储分层管理：统计 / TTL / 归档 / 缓存命中率
@@ -356,7 +380,11 @@ export const driverApi = {
 
 // AUTO-FIX-2026-06-26: 地图API Key配置化
 export const configApi = {
-  getMapConfig: () => api.get('/config/map'),
+getMapConfig: () => api.get('/config/map'),
+updateMapConfig: (data) => api.put('/config/map', data),
+// FIXED-2026-07-24: AI 模块配置接口
+getAIConfig: () => api.get('/config/ai'),
+updateAIConfig: (data) => api.put('/config/ai', data),
 }
 
 // AUTO-FIX-2026-06-26: 第六轮遗留修复 - 官网信息接口（购买链接）

@@ -151,7 +151,7 @@ func NewWriteQueue(ts TimeSeriesStorage, cfg WriteQueueConfig, logger *zap.Logge
 	}
 
 	// 确保 spool 目录存在
-	if err := os.MkdirAll(cfg.SpoolDir, 0755); err != nil {
+	if err := os.MkdirAll(cfg.SpoolDir, 0700); err != nil {
 		return nil, fmt.Errorf("create spool dir: %w", err)
 	}
 
@@ -172,7 +172,7 @@ func NewWriteQueue(ts TimeSeriesStorage, cfg WriteQueueConfig, logger *zap.Logge
 	}
 
 	// 打开 spool 文件（append 模式）
-	f, err := os.OpenFile(spoolPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(spoolPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("open spool file: %w", err)
 	}
@@ -529,7 +529,7 @@ func (wq *WriteQueue) reopenSpool() {
 		_ = wq.spoolFileF.Close()
 		wq.spoolFileF = nil
 	}
-	f, err := os.OpenFile(wq.spoolFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(wq.spoolFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		wq.logger.Error("reopen spool file failed", zap.Error(err))
 		return

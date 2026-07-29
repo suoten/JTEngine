@@ -49,10 +49,11 @@ type Loader struct {
 	modules    map[string]*LoadedModule
 	registry   *registry.FeatureRegistry
 	logger     *zap.Logger
-	verify     bool
+	// P0-FIX: 签名校验始终强制启用，不可关闭。移除 verify 布尔字段。
+	// 任何加载的模块 .so/.binary 必须附带有效 .sig 签名文件，否则拒绝加载。
 	loadOrder  []string    // 拓扑排序后的加载顺序（Init/Start 正序，Stop 逆序）
-	supervisor *Supervisor // AUTO-FIX-2026-06-30 [集成-4]: 模块崩溃自动重启
-	loadMode   ModuleLoadMode // AUTO-FIX-2026-06-30 [集成-5]: 加载模式（plugin/process）
+	supervisor *Supervisor // 模块崩溃自动重启
+	loadMode   ModuleLoadMode // 加载模式（plugin/process）
 	modeCfg    LoadModeConfig // 进程模式配置
 }
 
@@ -64,13 +65,26 @@ type LoadedModule struct {
 	LastError    string    // 最近一次错误（panic/recover 或 Start/Health 失败）
 }
 
+// NewLoader 创建模块加载器。
+// P0-FIX: verify 参数已废弃（始终强制启用签名校验），保留参数仅为向后兼容。
+// 新代码应使用 NewLoaderSecure。
 func NewLoader(dir string, reg *registry.FeatureRegistry, logger *zap.Logger, verify bool) *Loader {
 	return &Loader{
 		dir:      dir,
 		modules:  make(map[string]*LoadedModule),
 		registry: reg,
 		logger:   logger,
-		verify:   verify,
+		// verify 字段已移除，签名校验始终强制启用
+	}
+}
+
+// NewLoaderSecure 创建模块加载器（推荐用法，无废弃参数）。
+func NewLoaderSecure(dir string, reg *registry.FeatureRegistry, logger *zap.Logger) *Loader {
+	return &Loader{
+		dir:      dir,
+		modules:  make(map[string]*LoadedModule),
+		registry: reg,
+		logger:   logger,
 	}
 }
 
@@ -174,6 +188,25 @@ func (l *Loader) loadProcessModulesLocked() error {
 	}
 
 	for name, binPath := range binaries {
+		// R35-FIX [P0]: 进程模式同样必须强制签名校验，与 plugin 模式保持一致。
+		// 原实现仅 plugin 模式（loadModule）执行 VerifySignature，进程模式直接加载，
+		// 导致 Windows/macOS（强制使用进程模式）上可加载未签名/篡改的模块二进制。
+		sigPath := binPath + ".sig"
+		if _, err := os.Stat(sigPath); os.IsNotExist(err) {
+			l.logger.Error("process module signature file missing, skipping (signature verification is mandatory)",
+				zap.String("name", name),
+				zap.String("binary", binPath),
+				zap.String("sig_path", sigPath))
+			continue
+		}
+		if err := VerifySignature(binPath, sigPath); err != nil {
+			l.logger.Error("process module signature verification failed, skipping (mandatory security check)",
+				zap.String("name", name),
+				zap.String("binary", binPath),
+				zap.Error(err))
+			continue
+		}
+
 		pm := NewProcessModule(name, binPath, cfg, l.logger)
 		info := ModuleInfo{
 			Name:    name,
@@ -184,7 +217,7 @@ func (l *Loader) loadProcessModulesLocked() error {
 			Info:   info,
 			Module: pm,
 		}
-		l.logger.Info("module loaded (process mode)",
+		l.logger.Info("module loaded (process mode, signature verified)",
 			zap.String("name", name),
 			zap.String("binary", binPath))
 	}
@@ -195,18 +228,13 @@ func (l *Loader) loadProcessModulesLocked() error {
 func (l *Loader) loadModule(path string) error {
 	sigPath := path + ".sig"
 
-	if l.verify {
-		if _, err := os.Stat(sigPath); os.IsNotExist(err) {
-			return fmt.Errorf("signature file missing: %s (signature_verify is enabled)", sigPath)
-		}
-		if err := VerifySignature(path, sigPath); err != nil {
-			return fmt.Errorf("signature verification failed: %w", err)
-		}
-	} else {
-		if _, err := os.Stat(sigPath); os.IsNotExist(err) {
-			l.logger.Warn("module has no signature file (signature_verify disabled)",
-				zap.String("path", path))
-		}
+	// P0-FIX: 签名校验始终强制启用，不可通过配置关闭。
+	// 缺少 .sig 文件或验签失败 → 拒绝加载模块。
+	if _, err := os.Stat(sigPath); os.IsNotExist(err) {
+		return fmt.Errorf("signature file missing: %s (signature verification is mandatory and cannot be disabled)", sigPath)
+	}
+	if err := VerifySignature(path, sigPath); err != nil {
+		return fmt.Errorf("signature verification failed (mandatory security check): %w", err)
 	}
 
 	p, err := plugin.Open(path)
@@ -214,16 +242,41 @@ func (l *Loader) loadModule(path string) error {
 		return fmt.Errorf("plugin open: %w", err)
 	}
 
-	sym, err := p.Lookup("Module")
-	if err != nil {
-		return fmt.Errorf("lookup Module symbol: %w", err)
+	// 优先通过 plugin.Lookup 获取 Module 符号（非混淆构建的首选路径）。
+	// 如果 Lookup 失败（Garble 混淆编译后变量名被改名），
+	// 回退到 PluginRegistry 查找（init() 函数在 plugin.Open 时已注册）。
+	sym, lookupErr := p.Lookup("Module")
+	if lookupErr == nil {
+		// plugin.Lookup 成功：非混淆构建或符号名被保留
+		mod, ok := sym.(Module)
+		if !ok {
+			return fmt.Errorf("symbol does not implement Module interface")
+		}
+		return l.registerLoadedModule(mod, path)
 	}
 
-	mod, ok := sym.(Module)
-	if !ok {
-		return fmt.Errorf("symbol does not implement Module interface")
+	// plugin.Lookup 失败：尝试从 PluginRegistry 获取模块实例。
+	// 模块的 init() 函数在 plugin.Open() 时已执行，将自身注册到全局注册表。
+	// 使用 .so 文件名（去掉扩展名）作为查找 key。
+	moduleKey := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	if regMod, ok := registry.GetPluginModule(moduleKey); ok {
+		mod, ok := regMod.(Module)
+		if !ok {
+			return fmt.Errorf("registry module %q does not implement Module interface", moduleKey)
+		}
+		l.logger.Info("module loaded via PluginRegistry fallback (Garble obfuscated)",
+			zap.String("key", moduleKey),
+			zap.String("path", path))
+		return l.registerLoadedModule(mod, path)
 	}
 
+	// 两种路径都失败
+	return fmt.Errorf("failed to load module: plugin.Lookup error: %v; PluginRegistry lookup for %q also failed", lookupErr, moduleKey)
+}
+
+// registerLoadedModule 将已获取的模块实例注册到加载器的模块表中，
+// 并执行版本兼容性校验。被 loadModule 调用，避免代码重复。
+func (l *Loader) registerLoadedModule(mod Module, path string) error {
 	// 模块版本绑定校验：防止模块针对不兼容的宿主 API 版本编译导致运行时崩溃
 	modAPIVersion := ""
 	if vm, ok := mod.(VersionedModule); ok {

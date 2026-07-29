@@ -40,7 +40,7 @@ func BenchmarkUnescape(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = Unescape(escaped)
+		_, _ = Unescape(escaped)
 	}
 }
 
@@ -62,7 +62,7 @@ func BenchmarkUnescapeSmall(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = Unescape(data)
+		_, _ = Unescape(data)
 	}
 }
 
@@ -128,6 +128,6 @@ func BenchmarkEscapeUnescapeRoundTrip(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		escaped := Escape(data)
-		_ = Unescape(escaped)
+		_, _ = Unescape(escaped)
 	}
 }

@@ -47,6 +47,7 @@ func TestComprehensive_RegisterMessage_FullFields(t *testing.T) {
 func TestComprehensive_AuthMessage_WithIMEI(t *testing.T) {
 	// 808-2019 0x0102: 标准体仅鉴权码；IMEI 为 15 字节可选扩展。
 	// SoftwareVersion 无法在无长度前缀的情况下可靠反向解析，故仅测试 AuthCode + IMEI 往返。
+	// FIXED-2026-07-22 [P0]: 启发式 IMEI 检测默认关闭，需显式启用。
 	orig := &AuthMessage{
 		AuthCode: "auth_code_12345",
 		IMEI:     "123456789012345",
@@ -55,6 +56,9 @@ func TestComprehensive_AuthMessage_WithIMEI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
+	// 启用启发式 IMEI 检测（仅此测试需要）
+	SetIMEIHeuristic(true)
+	defer SetIMEIHeuristic(false)
 	parsed := &AuthMessage{}
 	if err := parsed.Unmarshal(data); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
@@ -64,6 +68,101 @@ func TestComprehensive_AuthMessage_WithIMEI(t *testing.T) {
 	}
 	if parsed.IMEI != orig.IMEI {
 		t.Errorf("IMEI: got %q, want %q", parsed.IMEI, orig.IMEI)
+	}
+}
+
+// TestP0_AuthMessage_PureDigitAuthCode_NotTruncated 验证纯数字结尾的鉴权码不会被启发式 IMEI 检测误截断。
+// FIXED-2026-07-22 [P0]: 默认关闭启发式，整个 body 作为鉴权码。
+func TestP0_AuthMessage_PureDigitAuthCode_NotTruncated(t *testing.T) {
+	// 鉴权码全部为纯数字，长度 > 15，末尾 15 字节全为数字
+	// 启发式开启时会误截断，关闭时应完整保留
+	authCode := "1234567890123456789012345" // 25 字节纯数字
+	orig := &AuthMessage{AuthCode: authCode}
+	data, err := orig.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// 默认 allowIMEIHeuristic=false
+	parsed := &AuthMessage{}
+	if err := parsed.Unmarshal(data); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if parsed.AuthCode != authCode {
+		t.Errorf("AuthCode 被误截断: got %q (len=%d), want %q (len=%d)",
+			parsed.AuthCode, len(parsed.AuthCode), authCode, len(authCode))
+	}
+	if parsed.IMEI != "" {
+		t.Errorf("IMEI 应为空（启发式已关闭）: got %q", parsed.IMEI)
+	}
+}
+
+// TestP0_AuthMessage_HeuristicDisabledByDefault 验证启发式 IMEI 检测默认关闭。
+func TestP0_AuthMessage_HeuristicDisabledByDefault(t *testing.T) {
+	// 构造 body = 鉴权码(15B非数字) + IMEI(15B纯数字)
+	authPart := "authcode_test_1" // 15B
+	imeiPart := "123456789012345"   // 15B 纯数字
+	fullBody := append([]byte(authPart), []byte(imeiPart)...)
+
+	parsed := &AuthMessage{}
+	if err := parsed.Unmarshal(fullBody); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	// 默认关闭时，整个 body 作为鉴权码
+	if parsed.AuthCode != string(fullBody) {
+		t.Errorf("AuthCode: got %q, want %q", parsed.AuthCode, string(fullBody))
+	}
+	if parsed.IMEI != "" {
+		t.Errorf("IMEI 应为空（默认关闭启发式）: got %q", parsed.IMEI)
+	}
+}
+
+// TestP0_AuthMessage_HeuristicEnabled 验证显式启用启发式时 IMEI 可正确剥离。
+func TestP0_AuthMessage_HeuristicEnabled(t *testing.T) {
+	authPart := "authcode_test_1" // 15B
+	imeiPart := "123456789012345"   // 15B 纯数字
+	fullBody := append([]byte(authPart), []byte(imeiPart)...)
+
+	SetIMEIHeuristic(true)
+	defer SetIMEIHeuristic(false)
+
+	parsed := &AuthMessage{}
+	if err := parsed.Unmarshal(fullBody); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if parsed.AuthCode != authPart {
+		t.Errorf("AuthCode: got %q, want %q", parsed.AuthCode, authPart)
+	}
+	if parsed.IMEI != imeiPart {
+		t.Errorf("IMEI: got %q, want %q", parsed.IMEI, imeiPart)
+	}
+}
+
+// TestP0_AuthMessage_EmptyBody 验证空 body 不触发 panic。
+func TestP0_AuthMessage_EmptyBody(t *testing.T) {
+	parsed := &AuthMessage{}
+	if err := parsed.Unmarshal([]byte{}); err != nil {
+		t.Fatalf("Unmarshal empty body: %v", err)
+	}
+	if parsed.AuthCode != "" {
+		t.Errorf("AuthCode should be empty, got %q", parsed.AuthCode)
+	}
+	if parsed.IMEI != "" {
+		t.Errorf("IMEI should be empty, got %q", parsed.IMEI)
+	}
+}
+
+// TestP0_AuthMessage_ShortDigitAuthCode 验证 <=15 字节的纯数字鉴权码不受影响。
+func TestP0_AuthMessage_ShortDigitAuthCode(t *testing.T) {
+	authCode := "1234567890" // 10B 纯数字
+	parsed := &AuthMessage{}
+	if err := parsed.Unmarshal([]byte(authCode)); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if parsed.AuthCode != authCode {
+		t.Errorf("AuthCode: got %q, want %q", parsed.AuthCode, authCode)
+	}
+	if parsed.IMEI != "" {
+		t.Errorf("IMEI should be empty: got %q", parsed.IMEI)
 	}
 }
 
@@ -1063,7 +1162,10 @@ func TestComprehensive_EscapeRoundTrip(t *testing.T) {
 	if len(escaped) != 7 {
 		t.Fatalf("escaped length: got %d, want 7", len(escaped))
 	}
-	unescaped := Unescape(escaped)
+	unescaped, err := Unescape(escaped)
+	if err != nil {
+		t.Fatalf("Unescape error: %v", err)
+	}
 	if len(unescaped) != len(original) {
 		t.Fatalf("unescaped length: got %d, want %d", len(unescaped), len(original))
 	}

@@ -40,9 +40,10 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
 import { Location, VideoPlay, VideoPause } from '@element-plus/icons-vue'
 import { trackApi, configApi } from '../api'
+import { ElMessage } from 'element-plus'
 
 const vehicleId = ref('')
 const timeRange = ref([])
@@ -155,7 +156,13 @@ function playTrack() {
   if (trackPoints.value.length === 0 || isPlaying.value) return
   isPlaying.value = true
   currentPointIndex.value = 0
+  startPlayTimer()
+}
 
+// FIXED: [轨迹回放] 速度变化时重启定时器，使新速度立即生效 [2026-07-17]
+function startPlayTimer() {
+  if (playTimer) { clearInterval(playTimer); playTimer = null }
+  if (!isPlaying.value) return
   playTimer = setInterval(() => {
     if (currentPointIndex.value >= trackPoints.value.length - 1) {
       pauseTrack()
@@ -165,6 +172,13 @@ function playTrack() {
     updateMovingMarker()
   }, 1000 / playSpeed.value)
 }
+
+// FIXED: [轨迹回放] 监听速度变化，实时调整播放速度 [2026-07-17]
+watch(playSpeed, () => {
+  if (isPlaying.value) {
+    startPlayTimer()
+  }
+})
 
 function pauseTrack() {
   isPlaying.value = false
@@ -183,7 +197,10 @@ function updateMovingMarker() {
 }
 
 async function fetchTrack() {
-  if (!vehicleId.value) return
+  if (!vehicleId.value) {
+    ElMessage.warning('请输入车辆ID或终端号')
+    return
+  }
   pauseTrack()
   try {
     const params = { phone: vehicleId.value }
@@ -195,7 +212,11 @@ async function fetchTrack() {
     // 后端统一返回 {track: [...], total: N}（无 code/data 包装）
     trackPoints.value = res.track || res.data?.items || []
     if (trackPoints.value.length > 0) drawTrack()
-  } catch (e) { console.error(e) }
+    else ElMessage.info('未查询到轨迹数据')
+  } catch (e) {
+    console.error(e)
+    ElMessage.error('查询轨迹失败，请检查网络或稍后重试')
+  }
 }
 
 onMounted(() => { initMap() })

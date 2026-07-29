@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -44,35 +43,48 @@ func (h *AdminHandler) SetWSHub(hub WSPublisher) {
 	h.wsHub = hub
 }
 
+// R43-FIX [P2]: 使用结构化请求替代 map[string]interface{}，与 device.go UpdateDeviceRequest 保持一致。
+// 确保字段白名单校验，防止意外字段注入。
+type AdminUpdateVehicleRequest struct {
+	PlateNo      string `json:"plate_no,omitempty"`
+	PlateColor   *int   `json:"plate_color,omitempty"`
+	Manufacturer string `json:"manufacturer,omitempty"`
+	TerminalType string `json:"terminal_type,omitempty"`
+	TerminalID   string `json:"terminal_id,omitempty"`
+}
+
 func (h *AdminHandler) UpdateVehicle(c *gin.Context) {
 	id := c.Param("id")
-	var updates map[string]interface{}
-	if err := c.ShouldBindJSON(&updates); err != nil {
+	var req AdminUpdateVehicleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
 
-	vehicle, err := h.store.GetVehicle(context.Background(), id)
+	vehicle, err := h.store.GetVehicle(c.Request.Context(), id)
 	if err != nil || vehicle == nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "vehicle not found"})
 		return
 	}
 
-	if plateNo, ok := updates["plate_no"].(string); ok {
-		vehicle.PlateNo = plateNo
+	if req.PlateNo != "" {
+		vehicle.PlateNo = req.PlateNo
 	}
-	if plateColor, ok := updates["plate_color"].(float64); ok {
-		vehicle.PlateColor = int(plateColor)
+	if req.PlateColor != nil {
+		vehicle.PlateColor = *req.PlateColor
 	}
-	if manufacturer, ok := updates["manufacturer"].(string); ok {
-		vehicle.Manufacturer = manufacturer
+	if req.Manufacturer != "" {
+		vehicle.Manufacturer = req.Manufacturer
 	}
-	if terminalType, ok := updates["terminal_type"].(string); ok {
-		vehicle.TerminalType = terminalType
+	if req.TerminalType != "" {
+		vehicle.TerminalType = req.TerminalType
+	}
+	if req.TerminalID != "" {
+		vehicle.TerminalID = req.TerminalID
 	}
 
-	if err := h.store.SaveVehicle(context.Background(), vehicle); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+	if err := h.store.SaveVehicle(c.Request.Context(), vehicle); err != nil {
+		respondInternalError(c, h.logger, err, "UpdateVehicle.SaveVehicle")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "updated", "data": vehicle})
@@ -80,8 +92,8 @@ func (h *AdminHandler) UpdateVehicle(c *gin.Context) {
 
 func (h *AdminHandler) DeleteVehicle(c *gin.Context) {
 	id := c.Param("id")
-	if err := h.store.DeleteVehicle(context.Background(), id); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+	if err := h.store.DeleteVehicle(c.Request.Context(), id); err != nil {
+		respondInternalError(c, h.logger, err, "DeleteVehicle")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "deleted"})
@@ -106,7 +118,7 @@ func (h *AdminHandler) SendCommand(c *gin.Context) {
 		return
 	}
 
-	vehicle, err := h.store.GetVehicle(context.Background(), id)
+	vehicle, err := h.store.GetVehicle(c.Request.Context(), id)
 	if err != nil || vehicle == nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "vehicle not found"})
 		return
@@ -198,14 +210,26 @@ func (h *AdminHandler) CreatePlatform(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"code": 0, "message": "created"})
 }
 
+// R43-FIX [P2]: 使用结构化请求替代 map[string]interface{}，确保字段白名单校验。
+type AdminUpdatePlatformRequest struct {
+	Name     string `json:"name,omitempty"`
+	Host     string `json:"host,omitempty"`
+	Port     int    `json:"port,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
 func (h *AdminHandler) UpdatePlatform(c *gin.Context) {
 	id := c.Param("id")
-	var req map[string]interface{}
+	var req AdminUpdatePlatformRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
-	h.logger.Info("admin update platform", zap.String("id", id))
+	h.logger.Info("admin update platform",
+		zap.String("id", id),
+		zap.String("name", req.Name),
+		zap.String("host", req.Host))
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "updated"})
 }
 
@@ -248,6 +272,93 @@ func (h *AdminHandler) GetConfig(c *gin.Context) {
 	}})
 }
 
+// GetAIConfig 返回 AI 模块配置（DeepSeek/Ollama/Qwen API Key 等）
+// FIXED-2026-07-24: 暴露 AI 配置入口，让用户在系统设置中配置 DeepSeek 接口
+// INDUSTRIAL-FIX-2026-07-24-R3 [P1]: API Key 脱敏——仅返回 "configured"/"" 标志，
+// 不返回明文 Key，防止敏感凭证通过 API 泄露。明文 Key 仅在后端内部使用。
+func (h *AdminHandler) GetAIConfig(c *gin.Context) {
+	cfg := config.Get()
+	if cfg == nil {
+		c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{
+			"deepseek_api_key":  "",
+			"deepseek_url":      "https://api.deepseek.com/v1",
+			"ollama_url":        "http://127.0.0.1:11434",
+			"qwen_api_key":      "",
+			"timeout_seconds":   3,
+			"retry_count":       3,
+			"cache_enabled":     true,
+			"cache_ttl_minutes": 60,
+		}})
+		return
+	}
+	// API Key 脱敏：有值则返回 "configured"，无值则返回空串
+	maskKey := func(key string) string {
+		if key != "" {
+			return "configured"
+		}
+		return ""
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 0, "data": gin.H{
+		"deepseek_api_key":  maskKey(cfg.AI.DeepSeekAPIKey),
+		"deepseek_url":      cfg.AI.DeepSeekURL,
+		"ollama_url":        cfg.AI.OllamaURL,
+		"qwen_api_key":      maskKey(cfg.AI.QwenAPIKey),
+		"timeout_seconds":   cfg.AI.TimeoutSeconds,
+		"retry_count":       cfg.AI.RetryCount,
+		"cache_enabled":     cfg.AI.Cache.Enabled,
+		"cache_ttl_minutes": cfg.AI.Cache.TTLMinutes,
+	}})
+}
+
+// UpdateAIConfig 更新 AI 模块配置
+func (h *AdminHandler) UpdateAIConfig(c *gin.Context) {
+	var req struct {
+		DeepSeekAPIKey  string `json:"deepseek_api_key"`
+		DeepSeekURL     string `json:"deepseek_url"`
+		OllamaURL       string `json:"ollama_url"`
+		QwenAPIKey      string `json:"qwen_api_key"`
+		TimeoutSeconds  int    `json:"timeout_seconds"`
+		RetryCount      int    `json:"retry_count"`
+		CacheEnabled    *bool  `json:"cache_enabled"`
+		CacheTTLMinutes  int    `json:"cache_ttl_minutes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		return
+	}
+	cfg := config.Get()
+	if cfg == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "config not available"})
+		return
+	}
+	if req.DeepSeekAPIKey != "" {
+		cfg.AI.DeepSeekAPIKey = req.DeepSeekAPIKey
+	}
+	if req.DeepSeekURL != "" {
+		cfg.AI.DeepSeekURL = req.DeepSeekURL
+	}
+	if req.OllamaURL != "" {
+		cfg.AI.OllamaURL = req.OllamaURL
+	}
+	if req.QwenAPIKey != "" {
+		cfg.AI.QwenAPIKey = req.QwenAPIKey
+	}
+	if req.TimeoutSeconds > 0 {
+		cfg.AI.TimeoutSeconds = req.TimeoutSeconds
+	}
+	if req.RetryCount > 0 {
+		cfg.AI.RetryCount = req.RetryCount
+	}
+	if req.CacheEnabled != nil {
+		cfg.AI.Cache.Enabled = *req.CacheEnabled
+	}
+	if req.CacheTTLMinutes > 0 {
+		cfg.AI.Cache.TTLMinutes = req.CacheTTLMinutes
+	}
+	h.logger.Info("AI config updated", zap.String("deepseek_url", cfg.AI.DeepSeekURL))
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "AI 配置已保存，重启服务后完全生效"})
+}
+
 // GetMapConfig 返回地图API Key配置，供前端动态加载地图SDK。
 // AUTO-FIX-2026-06-26: 地图API Key配置化（原为前端硬编码 YOUR_TIANDITU_KEY）[2026-06-26]
 func (h *AdminHandler) GetMapConfig(c *gin.Context) {
@@ -273,6 +384,54 @@ func (h *AdminHandler) GetMapConfig(c *gin.Context) {
 		"amap_key":      cfg.Map.AMapKey,
 		"amap_security": cfg.Map.AMapSecurity,
 		"baidu_key":     cfg.Map.BaiduKey,
+	})
+}
+
+func (h *AdminHandler) UpdateMapConfig(c *gin.Context) {
+	var req struct {
+		Provider     string `json:"provider"`
+		TiandituKey  string `json:"tianditu_key"`
+		AMapKey      string `json:"amap_key"`
+		AMapSecurity string `json:"amap_security"`
+		BaiduKey     string `json:"baidu_key"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		return
+	}
+
+	cfg := config.Get()
+	if cfg == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "config not available"})
+		return
+	}
+
+	// 更新内存中的地图配置
+	if req.Provider != "" {
+		cfg.Map.Provider = req.Provider
+	}
+	cfg.Map.TiandituKey = req.TiandituKey
+	cfg.Map.AMapKey = req.AMapKey
+	cfg.Map.AMapSecurity = req.AMapSecurity
+	cfg.Map.BaiduKey = req.BaiduKey
+
+	h.logger.Info("Map config updated via API",
+		zap.String("provider", cfg.Map.Provider),
+		zap.Bool("tianditu_key_set", cfg.Map.TiandituKey != ""),
+		zap.Bool("amap_key_set", cfg.Map.AMapKey != ""),
+		zap.Bool("baidu_key_set", cfg.Map.BaiduKey != ""),
+	)
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    0,
+		"message": "地图配置已更新，重启服务后完全生效",
+		"data": gin.H{
+			"provider":      cfg.Map.Provider,
+			"tianditu_key":  cfg.Map.TiandituKey,
+			"amap_key":      cfg.Map.AMapKey,
+			"amap_security": cfg.Map.AMapSecurity,
+			"baidu_key":     cfg.Map.BaiduKey,
+		},
 	})
 }
 
@@ -464,7 +623,7 @@ func (h *AdminHandler) UpdateUser(c *gin.Context) {
 	}
 
 	if err := h.rbac.UpdateUser(id, role, displayName, enabled); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		respondInternalError(c, h.logger, err, "UpdateUser")
 		return
 	}
 
@@ -630,4 +789,35 @@ func (h *AdminHandler) DeleteRole(c *gin.Context) {
 	}
 	h.logger.Info("role deleted", zap.String("id", id))
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "deleted"})
+}
+
+// respondInternalError 统一处理 500 错误响应，防止内部错误信息泄露给客户端。
+// 详细错误（含数据库错误、文件路径、堆栈）记录到日志，客户端仅收到通用消息。
+// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 500 错误信息泄露修复
+// 原始代码 c.JSON(500, gin.H{"message": err.Error()}) 会向客户端暴露：
+//   - 数据库错误（表名、列名、约束名、SQL 语法）
+//   - 文件路径（服务器目录结构）
+//   - 内部异常堆栈（包名、函数名、行号）
+//
+// 这些信息可被攻击者用于枚举系统结构、构造精准攻击。
+func respondInternalError(c *gin.Context, logger *zap.Logger, err error, operation string) {
+	// AUTO-FIX-2026-07-15 [ConvergeLoop-UX]: trace_id 提前生成，写入日志与响应便于关联
+	traceID := c.GetString("trace_id")
+	if traceID == "" {
+		traceID = fmt.Sprintf("err_%d", time.Now().UnixNano())
+	}
+	if logger != nil {
+		logger.Error("internal server error",
+			zap.String("operation", operation),
+			zap.String("path", c.Request.URL.Path),
+			zap.String("method", c.Request.Method),
+			zap.String("client_ip", c.ClientIP()),
+			zap.String("trace_id", traceID),
+			zap.Error(err))
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{
+		"code":     500,
+		"message":  "internal server error, please retry or contact support with trace_id",
+		"trace_id": traceID,
+	})
 }

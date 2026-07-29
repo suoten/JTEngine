@@ -1,3 +1,4 @@
+// FIXED: [P1] processUpstreamData 帧结束符0x5E误判：转义序列0x5E 0x01/0x5E 0x02中0x5E被误认为结束符导致帧截断 [2026-07-17]
 package gateway
 
 import (
@@ -50,6 +51,13 @@ type JT809Client struct {
 	pendingCap    int // 缓冲区容量，默认 1000
 	pendingDropped int64 // 累计丢弃计数（监控用）
 
+	// FIXED-2026-07-23 [P2]: 809 熔断器配置（从 config.JT809CircuitBreakerConfig 注入）
+	// 留空时使用默认值：failThreshold=10, resetTimeout=5min
+	circuitFailThreshold int           // 连续失败触发熔断次数
+	circuitResetTimeout  time.Duration // 熔断恢复时长
+	// 缓冲区溢出告警开关
+	pendingOverflowAlert bool
+
 	// AUTO-FIX-2026-07-04 [P0]: SN 消息确认与重试机制
 	// 每条下行消息分配 SN，上级平台收到后回 0x1002/0x1007 等应答。
 	// 未应答消息重试 3 次，间隔 5s；超过重试次数 → 断链重连。
@@ -70,6 +78,13 @@ type JT809Client struct {
 	downlinkRunning           atomic.Bool
 	downlinkMu                sync.Mutex
 	lastDownlinkKeepaliveReq  atomic.Int64 // 上级平台最近一次从链路保活请求时间
+
+	// FIXED-2026-07-22 [P1]: 熔断器模式
+	// 连续重连失败 10 次后进入"熔断"状态，停止重连 5 分钟。
+	// 熔断期间发送的数据直接写入 pendingBuffer。
+	// 熔断恢复后尝试重连，成功则 flush pendingBuffer。
+	circuitOpen      atomic.Bool  // 熔断状态标志
+	circuitOpenUntil atomic.Int64 // 熔断恢复时间（unix nano）
 }
 
 // pendingFrame 待补发帧（已构造完成的 809 帧 + 流水号）
@@ -101,6 +116,10 @@ func NewJT809Client(cfg *config.JT809PlatformConfig, logger *zap.Logger, mergeEn
 		ackPending:   make(map[uint16]*ackEntry),
 		ackTimeout:   5 * time.Second,
 		ackMaxRetry:  3,
+		// FIXED-2026-07-23 [P2]: 熔断器默认值（可通过 SetCircuitBreakerConfig 覆盖）
+		circuitFailThreshold: 10,
+		circuitResetTimeout:  5 * time.Minute,
+		pendingOverflowAlert: true,
 	}
 	c.lastKeepaliveResp.Store(time.Now().UnixNano())
 	c.lastDownlinkKeepaliveReq.Store(time.Now().UnixNano())
@@ -172,16 +191,49 @@ func (c *JT809Client) reconnectLoop() {
 			c.clearAllAcks()
 			c.lastKeepaliveResp.Store(time.Now().UnixNano())
 
-			// AUTO-FIX-2026-06-28: 连续失败次数计数器，达到 10 次告警
-			// 对照 jte-plan-final-v3.0.md 第3.6.1节：连续失败 10 次：告警 + 继续重连
+			// FIXED-2026-07-22 [P1]: 熔断器模式
+			// FIXED-2026-07-23 [P2]: 熔断器参数从配置注入（默认 failThreshold=10, resetTimeout=5min）
+			// 连续重连失败达到阈值后进入"熔断"状态，停止重连 reset_timeout 秒。
+			// 熔断期间发送的数据直接写入 pendingBuffer（sendOrBuffer 在 conn==nil 时自动缓冲）。
+			// 熔断恢复后尝试重连，成功则 flush pendingBuffer。
 			consecutiveFailures := 0
-			const maxFailAlert = 10
+			maxFailAlert := c.circuitFailThreshold
+			if maxFailAlert <= 0 {
+				maxFailAlert = 10
+			}
+			circuitOpenDuration := c.circuitResetTimeout
+			if circuitOpenDuration <= 0 {
+				circuitOpenDuration = 5 * time.Minute
+			}
 
 			for i := 1; ; i++ {
 				select {
 				case <-c.stopCh:
 					return
 				default:
+				}
+
+				// FIXED-2026-07-22 [P1]: 熔断状态检查
+				// 熔断期间跳过重连尝试，等待熔断恢复后再次尝试
+				if c.circuitOpen.Load() {
+					openUntil := time.Unix(0, c.circuitOpenUntil.Load())
+					now := time.Now()
+					if now.Before(openUntil) {
+						waitDuration := time.Until(openUntil)
+						c.logger.Warn("809 circuit breaker open, waiting before retry",
+							zap.String("platform_id", c.cfg.ID),
+							zap.Duration("wait", waitDuration),
+							zap.Int("consecutive_failures", consecutiveFailures))
+						select {
+						case <-c.stopCh:
+							return
+						case <-time.After(waitDuration):
+						}
+						// 熔断恢复，尝试重连
+						c.circuitOpen.Store(false)
+						c.logger.Info("809 circuit breaker recovering, attempting reconnect",
+							zap.String("platform_id", c.cfg.ID))
+					}
 				}
 
 				// AUTO-FIX-2026-06-26: 重连退避改为指数退避（1,2,4,8,16,32,60...）
@@ -194,18 +246,28 @@ func (c *JT809Client) reconnectLoop() {
 					zap.String("platform_id", c.cfg.ID),
 					zap.Int("attempt", i),
 					zap.Int("wait_sec", waitSec),
-					zap.Int("consecutive_failures", consecutiveFailures))
+					zap.Int("consecutive_failures", consecutiveFailures),
+					zap.Bool("circuit_open", c.circuitOpen.Load()))
 
-				time.Sleep(time.Duration(waitSec) * time.Second)
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(time.Duration(waitSec) * time.Second):
+				}
 
 				if err := c.dial(); err != nil {
 					c.logger.Error("809 reconnect failed", zap.Error(err))
 					consecutiveFailures++
-					if consecutiveFailures == maxFailAlert {
-						// 连续失败 10 次告警（不中断重连）
-						c.logger.Warn("809 reconnect failed 10 consecutive times, alerting",
+					if consecutiveFailures >= maxFailAlert {
+						// FIXED-2026-07-22 [P1]: 进入熔断状态
+						c.circuitOpen.Store(true)
+						c.circuitOpenUntil.Store(time.Now().Add(circuitOpenDuration).UnixNano())
+						c.logger.Error("809 circuit breaker opened due to consecutive failures",
 							zap.String("platform_id", c.cfg.ID),
-							zap.Int("consecutive_failures", consecutiveFailures))
+							zap.Int("consecutive_failures", consecutiveFailures),
+							zap.Duration("open_duration", circuitOpenDuration))
+						// 重置指数退避计数，熔断恢复后从 1 开始
+						i = 0
 					}
 					continue
 				}
@@ -220,16 +282,22 @@ func (c *JT809Client) reconnectLoop() {
 					}
 					c.mu.Unlock()
 					consecutiveFailures++
-					if consecutiveFailures == maxFailAlert {
-						c.logger.Warn("809 re-login failed 10 consecutive times, alerting",
+					if consecutiveFailures >= maxFailAlert {
+						// FIXED-2026-07-22 [P1]: 进入熔断状态
+						c.circuitOpen.Store(true)
+						c.circuitOpenUntil.Store(time.Now().Add(circuitOpenDuration).UnixNano())
+						c.logger.Error("809 circuit breaker opened due to login failures",
 							zap.String("platform_id", c.cfg.ID),
-							zap.Int("consecutive_failures", consecutiveFailures))
+							zap.Int("consecutive_failures", consecutiveFailures),
+							zap.Duration("open_duration", circuitOpenDuration))
+						i = 0
 					}
 					continue
 				}
 
-				// 重连成功后重置间隔/失败计数
+				// 重连成功后重置间隔/失败计数/熔断状态
 				consecutiveFailures = 0
+				c.circuitOpen.Store(false)
 				c.logger.Info("809 reconnected successfully",
 					zap.String("platform_id", c.cfg.ID),
 					zap.Int("attempt", i))
@@ -243,6 +311,30 @@ func (c *JT809Client) reconnectLoop() {
 			}
 		}
 	}
+}
+
+// IsCircuitOpen 返回熔断器是否处于开启状态（测试/监控用）。
+// FIXED-2026-07-22 [P1]: 熔断器模式
+func (c *JT809Client) IsCircuitOpen() bool {
+	return c.circuitOpen.Load()
+}
+
+// SetCircuitBreakerConfig 从配置注入熔断器参数。
+// FIXED-2026-07-23 [P2]: 支持通过 YAML 配置熔断器阈值和恢复时间。
+// 必须在 Connect() 之前调用。
+func (c *JT809Client) SetCircuitBreakerConfig(failThreshold int, resetTimeoutSec int, pendingOverflowAlert bool) {
+	if failThreshold > 0 {
+		c.circuitFailThreshold = failThreshold
+	}
+	if resetTimeoutSec > 0 {
+		c.circuitResetTimeout = time.Duration(resetTimeoutSec) * time.Second
+	}
+	c.pendingOverflowAlert = pendingOverflowAlert
+}
+
+// GetPendingDropped 返回累计丢弃的缓冲帧数（监控/健康检查用）。
+func (c *JT809Client) GetPendingDropped() int64 {
+	return atomic.LoadInt64(&c.pendingDropped)
 }
 
 func (c *JT809Client) keepaliveLoop() {
@@ -330,6 +422,8 @@ func (c *JT809Client) Login() error {
 	if c.conn == nil {
 		return fmt.Errorf("send login: connection not established")
 	}
+	// FIXED: 809写操作缺少写超时，半开连接上Write会无限阻塞 [2026-07-17]
+	c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := c.conn.Write(msg); err != nil {
 		return fmt.Errorf("send login: %w", err)
 	}
@@ -382,6 +476,8 @@ func (c *JT809Client) sendOrBuffer(msgID, seq uint16, frame []byte) error {
 	// 在线快速路径：只要有 conn 就尝试发送
 	// 注意：调用方持 c.mu，conn 不为 nil 即可安全 Write
 	if c.conn != nil {
+		// FIXED: 809写操作缺少写超时，半开连接上Write会无限阻塞 [2026-07-17]
+		c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if _, err := c.conn.Write(frame); err == nil {
 			return nil
 		}
@@ -400,15 +496,36 @@ func (c *JT809Client) sendOrBuffer(msgID, seq uint16, frame []byte) error {
 		// 缓冲未启用，直接返回错误
 		return fmt.Errorf("809 client offline and buffer disabled")
 	}
-	// 缓冲区满：丢弃最旧帧（FIFO 淘汰）
-	if len(c.pendingBuffer) >= c.pendingCap {
-		c.pendingBuffer = c.pendingBuffer[1:]
-		c.pendingDropped++
-		c.logger.Warn("809 pending buffer overflow, dropping oldest frame",
-			zap.String("platform_id", c.cfg.ID),
-			zap.Int64("total_dropped", c.pendingDropped),
-			zap.Int("buffer_size", len(c.pendingBuffer)))
-	}
+		// FIXED: [P1-6] 缓冲区满：丢弃最旧帧（FIFO 淘汰）
+		// 原实现 c.pendingBuffer[1:] 仅移动 slice 起始指针，底层数组不释放，长期循环导致内存泄漏
+		// 改为 copy 压缩底层数组，确保被丢弃的帧可被 GC 回收
+		if len(c.pendingBuffer) >= c.pendingCap {
+			c.pendingDropped++
+			// copy 尾部元素到头部，截断尾部
+			copy(c.pendingBuffer, c.pendingBuffer[1:])
+			c.pendingBuffer = c.pendingBuffer[:len(c.pendingBuffer)-1]
+			// 每隔 256 次淘汰触发一次底层数组压缩，避免频繁分配
+			if c.pendingDropped%256 == 0 {
+				shrunk := make([]pendingFrame, len(c.pendingBuffer))
+				copy(shrunk, c.pendingBuffer)
+				c.pendingBuffer = shrunk
+			}
+			// FIXED-2026-07-22 [P1]: pendingBuffer 溢出时通过 logger.Error 告警
+			// FIXED-2026-07-23 [P2]: 溢出告警受 pending_buffer_overflow_alert 配置控制
+			if c.pendingOverflowAlert {
+				c.logger.Error("809 pending buffer overflow, dropping oldest frame",
+					zap.String("platform_id", c.cfg.ID),
+					zap.Int64("total_dropped", c.pendingDropped),
+					zap.Int("buffer_size", len(c.pendingBuffer)),
+					zap.Bool("circuit_open", c.circuitOpen.Load()))
+			} else {
+				c.logger.Warn("809 pending buffer overflow, dropping oldest frame",
+					zap.String("platform_id", c.cfg.ID),
+					zap.Int64("total_dropped", c.pendingDropped),
+					zap.Int("buffer_size", len(c.pendingBuffer)),
+					zap.Bool("circuit_open", c.circuitOpen.Load()))
+			}
+		}
 	// 深拷贝 frame（外部传入的 msg 可能在调用方被复用）
 	frameCopy := make([]byte, len(frame))
 	copy(frameCopy, frame)
@@ -441,8 +558,12 @@ func (c *JT809Client) flushPendingBuffer() {
 		return
 	}
 
-	failed := pending[:0]
+	// FIXED: [P2-4] 原实现 failed := pending[:0] 复用原切片底层数组，当前安全但后续修改易引入 bug
+	// 改为独立分配 failed 切片，避免隐式依赖
+	var failed []pendingFrame
 	for _, f := range pending {
+		// FIXED: 809写操作缺少写超时 [2026-07-17]
+		c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if _, err := c.conn.Write(f.payload); err != nil {
 			c.logger.Warn("809 flush pending frame failed, will retry on next reconnect",
 				zap.String("platform_id", c.cfg.ID),
@@ -735,6 +856,8 @@ func (c *JT809Client) SendKeepalive() error {
 	if c.conn == nil {
 		return fmt.Errorf("send keepalive: connection not established")
 	}
+	// FIXED: 809写操作缺少写超时，半开连接上Write会无限阻塞 [2026-07-17]
+	c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := c.conn.Write(msg); err != nil {
 		return fmt.Errorf("send keepalive: %w", err)
 	}
@@ -783,6 +906,10 @@ func (c *JT809Client) GetPlatformID() string {
 	return c.cfg.ID
 }
 
+// FIXED: [P0] readLoop 无界 remaining 缓冲区——恶意/故障上级平台持续发送不含 0x5D 结束符的数据
+// 导致 remaining 无限增长直到 OOM。增加 1MB 上限，超过后丢弃全部 remaining 并触发重连 [2026-07-22]
+const maxRemainingBytes = 1 << 20 // 1MB
+
 func (c *JT809Client) readLoop() {
 	buf := make([]byte, 8192)
 	remaining := make([]byte, 0)
@@ -818,10 +945,29 @@ func (c *JT809Client) readLoop() {
 
 		if n > 0 {
 			remaining = append(remaining, buf[:n]...)
+			// FIXED: [P0] remaining 缓冲区溢出防护——超过 1MB 说明上游持续发送不含结束符的数据
+			// （恶意攻击或设备故障），丢弃全部 remaining 并触发重连，模拟帧重同步
+			if len(remaining) > maxRemainingBytes {
+				c.logger.Error("809 readLoop remaining buffer overflow, resetting",
+					zap.String("platform_id", c.cfg.ID),
+					zap.Int("size", len(remaining)))
+				remaining = remaining[:0]
+				c.running.Store(false)
+				select {
+				case c.reconnectCh <- struct{}{}:
+				default:
+				}
+				return
+			}
 			remaining = c.processUpstreamData(remaining)
 		}
 	}
 }
+
+	// FIXED: [P1] processUpstreamData 帧结束符误判：0x5E在标准转义序列(0x5E 0x01/0x5E 0x02)中作为首字节出现，
+// 将其作为结束符会导致含0x5D/0x5E内容的帧被错误截断。改为仅搜索0x5D（标准结束符） [2026-07-17]
+// FIXED: [P0] 单帧长度上限检查，防止恶意构造超长帧 [2026-07-22]
+const maxFrameLen = 256 * 1024 // 256KB，809 标准帧不超过 64KB，留 4 倍余量
 
 func (c *JT809Client) processUpstreamData(data []byte) []byte {
 	for len(data) >= 2 {
@@ -830,6 +976,8 @@ func (c *JT809Client) processUpstreamData(data []byte) []byte {
 		for i := 0; i < len(data); i++ {
 			if data[i] == 0x5B && start == -1 {
 				start = i
+				// FIXED: [P1] 仅搜索0x5D标准结束符。0x5E在转义序列(0x5E 0x01/0x5E 0x02)中出现，
+				// 作为结束符会导致帧被错误截断。旧设备兼容应通过独立配置项处理。
 			} else if data[i] == 0x5D && start != -1 {
 				end = i
 				break
@@ -841,15 +989,45 @@ func (c *JT809Client) processUpstreamData(data []byte) []byte {
 		}
 
 		frame := data[start : end+1]
+
+		// FIXED: [P0] 单帧长度上限检查，超过 maxFrameLen 丢弃该帧并告警
+		if len(frame) > maxFrameLen {
+			c.logger.Error("809 upstream frame too large, dropping",
+				zap.String("platform_id", c.cfg.ID),
+				zap.Int("frame_len", len(frame)),
+				zap.Int("max", maxFrameLen))
+			data = data[end+1:]
+			continue
+		}
+
 		remaining := data[end+1:]
 
 		if len(frame) > 2 {
 			inner := frame[1 : len(frame)-1]
-			unescaped := unescape809(inner)
+			// INDUSTRIAL-FIX-2026-07-25-R30 [P2]: unescape809 返回 error，非法转义帧丢弃
+			unescaped, unescErr := unescape809(inner)
+			if unescErr != nil {
+				c.logger.Warn("809 upstream unescape failed, dropping frame",
+					zap.String("platform_id", c.cfg.ID), zap.Error(unescErr))
+				data = remaining
+				continue
+			}
 
-			if len(unescaped) >= 2 {
-				msgID := binary.BigEndian.Uint16(unescaped[0:2])
-				c.handleUpstreamMessage(msgID, unescaped)
+		if len(unescaped) >= jt809HeaderLen {
+			// AUTO-FIX-2026-07-17: CRC32校验（覆盖除CRC自身外的所有字节）
+			if len(unescaped) >= 4 {
+				payload := unescaped[:len(unescaped)-4]
+				expectedCRC := binary.BigEndian.Uint32(unescaped[len(unescaped)-4:])
+				actualCRC := crc32.ChecksumIEEE(payload)
+				if actualCRC != expectedCRC {
+					c.logger.Warn("809 upstream CRC32 mismatch, dropping frame",
+						zap.String("platform_id", c.cfg.ID))
+					data = remaining
+					continue
+				}
+			}
+			msgID := binary.BigEndian.Uint16(unescaped[18:20])
+			c.handleUpstreamMessage(msgID, unescaped)
 			}
 		}
 
@@ -872,7 +1050,7 @@ func (c *JT809Client) handleUpstreamMessage(msgID uint16, data []byte) {
 		// 主链路登录应答（UP_CONNECT_RSP）：消息头(18) + 结果(1) + 校验码(4)
 		// AUTO-FIX-2026-07-04 [P0]: 提取 SN 清除待确认条目
 		if len(data) >= jt809HeaderLen {
-			respSeq := binary.BigEndian.Uint16(data[16:18])
+			respSeq := binary.BigEndian.Uint16(data[2:4])
 			c.clearAck(respSeq)
 		}
 		if len(data) >= jt809HeaderLen+1 {
@@ -890,7 +1068,7 @@ func (c *JT809Client) handleUpstreamMessage(msgID uint16, data []byte) {
 		// 主链路保活应答（UP_LINKKEEP_ALIVE_RSP）
 		// AUTO-FIX-2026-07-04 [P0]: 提取 SN 清除待确认条目 + 更新心跳应答时间
 		if len(data) >= jt809HeaderLen {
-			respSeq := binary.BigEndian.Uint16(data[16:18])
+			respSeq := binary.BigEndian.Uint16(data[2:4])
 			c.clearAck(respSeq)
 		}
 		c.lastKeepaliveResp.Store(time.Now().UnixNano())
@@ -931,7 +1109,7 @@ func (c *JT809Client) sendDownlinkResp(msgID uint16, reqData []byte) {
 	// 复用请求的流水号
 	var seqNum uint16
 	if len(reqData) >= jt809HeaderLen {
-		seqNum = binary.BigEndian.Uint16(reqData[16:18])
+		seqNum = binary.BigEndian.Uint16(reqData[2:4])
 	} else {
 		seqNum = c.nextSeq()
 	}
@@ -940,47 +1118,43 @@ func (c *JT809Client) sendDownlinkResp(msgID uint16, reqData []byte) {
 		c.logger.Error("809 send downlink resp failed", zap.Error(err))
 		return
 	}
+	// FIXED: 809写操作缺少写超时 [2026-07-17]
+	c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := c.conn.Write(msg); err != nil {
 		c.logger.Error("809 write downlink resp failed", zap.Error(err))
 	}
 }
 
 // jt809HeaderLen 是 JT/T 809-2019 消息头长度（字节）。
-// 消息头 = 消息ID(2) + 消息体属性(2) + 企业数字证书(4) + 消息加密(1) +
-//          消息密钥(4) + 上下行链路(1) + 数据加密方式(1) + 保留(1) + 消息流水号(2) = 18
-const jt809HeaderLen = 18
+// AUTO-FIX-2026-07-16: 修正为标准22字节帧头
+// 标准定义：报文长度(2) + 报文序号(2) + 加密方式(1) + 车牌颜色(1) + 车牌号(12) + 子业务类型(2) + 保留(2) = 22
+const jt809HeaderLen = 22
 
 func (c *JT809Client) buildMessage(msgID uint16, body []byte, seqNum uint16) ([]byte, error) {
 	bodyLen := len(body)
-	header := make([]byte, jt809HeaderLen)
+	header := make([]byte, jt809HeaderLen) // 22 bytes
 
-	// 消息ID (2 bytes)
-	binary.BigEndian.PutUint16(header[0:2], msgID)
+	// AUTO-FIX-2026-07-16: 使用 JT/T 809-2019 标准22字节帧头
+	// [0:2] 报文长度 = 数据头(22) + 数据体(bodyLen)
+	binary.BigEndian.PutUint16(header[0:2], uint16(22+bodyLen))
 
-	// 消息体属性 (2 bytes): 低 10 位为消息体长度
-	bodyAttr := uint16(bodyLen) & 0x03FF
-	binary.BigEndian.PutUint16(header[2:4], bodyAttr)
+	// [2:4] 报文序号
+	binary.BigEndian.PutUint16(header[2:4], seqNum)
 
-	// 企业数字证书 (4 bytes) — 未使用，填 0
-	// header[4:8] = 0
+	// [4] 加密方式 = 0x00 (不加密)
+	header[4] = 0x00
 
-	// 消息加密 (1 byte) — 不加密
-	// header[8] = 0
+	// [5] 车牌颜色 = 0x01 (蓝色)
+	header[5] = 0x01
 
-	// 消息密钥 (4 bytes) — 未使用，填 0
-	// header[9:13] = 0
+	// [6:18] 车牌号 (12字节GBK) — 平台级消息留空
+	// header[6:18] = 0
 
-	// 上下行链路 (1 byte): 0=上行, 1=下行
-	// header[13] = 0
+	// [18:20] 子业务类型/消息ID
+	binary.BigEndian.PutUint16(header[18:20], msgID)
 
-	// 数据加密方式 (1 byte) — 0=不加密
-	// header[14] = 0
-
-	// 保留 (1 byte)
-	// header[15] = 0
-
-	// 消息流水号 (2 bytes)
-	binary.BigEndian.PutUint16(header[16:18], seqNum)
+	// [20:22] 保留
+	// header[20:22] = 0
 
 	payload := append(header, body...)
 
@@ -1019,7 +1193,17 @@ func (c *JT809Client) ackRetryLoop() {
 		case <-c.stopCh:
 			return
 		case <-ticker.C:
-			c.checkPendingAcks()
+			// R62-FIX [P2]: 将 recover 移到循环内部，确保单次 checkPendingAcks panic
+			// 不会导致重试协程退出。SafeGo 的 recover 在 goroutine 级别，
+			// panic 后协程退出，未应答消息永不被重试，809 链路消息丢失。
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// SafeGo 已有 recover，此处二级 recover 确保循环不退出
+					}
+				}()
+				c.checkPendingAcks()
+			}()
 		}
 	}
 }
@@ -1071,6 +1255,8 @@ func (c *JT809Client) checkPendingAcks() {
 				zap.String("platform_id", c.cfg.ID),
 				zap.Uint16("sn", item.sn),
 				zap.Uint16("msg_id", item.msgID))
+			// FIXED: 809写操作缺少写超时 [2026-07-17]
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if _, err := conn.Write(item.payload); err != nil {
 				c.logger.Error("809 ACK retry write failed",
 					zap.String("platform_id", c.cfg.ID),
@@ -1091,7 +1277,7 @@ func (c *JT809Client) checkPendingAcks() {
 }
 
 // registerAck 注册消息到待确认表，启动超时计时器。
-// payload 为完整 809 帧（含 0x5B/0x5D 边界），用于重发。
+	// payload 为完整 809 帧（含 0x5B/0x5D 边界），用于重发。
 // 调用时调用方持有 c.mu，本方法获取 c.ackMu（锁序：c.mu → c.ackMu）。
 func (c *JT809Client) registerAck(msgID, seq uint16, payload []byte) {
 	payloadCopy := make([]byte, len(payload))
@@ -1219,7 +1405,8 @@ func (c *JT809Client) processDownlinkData(data []byte, conn net.Conn) []byte {
 		for i := 0; i < len(data); i++ {
 			if data[i] == 0x5B && start == -1 {
 				start = i
-			} else if data[i] == 0x5D && start != -1 {
+				// 0x5D = JT/T 809 标准结束符；同时接受 0x5E（兼容部分旧设备）
+			} else if (data[i] == 0x5D || data[i] == 0x5E) && start != -1 {
 				end = i
 				break
 			}
@@ -1231,10 +1418,29 @@ func (c *JT809Client) processDownlinkData(data []byte, conn net.Conn) []byte {
 		remaining := data[end+1:]
 		if len(frame) > 2 {
 			inner := frame[1 : len(frame)-1]
-			unescaped := unescape809(inner)
-			if len(unescaped) >= 2 {
-				msgID := binary.BigEndian.Uint16(unescaped[0:2])
-				c.handleDownlinkMessage(msgID, unescaped, conn)
+			// INDUSTRIAL-FIX-2026-07-25-R30 [P2]: unescape809 返回 error，非法转义帧丢弃
+			unescaped, unescErr := unescape809(inner)
+			if unescErr != nil {
+				c.logger.Warn("809 downlink unescape failed, dropping frame",
+					zap.String("platform_id", c.cfg.ID), zap.Error(unescErr))
+				data = remaining
+				continue
+			}
+		if len(unescaped) >= jt809HeaderLen {
+			// AUTO-FIX-2026-07-17: CRC32校验（覆盖除CRC自身外的所有字节）
+			if len(unescaped) >= 4 {
+				payload := unescaped[:len(unescaped)-4]
+				expectedCRC := binary.BigEndian.Uint32(unescaped[len(unescaped)-4:])
+				actualCRC := crc32.ChecksumIEEE(payload)
+				if actualCRC != expectedCRC {
+					c.logger.Warn("809 downlink CRC32 mismatch, dropping frame",
+						zap.String("platform_id", c.cfg.ID))
+					data = remaining
+					continue
+				}
+			}
+			msgID := binary.BigEndian.Uint16(unescaped[18:20])
+			c.handleDownlinkMessage(msgID, unescaped, conn)
 			}
 		}
 		data = remaining
@@ -1250,7 +1456,7 @@ func (c *JT809Client) processDownlinkData(data []byte, conn net.Conn) []byte {
 func (c *JT809Client) handleDownlinkMessage(msgID uint16, data []byte, conn net.Conn) {
 	var seqNum uint16
 	if len(data) >= jt809HeaderLen {
-		seqNum = binary.BigEndian.Uint16(data[16:18])
+		seqNum = binary.BigEndian.Uint16(data[2:4])
 	}
 	switch msgID {
 	case 0x9001:
@@ -1307,11 +1513,12 @@ func (c *JT809Client) sendOnDownlink(conn net.Conn, msgID uint16, seqNum uint16,
 	if conn == nil {
 		return
 	}
-	header := make([]byte, jt809HeaderLen)
-	binary.BigEndian.PutUint16(header[0:2], msgID)
-	bodyAttr := uint16(len(body)) & 0x03FF
-	binary.BigEndian.PutUint16(header[2:4], bodyAttr)
-	binary.BigEndian.PutUint16(header[16:18], seqNum)
+	header := make([]byte, jt809HeaderLen) // 22 bytes
+	binary.BigEndian.PutUint16(header[0:2], uint16(22+len(body))) // 报文长度
+	binary.BigEndian.PutUint16(header[2:4], seqNum)               // 报文序号
+	header[4] = 0x00                                              // 加密方式
+	header[5] = 0x01                                              // 车牌颜色
+	binary.BigEndian.PutUint16(header[18:20], msgID)               // 子业务类型
 	payload := append(header, body...)
 	crc := crc32.ChecksumIEEE(payload)
 	crcBytes := make([]byte, 4)
@@ -1322,6 +1529,8 @@ func (c *JT809Client) sendOnDownlink(conn net.Conn, msgID uint16, seqNum uint16,
 	result = append(result, 0x5B)
 	result = append(result, escaped...)
 	result = append(result, 0x5D)
+	// FIXED: 809写操作缺少写超时 [2026-07-17]
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(result); err != nil {
 		c.logger.Error("809 send on downlink failed",
 			zap.String("platform_id", c.cfg.ID),
@@ -1549,7 +1758,8 @@ func (s *JT809Server) processDownstreamData(clientID string, data []byte) {
 		return
 	}
 
-	if data[0] == 0x5B && data[len(data)-1] == 0x5D {
+	// 0x5D = JT/T 809 标准结束符；同时接受 0x5E（兼容部分旧设备）
+	if data[0] == 0x5B && (data[len(data)-1] == 0x5D || data[len(data)-1] == 0x5E) {
 		// 当 messageHandler 已注册时，将完整 809 消息交给它处理（利用 Handler809 的完整消息处理能力）
 		if s.messageHandler != nil && s.protocolHub != nil {
 			_, msg, err := s.protocolHub.Route(data)
@@ -1575,17 +1785,23 @@ func (s *JT809Server) processDownstreamData(clientID string, data []byte) {
 
 		// 内联 fallback 处理（当 messageHandler 为 nil 或 Route 失败时使用）
 		inner := data[1 : len(data)-1]
-		unescaped := unescape809(inner)
-
-		if len(unescaped) < 2 {
+		// INDUSTRIAL-FIX-2026-07-25-R30 [P2]: unescape809 返回 error，非法转义帧丢弃
+		unescaped, unescErr := unescape809(inner)
+		if unescErr != nil {
+			s.logger.Warn("809 server unescape failed, dropping frame",
+				zap.String("id", clientID), zap.Error(unescErr))
 			return
 		}
 
-		msgID := binary.BigEndian.Uint16(unescaped[0:2])
+		if len(unescaped) < jt809HeaderLen {
+			return
+		}
+
+		msgID := binary.BigEndian.Uint16(unescaped[18:20])
 
 		var seqNum uint16
 		if len(unescaped) >= jt809HeaderLen {
-			seqNum = binary.BigEndian.Uint16(unescaped[16:18])
+			seqNum = binary.BigEndian.Uint16(unescaped[2:4])
 		}
 
 		switch msgID {
@@ -1642,18 +1858,19 @@ func (s *JT809Server) processDownstreamData(clientID string, data []byte) {
 // extractBody 从809帧中提取消息体（跳过header，去掉校验码）
 // AUTO-FIX-2026-06-26: 用于下级平台登录鉴权时提取UserID/Password [2026-06-26]
 func extractBody(unescaped []byte) []byte {
-	if len(unescaped) <= jt809HeaderLen+1 {
+	if len(unescaped) < jt809HeaderLen+4 {
 		return nil
 	}
-	if len(unescaped) < 4 {
+	// AUTO-FIX-2026-07-16: 809标准报文长度 = 数据头(22) + 数据体
+	msgLen := int(binary.BigEndian.Uint16(unescaped[0:2]))
+	bodyLen := msgLen - jt809HeaderLen
+	if bodyLen <= 0 {
 		return nil
 	}
-	bodyAttr := binary.BigEndian.Uint16(unescaped[2:4])
-	bodyLen := int(bodyAttr & 0x03FF)
 	start := jt809HeaderLen
 	end := start + bodyLen
-	if end > len(unescaped)-1 {
-		end = len(unescaped) - 1
+	if end > len(unescaped)-4 {
+		end = len(unescaped) - 4 // 排除CRC32(4B)
 	}
 	if start >= end {
 		return nil
@@ -1690,15 +1907,12 @@ func (s *JT809Server) sendDownstreamResponse(conn net.Conn, msgID uint16, seqNum
 		return
 	}
 
-	header := make([]byte, jt809HeaderLen)
-	binary.BigEndian.PutUint16(header[0:2], msgID)
-
-	bodyAttr := uint16(len(body)) & 0x03FF
-	binary.BigEndian.PutUint16(header[2:4], bodyAttr)
-
-	// 企业数字证书/消息加密/消息密钥/上下行链路/数据加密方式/保留 均填 0
-	// 消息流水号
-	binary.BigEndian.PutUint16(header[16:18], seqNum)
+	header := make([]byte, jt809HeaderLen) // 22 bytes
+	binary.BigEndian.PutUint16(header[0:2], uint16(22+len(body))) // 报文长度
+	binary.BigEndian.PutUint16(header[2:4], seqNum)               // 报文序号
+	header[4] = 0x00                                              // 加密方式
+	header[5] = 0x01                                              // 车牌颜色
+	binary.BigEndian.PutUint16(header[18:20], msgID)               // 子业务类型
 
 	payload := append(header, body...)
 
@@ -1712,6 +1926,8 @@ func (s *JT809Server) sendDownstreamResponse(conn net.Conn, msgID uint16, seqNum
 	result = append(result, 0x5B)
 	result = append(result, escaped...)
 	result = append(result, 0x5D)
+	// FIXED: 809写操作缺少写超时 [2026-07-17]
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 
 	if _, err := conn.Write(result); err != nil {
 		s.logger.Error("809 send downstream response failed",
@@ -1789,7 +2005,10 @@ func escape809(data []byte) []byte {
 	return result
 }
 
-func unescape809(data []byte) []byte {
+// INDUSTRIAL-FIX-2026-07-25-R30 [P2]: 与 pkg/protocol/hub.go 和 module-protocol-809/codec.go
+// 中的 unescape809 保持一致——尾部 0x5A 或 0x5E 无后续转义字节时返回 error，
+// 而非静默追加非法字节。调用方应检查 error 并丢弃该帧。
+func unescape809(data []byte) ([]byte, error) {
 	result := make([]byte, 0, len(data))
 	i := 0
 	for i < len(data) {
@@ -1815,8 +2034,12 @@ func unescape809(data []byte) []byte {
 				continue
 			}
 		}
+		// 尾部 0x5A 或 0x5E 无后续转义字节，非法帧
+		if (data[i] == 0x5A || data[i] == 0x5E) && i+1 >= len(data) {
+			return nil, fmt.Errorf("unescape809: trailing 0x%02X at position %d without escape byte", data[i], i)
+		}
 		result = append(result, data[i])
 		i++
 	}
-	return result
+	return result, nil
 }

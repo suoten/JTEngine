@@ -1,4 +1,4 @@
-# JTE Prometheus 采集配置
+﻿# JTE Prometheus 采集配置
 
 global:
   scrape_interval: 15s
@@ -16,10 +16,10 @@ alerting:
 
 scrape_configs:
   # JTE 引擎主服务
-  - job_name: jte-engine
+  - job_name: jt-engine
     metrics_path: /metrics
     static_configs:
-      - targets: ["jte-engine:8080"]
+      - targets: ["jt-engine:8080"]
         labels:
           service: jte
           env: production
@@ -29,7 +29,7 @@ scrape_configs:
     metrics_path: /health/ready
     scrape_interval: 30s
     static_configs:
-      - targets: ["jte-engine:8080"]
+      - targets: ["jt-engine:8080"]
         labels:
           service: jte-health
 

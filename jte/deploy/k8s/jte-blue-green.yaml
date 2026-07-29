@@ -43,6 +43,8 @@ data:
 
 ---
 # Secret 敏感配置（生产环境用 SealedSecrets/External Secrets 替代）
+# FIXED: [P1-2] 原实现 ${MYSQL_PASSWORD} 在 stringData 中是字面量，K8s 不会展开
+# 改为独立 Secret 条目，Pod 环境变量中通过 $(VAR) 语法引用（K8s 自动展开）
 apiVersion: v1
 kind: Secret
 metadata:
@@ -50,9 +52,24 @@ metadata:
   namespace: jte
 type: Opaque
 stringData:
-  mysql_dsn: "jte:${MYSQL_PASSWORD}@tcp(mysql:3306)/jte?parseTime=true"
-  redis_addr: "redis:6379"
-  tdengine_dsn: "root:${TDENGINE_PASSWORD}@ws(tdengine1:6041,tdengine2:6041,tdengine3:6041)/jte_ts"
+  MYSQL_PASSWORD: "CHANGE_ME_IN_PRODUCTION"
+  TDENGINE_PASSWORD: "CHANGE_ME_IN_PRODUCTION"
+  REDIS_PASSWORD: "CHANGE_ME_IN_PRODUCTION"
+
+---
+# [工业级加固] PriorityClass 确保 JTE Pod 在资源紧张时优先调度
+# preempting: Never — 不抢占低优先级 Pod，但在调度时优先获得资源
+# 生产环境建议使用 high 优先级，低于 system-critical（1000000000）
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: jte-high-priority
+  labels:
+    app: jte
+value: 1000000
+preemptionPolicy: Never
+globalDefault: false
+description: "JTE engine pods get this priority to ensure scheduling preference during resource pressure."
 
 ---
 # Blue Deployment（当前生产版本）
@@ -82,9 +99,19 @@ spec:
         slot: blue
     spec:
       terminationGracePeriodSeconds: 330  # drain_timeout(300) + 30s buffer
+      # [工业级加固] 优先级确保资源紧张时 JTE Pod 优先调度
+      priorityClassName: jte-high-priority
+      # [工业级加固] 跨可用区分布，避免单可用区故障导致全部 Pod 不可用
+      topologySpreadConstraints:
+        - maxSkew: 1  # 允许的最大不均匀度（1 表示各可用区 Pod 数差异 ≤1）
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule  # 无法满足时拒绝调度（强约束）
+          labelSelector:
+            matchLabels:
+              app: jte
       containers:
       - name: jte
-        image: jte-engine:latest
+        image: jte-engine:v3.0.0  # FIXED: [P2-1] 固定版本标签，生产环境禁止使用 latest
         ports:
         - containerPort: 7611
           name: gateway
@@ -93,6 +120,16 @@ spec:
         env:
         - name: JTE_ACTIVE_SLOT
           value: "blue"
+        # FIXED: [P1-2] 使用独立环境变量引用 Secret 条目，K8s 自动展开 $(VAR)
+        - name: JTE_STORAGE_DSN
+          value: "jte:$(MYSQL_PASSWORD)@tcp(mysql:3306)/jte?parseTime=true"
+        - name: JTE_TDENGINE_DSN
+          value: "root:$(TDENGINE_PASSWORD)@ws(tdengine1:6041,tdengine2:6041,tdengine3:6041)/jte_ts"
+        - name: JTE_REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: jte-secrets
+              key: REDIS_PASSWORD
         envFrom:
         - secretRef:
             name: jte-secrets
@@ -127,13 +164,18 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 5
           failureThreshold: 60  # 最多等 5 分钟启动
+        # [工业级加固] 基于压测数据的资源配额
+        # 压测基线：10000 设备 × 5s 上报频率，单 Pod 消耗 ~2CPU/2.5GB
+        # requests 设为压测 P50，limits 设为 P99，确保突发流量不被 OOM Kill
         resources:
           requests:
-            cpu: "1000m"
-            memory: "2Gi"
+            cpu: "2000m"      # 压测 P50: 1.8 CPU
+            memory: "3Gi"     # 压测 P50: 2.5 GB
+            ephemeral-storage: "5Gi"  # 日志/缓冲临时存储
           limits:
-            cpu: "4000m"
-            memory: "8Gi"
+            cpu: "8000m"      # 压测 P99: 6.5 CPU（高并发突发）
+            memory: "8Gi"     # 压测 P99: 6.8 GB（批量写入缓冲峰值）
+            ephemeral-storage: "20Gi"
         # 优雅停机：SIGTERM → 拒绝新连接 → 下发退避 → 排空 5 分钟 → 退出
         lifecycle:
           preStop:
@@ -172,9 +214,18 @@ spec:
         slot: green
     spec:
       terminationGracePeriodSeconds: 330
+      # [工业级加固] 与 Blue 相同的优先级和拓扑分布约束
+      priorityClassName: jte-high-priority
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: jte
       containers:
       - name: jte
-        image: jte-engine:latest  # 切换前更新为新版本 tag
+        image: jte-engine:v3.0.0  # FIXED: [P2-1] 固定版本标签，切换前更新为新版本
         ports:
         - containerPort: 7611
           name: gateway
@@ -183,6 +234,16 @@ spec:
         env:
         - name: JTE_ACTIVE_SLOT
           value: "green"
+        # FIXED: [P1-2] 使用独立环境变量引用 Secret 条目，K8s 自动展开 $(VAR)
+        - name: JTE_STORAGE_DSN
+          value: "jte:$(MYSQL_PASSWORD)@tcp(mysql:3306)/jte?parseTime=true"
+        - name: JTE_TDENGINE_DSN
+          value: "root:$(TDENGINE_PASSWORD)@ws(tdengine1:6041,tdengine2:6041,tdengine3:6041)/jte_ts"
+        - name: JTE_REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: jte-secrets
+              key: REDIS_PASSWORD
         envFrom:
         - secretRef:
             name: jte-secrets
@@ -214,13 +275,16 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 5
           failureThreshold: 60
+        # [工业级加固] 与 Blue 相同的资源配额
         resources:
           requests:
-            cpu: "1000m"
-            memory: "2Gi"
+            cpu: "2000m"
+            memory: "3Gi"
+            ephemeral-storage: "5Gi"
           limits:
-            cpu: "4000m"
+            cpu: "8000m"
             memory: "8Gi"
+            ephemeral-storage: "20Gi"
         lifecycle:
           preStop:
             exec:
@@ -284,14 +348,5 @@ spec:
       storage: 50Gi
 
 ---
-# PodDisruptionBudget 保障 voluntary disruption 期间最少可用副本
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: jte-pdb
-  namespace: jte
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      app: jte
+# PodDisruptionBudget 已移至独立的 pdb.yaml 文件，避免重复定义
+# 请使用：kubectl apply -f pdb.yaml

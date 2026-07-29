@@ -240,6 +240,17 @@ func (s *Session) ensureSendLoop() {
 	})
 }
 
+// SendQueueDepth 返回当前发送队列深度（INDUSTRIAL-FIX-2026-07-24: 慢客户端监控）。
+// 队列深度持续高说明客户端写入缓慢，可能需要踢出以释放资源。
+func (s *Session) SendQueueDepth() int {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if s.sendCh == nil {
+		return 0
+	}
+	return len(s.sendCh)
+}
+
 // sendLoop 串行化处理发送队列中的所有下行写入。
 // 单 goroutine 消费 sendCh，从根本上避免并发写冲突；
 // 写超时 5s，超时关闭连接触发设备重连。
@@ -337,6 +348,11 @@ type SessionManager struct {
 	byConn   map[net.Conn]*Session
 	byPhone  map[string]*Session
 	logger   *zap.Logger
+	// R44-FIX-2026-07-26 [P2]: 保护 logger 字段的并发读写。
+	// SetLogger 在配置热重载时写入，deviceLogger/Create 等并发读取，
+	// 不加锁会产生数据竞争（*zap.Logger 指针赋值非原子）。
+	// 使用独立 mutex 而非 sm.mu，避免 deviceLogger 在 sm.mu.Lock 上下文中调用时的重入死锁。
+	loggerMu sync.RWMutex
 }
 
 func NewSessionManager(logger *zap.Logger) *SessionManager {
@@ -349,7 +365,11 @@ func NewSessionManager(logger *zap.Logger) *SessionManager {
 }
 
 // SetLogger 用于配置热重载时替换 logger
+// R44-FIX-2026-07-26 [P2]: 使用 loggerMu 保护 logger 字段的并发读写，
+// 防止与 deviceLogger/Create 等读取 goroutine 的数据竞争。
 func (sm *SessionManager) SetLogger(logger *zap.Logger) {
+	sm.loggerMu.Lock()
+	defer sm.loggerMu.Unlock()
 	sm.logger = logger
 }
 
@@ -357,6 +377,7 @@ func (sm *SessionManager) Create(id string, conn net.Conn) *Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	// R44-FIX-2026-07-26 [P2]: 通过 getLogger() 安全读取 logger 快照
 	session := &Session{
 		ID:         id,
 		Conn:       conn,
@@ -364,20 +385,26 @@ func (sm *SessionManager) Create(id string, conn net.Conn) *Session {
 		Status:     "connected",
 		LastActive: time.Now(),
 		Metadata:   make(map[string]interface{}),
-		logger:     sm.logger,
+		logger:     sm.getLogger(),
 	}
 
 	sm.sessions[id] = session
 	sm.byConn[conn] = session
 	// AUTO-FIX-2026-06-30 [集成-7]: 在线设备数指标
 	metrics.OnlineDevices.Set(float64(len(sm.sessions)))
-	sm.logger.Info("session created", zap.String("id", id), zap.String("remote", session.RemoteAddr))
+	// R44-FIX-2026-07-26 [P2]: 通过 getLogger() 安全读取
+	sm.getLogger().Info("session created", zap.String("id", id), zap.String("remote", session.RemoteAddr))
 	return session
 }
 
 func (sm *SessionManager) Register(session *Session, phone string) {
+	// R38-FIX-2026-07-26 [P1]: 将 oldSession.Close() 移到锁外执行。
+	// Close() 内部调用 sendWg.Wait() 等待 sendLoop 退出，最长阻塞 5s（写超时）。
+	// 原实现在 sm.mu.Lock() 内调用 Close()，导致高并发重连场景下
+	// 所有会话操作（Create/Get/Remove/Register）被阻塞长达 5s。
+	var oldSessionToClose *Session
+
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
 	// AUTO-FIX-2026-06-30 [集成-7]: 日志统一携带 device_id 字段（phone 即 JT/T 808 设备标识）
 	devLog := sm.deviceLogger(phone)
 	// 单设备会话限制：同一手机号仅允许一个活跃会话，踢出旧会话
@@ -385,28 +412,42 @@ func (sm *SessionManager) Register(session *Session, phone string) {
 		devLog.Warn("踢出旧会话",
 			zap.String("old_session", oldSession.ID),
 			zap.String("new_session", session.ID))
-		if oldSession.Conn != nil {
-			oldSession.Close()
-		}
 		// 清空旧会话 Phone 并移除索引，避免旧连接退出时 Remove 误删新会话索引
 		oldSession.SetPhone("")
 		delete(sm.sessions, oldSession.ID)
-		delete(sm.byConn, oldSession.Conn)
+		if oldSession.Conn != nil {
+			delete(sm.byConn, oldSession.Conn)
+		}
+		oldSessionToClose = oldSession
 	}
 	session.SetPhone(phone)
 	session.SetStatus("registered")
 	sm.byPhone[phone] = session
+	sm.mu.Unlock()
+
+	// 锁外关闭旧会话：sendWg.Wait() 可能阻塞 5s，不能持锁等待
+	if oldSessionToClose != nil {
+		oldSessionToClose.Close()
+	}
 	devLog.Info("session registered", zap.String("id", session.ID))
 }
 
 // deviceLogger 返回带 device_id 字段的 logger（AUTO-FIX-2026-06-30 [集成-7] 可观测性完善）。
 // phone 即 JT/T 808 终端手机号，在本项目中作为设备唯一标识（device_id）。
 // 同时保留 phone 字段以兼容现有日志解析工具链。
+// getLogger 在 loggerMu 保护下读取 logger 快照（线程安全）。
+func (sm *SessionManager) getLogger() *zap.Logger {
+	sm.loggerMu.RLock()
+	defer sm.loggerMu.RUnlock()
+	return sm.logger
+}
+
 func (sm *SessionManager) deviceLogger(phone string) *zap.Logger {
-	if sm.logger == nil || phone == "" {
-		return sm.logger
+	l := sm.getLogger()
+	if l == nil || phone == "" {
+		return l
 	}
-	return sm.logger.With(zap.String("device_id", phone), zap.String("phone", phone))
+	return l.With(zap.String("device_id", phone), zap.String("phone", phone))
 }
 
 func (sm *SessionManager) Authenticate(phone string) bool {
@@ -444,23 +485,37 @@ func (sm *SessionManager) GetByPhone(phone string) (*Session, bool) {
 }
 
 func (sm *SessionManager) Remove(id string) {
+	// R38-FIX-2026-07-26 [P1]: 将 session.Close() 移到锁外执行。
+	// Close() 内部调用 sendWg.Wait() 等待 sendLoop 退出，最长阻塞 5s（写超时）。
+	// 原实现在 sm.mu.Lock() 内调用 Close()，导致高并发断连场景下
+	// 所有会话操作被阻塞长达 5s。
+	var sessionToClose *Session
+
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
 	session, ok := sm.sessions[id]
 	if !ok {
+		sm.mu.Unlock()
 		return
 	}
 	delete(sm.sessions, id)
-	delete(sm.byConn, session.Conn)
+	if session.Conn != nil {
+		delete(sm.byConn, session.Conn)
+	}
 	phone := session.GetPhone()
 	if phone != "" {
 		delete(sm.byPhone, phone)
 	}
 	if session.Conn != nil {
-		session.Close()
+		sessionToClose = session
 	}
-	// AUTO-FIX-2026-06-30 [集成-7]: 在线设备数指标 + device_id 日志字段
+	// AUTO-FIX-2026-06-30 [集成-7]: 在线设备数指标
 	metrics.OnlineDevices.Set(float64(len(sm.sessions)))
+	sm.mu.Unlock()
+
+	// 锁外关闭会话：sendWg.Wait() 可能阻塞 5s，不能持锁等待
+	if sessionToClose != nil {
+		sessionToClose.Close()
+	}
 	sm.deviceLogger(phone).Info("session removed", zap.String("id", id))
 }
 
@@ -497,6 +552,9 @@ func (sm *SessionManager) UpdateActivity(id string) {
 type TCPServer struct {
 	cfg         *config.GatewayConfig
 	logger      *zap.Logger
+	// R44-FIX-2026-07-26 [P2]: 保护 logger 字段的并发读写。
+	// SetLogger 在配置热重载时写入，acceptLoop/handleConn 等并发读取。
+	loggerMu    sync.RWMutex
 	listener    net.Listener
 	listenerMu  sync.Mutex // 保护 listener 字段的读写，防止 acceptLoop 与 Stop 并发 nil panic
 	sessions    *SessionManager
@@ -507,10 +565,16 @@ type TCPServer struct {
 	accepting   atomic.Bool // 是否继续接受新连接（优雅停机时置 false，现有连接继续服务）
 	onMessage   func(session *Session, msg *protocol.Message)
 	byIP        map[string]int // 单 IP 连接数统计
-	ipLimit     int            // 单 IP 最大连接数（默认 1000）
+	ipLimit     int            // 单 IP 最大连接数（默认 100）
 	ipMu        sync.Mutex     // 保护 byIP
 	memGuard    *memoryGuard   // OOM 防护
 	authLimiter *tokenBucket   // 鉴权限流：令牌桶 1000/s
+	// FIXED-2026-07-22 [P0]: 初始认证超时（连接建立后须在此时间内完成注册+鉴权）
+	initialAuthTimeout time.Duration
+	// FIXED-2026-07-22 [P0]: 单 IP 连接速率限制器
+	ipRateLimiter *ipConnRateLimiter
+	// INDUSTRIAL-FIX-2026-07-24: 每会话消息洪水检测限流器
+	msgRateLimiter *sessionMsgRateLimiter
 	// AUTO-FIX-2026-06-30 [P1-2]: 服务端重启退避窗口。
 	// 启动后 backoffWindow 时间内，鉴权限流退避时间取更大值，分散重启后的鉴权风暴。
 	startupTime   time.Time
@@ -525,17 +589,33 @@ func NewTCPServer(
 	store storage.Interface,
 	reg *registry.FeatureRegistry,
 ) *TCPServer {
+	// FIXED-2026-07-22 [P0]: 从配置读取初始认证超时和单 IP 连接限制
+	ipLimit := 1000 // 向后兼容默认值
+	if cfg != nil && cfg.MaxConnsPerIP > 0 {
+		ipLimit = cfg.MaxConnsPerIP
+	}
+	authTimeout := 30 * time.Second // 默认 30s
+	if cfg != nil && cfg.InitialAuthTimeout > 0 {
+		authTimeout = time.Duration(cfg.InitialAuthTimeout) * time.Second
+	}
+	connRatePerIP := 50 // 默认 50/s
+	if cfg != nil && cfg.MaxConnRatePerIP > 0 {
+		connRatePerIP = cfg.MaxConnRatePerIP
+	}
 	return &TCPServer{
-		cfg:         cfg,
-		logger:      logger,
-		sessions:    sessions,
-		protocol:    protocolHub,
-		storage:     store,
-		registry:    reg,
-		byIP:        make(map[string]int),
-		ipLimit:     1000,
-		memGuard:    newMemoryGuard(sessions, logger),
-		authLimiter: newTokenBucket(1000, 1000), // 容量 1000，每秒填充 1000
+		cfg:                cfg,
+		logger:             logger,
+		sessions:           sessions,
+		protocol:           protocolHub,
+		storage:            store,
+		registry:           reg,
+		byIP:               make(map[string]int),
+		ipLimit:            ipLimit,
+		memGuard:           newMemoryGuard(sessions, logger),
+		authLimiter:        newTokenBucket(1000, 1000), // 容量 1000，每秒填充 1000
+		initialAuthTimeout: authTimeout,
+		ipRateLimiter:      newIPConnRateLimiter(connRatePerIP, time.Second),
+		msgRateLimiter:     newSessionMsgRateLimiter(1000, time.Second), // 每会话每秒最多 1000 条消息
 	}
 }
 
@@ -544,11 +624,21 @@ func (s *TCPServer) SetMessageHandler(handler func(session *Session, msg *protoc
 }
 
 // SetLogger 用于配置热重载时替换 logger
+// R44-FIX-2026-07-26 [P2]: 使用 loggerMu 保护并发读写，防止数据竞争。
 func (s *TCPServer) SetLogger(logger *zap.Logger) {
+	s.loggerMu.Lock()
 	s.logger = logger
+	s.loggerMu.Unlock()
 	if s.sessions != nil {
 		s.sessions.SetLogger(logger)
 	}
+}
+
+// getLogger 在 loggerMu 保护下读取 logger 快照（线程安全）。
+func (s *TCPServer) getLogger() *zap.Logger {
+	s.loggerMu.RLock()
+	defer s.loggerMu.RUnlock()
+	return s.logger
 }
 
 // SetSessionManager 用于运行时替换会话管理器
@@ -577,8 +667,13 @@ func (s *TCPServer) Start() error {
 		s.memGuard.Start()
 	}
 
-	s.logger.Info("TCP server started", zap.String("addr", addr))
-	util.SafeGo(s.logger, "gateway.acceptLoop", s.acceptLoop)
+	// FIXED-2026-07-23 [P2]: 启动 IP 连接速率限制器后台清理
+	if s.ipRateLimiter != nil {
+		s.ipRateLimiter.StartCleanup()
+	}
+
+	s.getLogger().Info("TCP server started", zap.String("addr", addr))
+	util.SafeGo(s.getLogger(), "gateway.acceptLoop", s.acceptLoop)
 	return nil
 }
 
@@ -592,7 +687,7 @@ func (s *TCPServer) StopAccept() {
 		s.listener = nil
 	}
 	s.listenerMu.Unlock()
-	s.logger.Info("TCP server stopped accepting new connections")
+	s.getLogger().Info("TCP server stopped accepting new connections")
 }
 
 func (s *TCPServer) Stop() {
@@ -608,12 +703,22 @@ func (s *TCPServer) Stop() {
 	if s.memGuard != nil {
 		s.memGuard.Stop()
 	}
-	for _, session := range s.sessions.List() {
-		if session.Conn != nil {
-			session.Conn.Close()
-		}
+	// FIXED-2026-07-23 [P2]: 停止 IP 连接速率限制器后台清理
+	if s.ipRateLimiter != nil {
+		s.ipRateLimiter.StopCleanup()
 	}
-	s.logger.Info("TCP server stopped")
+	// INDUSTRIAL-FIX-2026-07-24: 停止每会话消息限流器后台清理
+	if s.msgRateLimiter != nil {
+		s.msgRateLimiter.StopCleanup()
+	}
+	// R44-FIX-2026-07-26 [P1]: 使用 session.Close() 替代直接访问 session.Conn。
+	// 原实现 session.Conn 直接字段访问无锁保护，与 Session.Close() 的 s.mu.Lock 下
+	// s.Conn = nil 形成数据竞争（Go race detector 会报错）。
+	// session.Close() 内部在 s.mu 保护下安全关闭 Conn，并停止 sendLoop，避免 goroutine 泄漏。
+	for _, session := range s.sessions.List() {
+		session.Close()
+	}
+	s.getLogger().Info("TCP server stopped")
 }
 
 func (s *TCPServer) acceptLoop() {
@@ -639,17 +744,17 @@ func (s *TCPServer) acceptLoop() {
 			if !s.accepting.Load() {
 				return
 			}
-			s.logger.Error("accept connection", zap.Error(err))
+			s.getLogger().Error("accept connection", zap.Error(err))
 			continue
 		}
 
 		if s.sessions.OnlineCount() >= s.cfg.MaxConnections {
-			s.logger.Warn("max connections reached, rejecting", zap.String("remote", conn.RemoteAddr().String()))
+			s.getLogger().Warn("max connections reached, rejecting", zap.String("remote", conn.RemoteAddr().String()))
 			conn.Close()
 			continue
 		}
 
-		util.SafeGoWithRecover(s.logger, "gateway.handleConn", func(r interface{}) {
+		util.SafeGoWithRecover(s.getLogger(), "gateway.handleConn", func(r interface{}) {
 			// handleConn panic 时确保连接关闭，避免文件描述符泄漏
 			_ = conn.Close()
 		}, func() { s.handleConn(conn) })
@@ -662,7 +767,7 @@ func (s *TCPServer) acceptLoop() {
 func (s *TCPServer) handleConn(conn net.Conn) {
 	// OOM 防护：内存满时拒绝新连接
 	if s.memGuard != nil && s.memGuard.IsMemoryFull() {
-		s.logger.Warn("内存不足，拒绝新连接", zap.String("remote", conn.RemoteAddr().String()))
+		s.getLogger().Warn("内存不足，拒绝新连接", zap.String("remote", conn.RemoteAddr().String()))
 		conn.Close()
 		return
 	}
@@ -672,13 +777,29 @@ func (s *TCPServer) handleConn(conn net.Conn) {
 	s.ipMu.Lock()
 	if s.byIP[remoteIP] >= s.ipLimit {
 		s.ipMu.Unlock()
-		s.logger.Warn("单IP连接数超限，拒绝连接",
+		s.getLogger().Warn("单IP连接数超限，拒绝连接",
 			zap.String("ip", remoteIP), zap.Int("limit", s.ipLimit))
 		conn.Close()
 		return
 	}
 	s.byIP[remoteIP]++
 	s.ipMu.Unlock()
+
+	// FIXED-2026-07-22 [P0]: 单 IP 连接速率限制（滑动窗口）
+	if s.ipRateLimiter != nil && !s.ipRateLimiter.Allow(remoteIP) {
+		s.getLogger().Warn("单IP连接速率超限，拒绝连接",
+			zap.String("ip", remoteIP))
+		conn.Close()
+		// 连接被拒，回退 byIP 计数
+		s.ipMu.Lock()
+		s.byIP[remoteIP]--
+		if s.byIP[remoteIP] <= 0 {
+			delete(s.byIP, remoteIP)
+		}
+		s.ipMu.Unlock()
+		return
+	}
+
 	// 连接关闭时减少 byIP 计数（含心跳超时踢出场景）
 	defer func() {
 		s.ipMu.Lock()
@@ -698,12 +819,18 @@ func (s *TCPServer) handleConn(conn net.Conn) {
 		s.sessions.Remove(sessionID)
 	}()
 
-	// 慢连接检测：连接建立后 5s 内必须收到 0x0100 注册消息
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// FIXED-2026-07-22 [P0]: 使用可配置的 initialAuthTimeout（默认 30s）
+	// 连接建立后须在 initialAuthTimeout 内完成注册+鉴权，超时关闭连接并记录日志。
+	authTimeout := s.initialAuthTimeout
+	if authTimeout == 0 {
+		authTimeout = 30 * time.Second
+	}
+	conn.SetReadDeadline(time.Now().Add(authTimeout))
 
 	var frameBuf *protocol.FrameBuffer
 
-	buf := make([]byte, 8192)
+	// [P2-4] 读缓冲从 8192 扩大到 65536，支持大帧（如 1078 视频帧、809 批量报文）
+	buf := make([]byte, 65536)
 	for s.running.Load() {
 		n, err := conn.Read(buf)
 		if err != nil {
@@ -714,19 +841,19 @@ func (s *TCPServer) handleConn(conn net.Conn) {
 				// 根据会话状态记录超时原因
 				switch session.GetStatus() {
 				case "connected":
-					s.logger.Warn("连接建立超时", zap.String("id", sessionID),
+					s.getLogger().Warn("连接建立超时", zap.String("id", sessionID),
 						zap.String("remote", session.RemoteAddr))
 				case "registered":
-					s.logger.Warn("鉴权超时", zap.String("id", sessionID),
+					s.getLogger().Warn("鉴权超时", zap.String("id", sessionID),
 						zap.String("phone", session.GetPhone()))
 				case "authenticated":
 					// P1-3: 鉴权后 30s 无数据超时（慢连接/空闲连接防护）
-					s.logger.Warn("鉴权后无数据超时", zap.String("id", sessionID),
+					s.getLogger().Warn("鉴权后无数据超时", zap.String("id", sessionID),
 						zap.String("phone", session.GetPhone()))
 				}
 				return
 			}
-			s.logger.Debug("connection read error", zap.String("id", sessionID), zap.Error(err))
+			s.getLogger().Debug("connection read error", zap.String("id", sessionID), zap.Error(err))
 			return
 		}
 
@@ -743,7 +870,7 @@ func (s *TCPServer) handleConn(conn net.Conn) {
 			if frameBuf == nil {
 				frameBuf = s.detectProtocol(data)
 				if frameBuf == nil {
-					s.logger.Warn("cannot detect protocol", zap.String("id", sessionID))
+					s.getLogger().Warn("cannot detect protocol", zap.String("id", sessionID))
 					continue
 				}
 				session.SetProtocol(frameBuf.GetProtocol())
@@ -751,6 +878,21 @@ func (s *TCPServer) handleConn(conn net.Conn) {
 
 			frames := frameBuf.Feed(data)
 			for _, frame := range frames {
+				// INDUSTRIAL-FIX-2026-07-24: 每会话消息洪水检测
+				// 单连接每秒超过 1000 条消息视为洪水攻击，断开连接
+				if !s.msgRateLimiter.Allow(sessionID) {
+					phone := session.GetPhone()
+					logger := s.logger
+					if phone != "" {
+						logger = logger.With(zap.String("device_id", phone), zap.String("phone", phone))
+					}
+					logger.Warn("message flood detected, closing connection",
+						zap.String("id", sessionID))
+					conn.Close()
+					return
+				}
+				metrics.MessagesPerSession.IncWithLabels(map[string]string{"session_id": sessionID})
+
 				pt, msg, err := s.protocol.Route(frame)
 				if err != nil {
 					// AUTO-FIX-2026-07-02 [可观测性]: 解析错误计数指标
@@ -758,7 +900,7 @@ func (s *TCPServer) handleConn(conn net.Conn) {
 						"protocol": string(pt),
 						"error":    "route_failed",
 					})
-					s.logger.Warn("protocol route failed", zap.Error(err), zap.String("id", sessionID))
+					s.getLogger().Warn("protocol route failed", zap.Error(err), zap.String("id", sessionID))
 					continue
 				}
 
@@ -769,19 +911,25 @@ func (s *TCPServer) handleConn(conn net.Conn) {
 				// 慢连接检测：根据消息类型推进读超时阶段
 				if msg != nil {
 					switch msg.Header.MsgID {
-					case 0x0100: // JT/T 808 终端注册，收到后 10s 内必须完成鉴权
-						conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+					case 0x0100: // JT/T 808 终端注册，收到后续续期 initialAuthTimeout
+						conn.SetReadDeadline(time.Now().Add(authTimeout))
 					case 0x0102: // JT/T 808 终端鉴权
 						// AUTO-FIX-2026-06-30 [P1-2]: 鉴权限流：令牌桶 1000/s，超限下发 0x8001 应答码 0x01 + 随机退避时间
 						if !s.authLimiter.Allow() {
 							backoffSec := s.authBackoffSec()
-							s.logger.Warn("鉴权限流，下发退避时间",
+							s.getLogger().Warn("鉴权限流，下发退避时间",
 								zap.String("id", sessionID),
 								zap.String("phone", msg.Header.Phone),
 								zap.Int("backoff_sec", backoffSec))
 							resp := BuildReconnectBackoffResp(msg.Header.Phone, msg.Header.SeqNum, backoffSec)
-							if _, werr := conn.Write(resp); werr != nil {
-								s.logger.Warn("发送鉴权退避应答失败",
+							// R44-FIX-2026-07-26 [P1]: 使用 session.Write 替代 conn.Write。
+							// 原实现直接 conn.Write(resp) 绕过 sendLoop，若前序消息的 onMessage
+							// 回调已通过 session.Write 投递了下行帧到 sendLoop 队列，
+							// 则 sendLoop goroutine 可能正在并发执行 conn.Write，
+							// 与此处的 conn.Write 形成并发写竞争，导致数据交错/损坏。
+							// session.Write 内部通过 sendLoop 串行化所有下行写入，从根本上避免并发写。
+							if _, werr := session.Write(resp); werr != nil {
+								s.getLogger().Warn("发送鉴权退避应答失败",
 									zap.String("id", sessionID), zap.Error(werr))
 							}
 							conn.Close()
@@ -809,13 +957,13 @@ func (s *TCPServer) detectProtocol(data []byte) *protocol.FrameBuffer {
 
 	switch {
 	case data[0] == 0x7E:
-		s.logger.Debug("detected JT/T 808/1078/905/1253 protocol")
+		s.getLogger().Debug("detected JT/T 808/1078/905/1253 protocol")
 		return protocol.NewFrameBuffer(protocol.ProtocolJT808)
 	case data[0] == 0x5B:
-		s.logger.Debug("detected JT/T 809 protocol")
+		s.getLogger().Debug("detected JT/T 809 protocol")
 		return protocol.NewFrameBuffer(protocol.ProtocolJT809)
 	case len(data) >= 2 && data[0] == 0x23 && data[1] == 0x23:
-		s.logger.Debug("detected GB/T 32960 protocol")
+		s.getLogger().Debug("detected GB/T 32960 protocol")
 		return protocol.NewFrameBuffer(protocol.ProtocolGBT32960)
 	default:
 		return nil
@@ -833,6 +981,96 @@ func extractIP(addr string) string {
 		return addr
 	}
 	return host
+}
+
+// ipConnRateLimiter 单 IP 连接速率限制器（滑动窗口）。
+// FIXED-2026-07-22 [P0]: 防止单 IP 在短时间内大量新建连接占满 max_connections。
+// FIXED-2026-07-23 [P2]: 添加后台清理机制，防止 counters map 内存泄漏。
+type ipConnRateLimiter struct {
+	mu       sync.Mutex
+	window   time.Duration // 时间窗口（默认 1s）
+	maxRate  int           // 窗口内最大新建连接数
+	counters map[string]*ipRateCounter
+	stopCh   chan struct{}
+	stopOnce sync.Once // R35-FIX [P2]: 幂等关闭，防止重复 close panic
+}
+
+type ipRateCounter struct {
+	count    int
+	windowStart time.Time
+}
+
+// newIPConnRateLimiter 创建单 IP 连接速率限制器。
+func newIPConnRateLimiter(maxRate int, window time.Duration) *ipConnRateLimiter {
+	return &ipConnRateLimiter{
+		window:   window,
+		maxRate:  maxRate,
+		counters: make(map[string]*ipRateCounter),
+		stopCh:   make(chan struct{}),
+	}
+}
+
+// Allow 检查指定 IP 是否允许新建连接。如果允许，计数器+1；否则返回 false。
+func (r *ipConnRateLimiter) Allow(ip string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	c, ok := r.counters[ip]
+	if !ok || now.Sub(c.windowStart) >= r.window {
+		// 新窗口
+		r.counters[ip] = &ipRateCounter{count: 1, windowStart: now}
+		return true
+	}
+	if c.count >= r.maxRate {
+		return false
+	}
+	c.count++
+	return true
+}
+
+// Cleanup 清理过期的计数器（由后台定期调用或惰性清理）。
+func (r *ipConnRateLimiter) Cleanup() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for ip, c := range r.counters {
+		if now.Sub(c.windowStart) >= r.window {
+			delete(r.counters, ip)
+		}
+	}
+}
+
+// StartCleanup 启动后台清理协程，每 5 分钟清理一次过期计数器。
+// FIXED-2026-07-23 [P2]: 防止 counters map 无限增长导致内存泄漏。
+func (r *ipConnRateLimiter) StartCleanup() {
+	util.SafeGo(nil, "ipConnRateLimiter.cleanup", func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// R62-FIX [P2]: 将 recover 移到循环内部，确保单次 Cleanup panic
+				// 不会导致清理协程整体退出。SafeGo 的 recover 在 goroutine 级别，
+				// panic 后协程退出，counters map 永不被清理，内存泄漏。
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							// SafeGo 已有 recover，此处二级 recover 确保循环不退出
+						}
+					}()
+					r.Cleanup()
+				}()
+			case <-r.stopCh:
+				return
+			}
+		}
+	})
+}
+
+// StopCleanup 停止后台清理协程（幂等，多次调用安全）。
+// R35-FIX [P2]: 使用 sync.Once 防止重复 close panic。
+func (r *ipConnRateLimiter) StopCleanup() {
+	r.stopOnce.Do(func() { close(r.stopCh) })
 }
 
 type HeartbeatChecker struct {
@@ -885,15 +1123,46 @@ func (h *HeartbeatChecker) checkLoop() {
 		case <-h.stopCh:
 			return
 		case <-ticker.C:
-			h.checkSessions()
+			// R62-FIX [P2]: 将 recover 移到循环内部，确保单次 checkSessions panic
+			// 不会导致心跳检查协程退出。SafeGo 的 recover 在 goroutine 级别，
+			// panic 后协程退出，心跳超时检测失效，僵尸会话不被清理，连接泄漏。
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// SafeGo 已有 recover，此处二级 recover 确保循环不退出
+					}
+				}()
+				h.checkSessions()
+			}()
 		}
 	}
 }
 
+// checkSessions 定期检查所有会话的心跳状态。
+// INDUSTRIAL-FIX-2026-07-24: 同时上报会话状态分布指标和发送队列深度告警。
 func (h *HeartbeatChecker) checkSessions() {
 	now := time.Now()
+	// INDUSTRIAL-FIX-2026-07-24: 会话状态分布指标
+	stateCount := map[string]int{"connected": 0, "registered": 0, "authenticated": 0}
 	for _, session := range h.sessions.List() {
 		lastActive := session.GetLastActive()
+		status := session.GetStatus()
+		stateCount[status]++
+
+		// INDUSTRIAL-FIX-2026-07-24: 发送队列深度告警（队列 ≥200/256 = 78%时告警）
+		queueDepth := session.SendQueueDepth()
+		if queueDepth >= 200 {
+			phone := session.GetPhone()
+			logger := h.logger
+			if phone != "" {
+				logger = logger.With(zap.String("device_id", phone), zap.String("phone", phone))
+			}
+			logger.Warn("session send queue near full, slow client detected",
+				zap.String("id", session.ID),
+				zap.Int("queue_depth", queueDepth),
+				zap.Int("queue_capacity", 256))
+		}
+
 		if now.Sub(lastActive) > h.timeout {
 			// AUTO-FIX-2026-06-30 [集成-7]: 心跳超时日志携带 device_id 字段
 			phone := session.GetPhone()
@@ -924,6 +1193,11 @@ func (h *HeartbeatChecker) checkSessions() {
 				session.Conn.Close()
 			}
 		}
+	}
+
+	// 上报会话状态分布指标
+	for state, count := range stateCount {
+		metrics.SessionStateDistribution.SetWithLabels(float64(count), map[string]string{"state": state})
 	}
 }
 
@@ -1088,7 +1362,17 @@ func (m *memoryGuard) loop() {
 		case <-m.stopCh:
 			return
 		case <-ticker.C:
-			m.check()
+			// R62-FIX [P2]: 将 recover 移到循环内部，确保单次 check panic
+			// 不会导致 OOM 防护协程退出。SafeGo 的 recover 在 goroutine 级别，
+			// panic 后协程退出，OOM 防护失效，高负载下可能触发 OOM Kill。
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// SafeGo 已有 recover，此处二级 recover 确保循环不退出
+					}
+				}()
+				m.check()
+			}()
 		}
 	}
 }
@@ -1179,4 +1463,91 @@ func (m *memoryGuard) evictOldestInactive() {
 			oldest.Conn.Close()
 		}
 	}
+}
+
+// sessionMsgRateLimiter 每会话消息速率限制器（滑动窗口）。
+// INDUSTRIAL-FIX-2026-07-24: 防止单设备消息洪水攻击（如高频位置上报）。
+// 每个会话在 window 窗口内最多发送 maxRate 条消息，超限视为洪水攻击。
+type sessionMsgRateLimiter struct {
+	mu       sync.Mutex
+	window   time.Duration
+	maxRate  int
+	counters map[string]*sessionRateCounter
+	stopCh   chan struct{}
+	stopOnce sync.Once // R35-FIX [P2]: 幂等关闭，防止重复 close panic
+}
+
+type sessionRateCounter struct {
+	count       int
+	windowStart time.Time
+}
+
+// newSessionMsgRateLimiter 创建每会话消息速率限制器。
+func newSessionMsgRateLimiter(maxRate int, window time.Duration) *sessionMsgRateLimiter {
+	r := &sessionMsgRateLimiter{
+		window:   window,
+		maxRate:  maxRate,
+		counters: make(map[string]*sessionRateCounter),
+		stopCh:   make(chan struct{}),
+	}
+	// 启动后台清理协程，定期清理已关闭会话的计数器
+	util.SafeGo(nil, "sessionMsgRateLimiter.cleanup", func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// R62-FIX [P2]: 将 recover 移到循环内部，确保单次 Cleanup panic
+				// 不会导致清理协程整体退出。SafeGo 的 recover 在 goroutine 级别，
+				// panic 后协程退出，counters map 永不被清理，内存泄漏。
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							// SafeGo 已有 recover，此处二级 recover 确保循环不退出
+						}
+					}()
+					r.Cleanup()
+				}()
+			case <-r.stopCh:
+				return
+			}
+		}
+	})
+	return r
+}
+
+// Allow 检查指定会话是否允许发送消息。如果允许，计数器+1；否则返回 false。
+func (r *sessionMsgRateLimiter) Allow(sessionID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	c, ok := r.counters[sessionID]
+	if !ok || now.Sub(c.windowStart) >= r.window {
+		// 新窗口
+		r.counters[sessionID] = &sessionRateCounter{count: 1, windowStart: now}
+		return true
+	}
+	if c.count >= r.maxRate {
+		return false
+	}
+	c.count++
+	return true
+}
+
+// Cleanup 清理过期的计数器（由后台定期调用）。
+func (r *sessionMsgRateLimiter) Cleanup() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for sid, c := range r.counters {
+		if now.Sub(c.windowStart) >= r.window {
+			delete(r.counters, sid)
+		}
+	}
+}
+
+// StopCleanup 停止后台清理协程（幂等，多次调用安全）。
+// R35-FIX [P2]: 使用 sync.Once 防止重复 close panic。
+func (r *sessionMsgRateLimiter) StopCleanup() {
+	r.stopOnce.Do(func() { close(r.stopCh) })
 }

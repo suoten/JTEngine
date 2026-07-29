@@ -61,13 +61,15 @@ const routes = [
     path: '/devices',
     name: 'Devices',
     component: () => import('../views/Devices.vue'),
-    meta: { permission: 'device', requireModule: ['protocol_809', 'protocol_1045'] },
+    // FIXED-2026-07-24: 设备管理是 JT/T 808 核心功能，开源版免费，无需模块授权
+    meta: { permission: 'device' },
   },
   {
     path: '/tracks',
     name: 'Tracks',
     component: () => import('../views/Tracks.vue'),
-    meta: { permission: 'track', requireModule: ['protocol_809'] },
+    // FIXED-2026-07-24: 轨迹回放是 JT/T 808 核心功能，开源版免费，无需模块授权
+    meta: { permission: 'track' },
   },
   {
     // AUTO-FIX-2026-07-02: 归档数据查询（联合归档+实时数据，归档任务监控）
@@ -84,16 +86,18 @@ const routes = [
     meta: { permission: 'monitor', requireModule: ['protocol_905'] },
   },
   {
+    // FIXED: 视频监控（JT/T 1078）为免费自带功能，无需模块授权
     path: '/video',
     name: 'Video',
     component: () => import('../views/Video.vue'),
-    meta: { permission: 'video', requireModule: ['protocol_1078', 'protocol_905'] },
+    meta: { permission: 'video' },
   },
   {
     path: '/commands',
     name: 'Commands',
     component: () => import('../views/Commands.vue'),
-    meta: { permission: 'command', requireModule: ['protocol_809'] },
+    // FIXED-2026-07-24: 指令下发是 JT/T 808 核心功能，开源版免费，无需模块授权
+    meta: { permission: 'command' },
   },
   {
     path: '/reports',
@@ -126,9 +130,28 @@ const routes = [
     meta: { permission: 'user_manage' },
   },
   {
+    // FIXED-2026-07-24: 配置管理拆分为独立页面
     path: '/system/config',
     name: 'SystemConfig',
     component: () => import('../views/system/Config.vue'),
+    meta: { permission: 'system' },
+  },
+  {
+    path: '/system/map-config',
+    name: 'MapConfig',
+    component: () => import('../views/system/MapConfig.vue'),
+    meta: { permission: 'system' },
+  },
+  {
+    path: '/system/menu-config',
+    name: 'MenuConfig',
+    component: () => import('../views/system/MenuConfig.vue'),
+    meta: { permission: 'system' },
+  },
+  {
+    path: '/system/ai-config',
+    name: 'AIConfig',
+    component: () => import('../views/system/AIConfig.vue'),
     meta: { permission: 'system' },
   },
   {

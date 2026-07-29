@@ -94,27 +94,35 @@ func (a *AuthManager) Validate(licenseKey string) bool {
 		return false
 	}
 
+	// INDUSTRIAL-FIX-2026-07-25-R30 [P1]: 缓存过期时需要修改 info 字段，
+	// 必须持有写锁。原实现在 RLock 释放后直接修改 info.Valid 和 info.CachedAt，
+	// 与并发 GetAuthInfo/Validate 读路径形成数据竞争（string/bool/time 赋值非原子）。
 	if time.Since(info.CachedAt) > a.cacheTTL {
 		result, err := a.client.VerifyLicense(licenseKey, info.MachineFP)
 		if err != nil {
 			a.logger.Warn("license verify failed, using cache", zap.Error(err))
 			return info.Valid && time.Now().Before(info.ExpiresAt)
 		}
+		// 持写锁更新缓存字段，避免与并发读路径竞争
+		a.mu.Lock()
 		info.Valid = result.Valid
 		info.CachedAt = time.Now()
+		a.mu.Unlock()
 	}
 
 	return info.Valid && time.Now().Before(info.ExpiresAt)
 }
 
-func (a *AuthManager) GetAuthInfo(licenseKey string) (*AuthInfo, bool) {
+// INDUSTRIAL-FIX-2026-07-25-R30 [P1]: 返回 AuthInfo 的值拷贝而非指针，
+// 避免调用方通过返回的指针并发修改缓存中的共享对象（与 Validate 的写路径竞争）。
+func (a *AuthManager) GetAuthInfo(licenseKey string) (AuthInfo, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	info, ok := a.cache[licenseKey]
 	if !ok {
-		return nil, false
+		return AuthInfo{}, false
 	}
-	return info, true
+	return *info, true
 }
 
 func maskKey(key string) string {

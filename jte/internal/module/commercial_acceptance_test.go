@@ -155,11 +155,11 @@ func TestCommercial_TrialAutoStart(t *testing.T) {
 		t.Errorf("expected 29-30 remaining days, got %d", remaining)
 	}
 
-	// 第二次调用不应重复开启
+	// 第二次调用不应重复开启（试用数应保持不变）
 	m.AutoStartTrials()
 	trials2 := m.GetTrials()
-	if len(trials2) != 1 {
-		t.Errorf("expected 1 trial, got %d", len(trials2))
+	if len(trials2) != len(trials) {
+		t.Errorf("expected %d trials (same as first call), got %d", len(trials), len(trials2))
 	}
 
 	_ = dir
@@ -505,6 +505,8 @@ func TestCommercial_OfflineUnbind_RSA(t *testing.T) {
 
 func TestCommercial_OfflineUnbind_HMAC(t *testing.T) {
 	m := newTestLicenseManager(nil, "test-fp-unbind-hmac")
+	// P0-FIX: 设置测试用 secret（移除硬编码 secret 后必须显式配置）
+	m.offlineUnbindSecret = []byte("test-offline-unbind-secret-for-hmac")
 
 	// HMAC 降级模式（不使用 RSA）
 	cert, err := m.generateOfflineUnbindCert("lic-hmac-test")
@@ -512,8 +514,8 @@ func TestCommercial_OfflineUnbind_HMAC(t *testing.T) {
 		t.Fatalf("generate HMAC cert failed: %v", err)
 	}
 
-	// 验证凭证
-	licenseID, fingerprint, _, err := VerifyOfflineUnbindCert(cert)
+	// 验证凭证（使用同一 secret）
+	licenseID, fingerprint, _, err := VerifyOfflineUnbindCertWithSecret(cert, m.offlineUnbindSecret)
 	if err != nil {
 		t.Fatalf("verify HMAC cert failed: %v", err)
 	}

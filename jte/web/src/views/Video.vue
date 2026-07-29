@@ -278,7 +278,16 @@ const bufferStates = ref({})
 const qualityStats = ref({})
 const retryCounts = ref({})
 
+// FIXED: [视频性能] 最大并发流限制，防止浏览器崩溃 [2026-07-17]
+// 1/4/9 画面模式下最多 9 路同时拉流，16 画面模式由激活机制控制
+const MAX_CONCURRENT_STREAMS = 9
+
 async function startStream() {
+  // FIXED: [视频性能] 检查并发流限制，防止浏览器崩溃 [2026-07-17]
+  if (streams.value.length >= MAX_CONCURRENT_STREAMS) {
+    ElMessage.warning(`已达到最大并发流数限制（${MAX_CONCURRENT_STREAMS}路），请先停止部分视频`)
+    return
+  }
   try {
     const res = await videoApi.startStream({
       vehicle_id: startForm.value.vehicle_id,

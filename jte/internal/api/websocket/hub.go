@@ -137,10 +137,22 @@ func (h *Hub) Unsubscribe(client *Client, topic string) {
 }
 
 func (h *Hub) Publish(topic string, msgType string, data interface{}) {
-	h.broadcast <- &Message{
+	// INDUSTRIAL-FIX-2026-07-24-R3 [P2]: 非阻塞发送，防止 broadcast channel 满时调用方阻塞。
+	// 原 h.broadcast <- msg 是阻塞写入，当 channel (cap=256) 满时 Publish 调用方会永久阻塞。
+	// 修复：使用 select default 模式，channel 满时丢弃消息并记录日志。
+	msg := &Message{
 		Topic: topic,
 		Type:  msgType,
 		Data:  data,
+	}
+	select {
+	case h.broadcast <- msg:
+	default:
+		if h.logger != nil {
+			h.logger.Warn("websocket broadcast channel full, message dropped",
+				zap.String("topic", topic),
+				zap.String("msg_type", msgType))
+		}
 	}
 }
 

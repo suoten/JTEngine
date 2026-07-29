@@ -190,7 +190,7 @@ describe('auth store - License 状态联动', () => {
         expired: false,
       }]
       store.trials = {
-        ai: { expires_at: '2026-07-09T00:00:00Z' },
+        ai: { expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString() },
       }
 
       expect(store.getModuleStatus('protocol_809')).toBe('licensed')

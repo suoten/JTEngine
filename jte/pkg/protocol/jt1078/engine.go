@@ -320,6 +320,11 @@ type StreamSession struct {
 	TotalLost     uint64 // 累计丢失包数
 	TotalExpected uint64 // 累计期望包数（收到的 + 丢失的）
 	MaxGap        uint64 // 单次最大 gap
+	// FIXED [P1]: 统计字段并发读写数据竞争修复
+	// ProcessRTPData（流处理协程）与 computeQualityAndCheckAlerts（质量监控协程）
+	// 以及 GetQualityStats（HTTP handler 协程）并发访问统计字段，需用互斥锁保护。
+	// Conn 字段仅在创建时设置一次，不需要锁保护。
+	mu sync.RWMutex
 }
 
 // QualityStats 视频流质量统计快照（对外暴露的只读视图）。
@@ -379,6 +384,8 @@ type VideoEngine struct {
 	onStreamDown       func(streamID, phone string, logicChannel byte) // 流断开回调（业务侧重新下发 0x9101）
 	onQualityPoor      func(streamID, phone string, logicChannel, curStreamType byte) // 质量差回调（业务侧下发 0x9101 StreamType=1 切子码流）
 	qualityStopCh      chan struct{}
+	// FIXED [P1]: Stop() 重复调用时 close(qualityStopCh) 导致 panic
+	stopOnce           sync.Once
 	// AUTO-FIX-2026-07-02 [P1]: UDP→TCP fallback 事件回调（业务侧可订阅以告警/记录）。
 	// project_memory: 添加 fallback 事件日志和指标上报。
 	// fallback 时播放状态(session/SSRC/时间戳)天然保留——ForwardRTP 不触碰 StreamSession。
@@ -497,6 +504,10 @@ func (e *VideoEngine) GetQualityStats(streamID string) (*QualityStats, bool) {
 	downTimeout := e.streamDownTimeout
 	e.qualityMu.RUnlock()
 
+	// FIXED [P1]: 加读锁保护统计字段并发访问
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	now := time.Now()
 	online := now.Sub(s.LastActive) < downTimeout
 
@@ -573,6 +584,10 @@ func (e *VideoEngine) GetGapReport(streamID string) (*GapReport, bool) {
 	downTimeout := e.streamDownTimeout
 	e.qualityMu.RUnlock()
 
+	// FIXED [P1]: 加读锁保护统计字段并发访问
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	now := time.Now()
 	online := now.Sub(s.LastActive) < downTimeout
 
@@ -632,6 +647,8 @@ func (e *VideoEngine) qualityMonitorLoop() {
 
 // computeQualityAndCheckAlerts 单次质量计算与告警检查。
 // 每秒执行：基于窗口计数计算码率/帧率/丢包率，重置窗口，检查流断开与质量差触发条件。
+// FIXED [P1]: 加 session 级互斥锁保护统计字段，避免 ProcessRTPData 与质量监控循环的并发读写竞争。
+// 锁策略：持锁完成「质量计算→窗口重置→决策→状态修改」，解锁后再触发回调与指标上报（避免锁内阻塞）。
 func (e *VideoEngine) computeQualityAndCheckAlerts() {
 	e.qualityMu.RLock()
 	downTimeout := e.streamDownTimeout
@@ -657,6 +674,9 @@ func (e *VideoEngine) computeQualityAndCheckAlerts() {
 	e.mu.RUnlock()
 
 	for _, s := range sessions {
+		// 持锁完成质量计算 + 窗口重置 + 决策逻辑
+		s.mu.Lock()
+
 		// 1) 计算码率/帧率/丢包率（基于1秒窗口）
 		bitrateKbps := float64(s.WindowBytes) * 8.0 / 1000.0
 		frameRate := float64(s.WindowFrames)
@@ -669,45 +689,38 @@ func (e *VideoEngine) computeQualityAndCheckAlerts() {
 		s.FrameRate = frameRate
 		s.LossRate = lossRate
 
-		// AUTO-FIX-2026-06-30 [集成-7]: Prometheus 视频质量指标（按流标签）
-		streamLabels := map[string]string{
-			"stream_id": s.ID,
-			"device_id": s.Phone,
-			"channel":   strconv.Itoa(int(s.LogicChannel)),
-		}
-		metrics.VideoBitrate.SetWithLabels(bitrateKbps, streamLabels)
-		metrics.VideoFramerate.SetWithLabels(frameRate, streamLabels)
-		metrics.VideoPacketLoss.SetWithLabels(lossRate, streamLabels)
-
 		// 重置窗口
 		s.WindowPackets = 0
 		s.WindowBytes = 0
 		s.WindowLost = 0
 		s.WindowFrames = 0
 
+		// 收集回调信息（解锁后触发，避免锁内阻塞）
+		streamID := s.ID
+		phone := s.Phone
+		logicChannel := s.LogicChannel
+
 		// 2) 流断开检测：无 RTP 包超过 downTimeout
+		streamDownDetected := false
+		streamDownTriggered := false
+		var streamDownIdle time.Duration
 		if autoReconnect && onStreamDown != nil && now.Sub(s.LastActive) >= downTimeout {
+			streamDownDetected = true
 			// 仅在已经有过 RTP 数据的流上触发（避免误判未启动的流）
 			if s.Packets > 0 {
-				e.logger.Warn("stream down detected, triggering auto reconnect",
-					zap.String("stream_id", s.ID),
-					zap.String("phone", s.Phone),
-					zap.Uint8("channel", s.LogicChannel),
-					zap.Duration("idle", now.Sub(s.LastActive)))
-				// AUTO-FIX-2026-06-30 [P2-7]: 记录录制分片结束（流断开），供断片检测
+				streamDownIdle = now.Sub(s.LastActive)
 				if recordTracker != nil {
 					recordTracker.OnStreamSwitch(s.ID, s.Phone, s.LogicChannel, SwitchReasonStreamDown, now)
 				}
 				// 标记已触发，避免重复回调：将 LastActive 推后一个 downTimeout
 				s.LastActive = now
-				util.SafeGo(e.logger, "jt1078.onStreamDown", func() { onStreamDown(s.ID, s.Phone, s.LogicChannel) })
+				streamDownTriggered = true
 			}
-			continue
 		}
 
-		// 3) 子码流自动切换检测
-		// project_memory: 连续3次丢包>5% 或 码率<100kbps 自动切换到子码流
-		if autoSwitchSub && onQualityPoor != nil && s.StreamType == 0 {
+		// 3) 子码流自动切换检测（仅在流未断开时检查）
+		qualityPoorTriggered := false
+		if !streamDownDetected && autoSwitchSub && onQualityPoor != nil && s.StreamType == 0 {
 			// 仅主码流才需要切换到子码流
 			poorLoss := lossRate > 5.0
 			poorBitrate := bitrateKbps < 100.0 && s.WindowPackets == 0 && s.Packets > 0
@@ -726,13 +739,6 @@ func (e *VideoEngine) computeQualityAndCheckAlerts() {
 			}
 
 			if s.LossExceedCount >= 3 || s.LowBitrateCount >= 3 {
-				e.logger.Warn("stream quality poor, switching to sub stream",
-					zap.String("stream_id", s.ID),
-					zap.Float64("bitrate_kbps", bitrateKbps),
-					zap.Float64("frame_rate", frameRate),
-					zap.Float64("loss_rate", lossRate),
-					zap.Int("loss_exceed_count", s.LossExceedCount),
-					zap.Int("low_bitrate_count", s.LowBitrateCount))
 				// AUTO-FIX-2026-06-30 [P2-7]: 播放侧切子码流，录制侧仍录主码流（仅标记分片切换原因）。
 				// 录制分片不结束——主码流仍在传输，只是播放侧切到子码流，用户无感。
 				if recordTracker != nil {
@@ -743,30 +749,70 @@ func (e *VideoEngine) computeQualityAndCheckAlerts() {
 				s.LowBitrateCount = 0
 				// 标记当前码流类型为子码流，避免重复切换
 				s.StreamType = 1
-				util.SafeGo(e.logger, "jt1078.onQualityPoor", func() { onQualityPoor(s.ID, s.Phone, s.LogicChannel, 0) })
+				qualityPoorTriggered = true
 			}
 		}
 
 		// 4) 验收标准4: 弱网自动恢复检测
 		// 当流在子码流状态且网络质量恢复（连续3秒丢包率<2%且码率>200kbps）时，自动切回主码流
-		if s.StreamType == 1 && e.autoRecovery != nil {
+		autoRecoveryTriggered := false
+		if !streamDownDetected && s.StreamType == 1 && e.autoRecovery != nil {
 			if e.autoRecovery.CheckRecovery(s.ID, lossRate, bitrateKbps) {
-				e.logger.Info("auto recovery: switching back to main stream",
-					zap.String("stream_id", s.ID),
-					zap.Float64("loss_rate", lossRate),
-					zap.Float64("bitrate_kbps", bitrateKbps))
 				// 标记当前码流类型为主码流
 				s.StreamType = 0
 				// 重置计数
 				s.LossExceedCount = 0
 				s.LowBitrateCount = 0
-				// 触发自动恢复回调
-				e.qualityMu.RLock()
-				onRecovery := e.onAutoRecovery
-				e.qualityMu.RUnlock()
-				if onRecovery != nil {
-					util.SafeGo(e.logger, "jt1078.onAutoRecovery", func() { onRecovery(s.ID, s.Phone, s.LogicChannel) })
-				}
+				autoRecoveryTriggered = true
+			}
+		}
+
+		s.mu.Unlock()
+
+		// === 以下为解锁后的外部调用（指标上报 + 回调触发），避免锁内阻塞 ===
+
+		// AUTO-FIX-2026-06-30 [集成-7]: Prometheus 视频质量指标（按流标签）
+		streamLabels := map[string]string{
+			"stream_id": streamID,
+			"device_id": phone,
+			"channel":   strconv.Itoa(int(logicChannel)),
+		}
+		metrics.VideoBitrate.SetWithLabels(bitrateKbps, streamLabels)
+		metrics.VideoFramerate.SetWithLabels(frameRate, streamLabels)
+		metrics.VideoPacketLoss.SetWithLabels(lossRate, streamLabels)
+
+		// 2) 流断开回调
+		if streamDownTriggered {
+			e.logger.Warn("stream down detected, triggering auto reconnect",
+				zap.String("stream_id", streamID),
+				zap.String("phone", phone),
+				zap.Uint8("channel", logicChannel),
+				zap.Duration("idle", streamDownIdle))
+			util.SafeGo(e.logger, "jt1078.onStreamDown", func() { onStreamDown(streamID, phone, logicChannel) })
+			continue
+		}
+
+		// 3) 质量差回调
+		if qualityPoorTriggered {
+			e.logger.Warn("stream quality poor, switching to sub stream",
+				zap.String("stream_id", streamID),
+				zap.Float64("bitrate_kbps", bitrateKbps),
+				zap.Float64("frame_rate", frameRate),
+				zap.Float64("loss_rate", lossRate))
+			util.SafeGo(e.logger, "jt1078.onQualityPoor", func() { onQualityPoor(streamID, phone, logicChannel, 0) })
+		}
+
+		// 4) 自动恢复回调
+		if autoRecoveryTriggered {
+			e.logger.Info("auto recovery: switching back to main stream",
+				zap.String("stream_id", streamID),
+				zap.Float64("loss_rate", lossRate),
+				zap.Float64("bitrate_kbps", bitrateKbps))
+			e.qualityMu.RLock()
+			onRecovery := e.onAutoRecovery
+			e.qualityMu.RUnlock()
+			if onRecovery != nil {
+				util.SafeGo(e.logger, "jt1078.onAutoRecovery", func() { onRecovery(streamID, phone, logicChannel) })
 			}
 		}
 
@@ -774,6 +820,12 @@ func (e *VideoEngine) computeQualityAndCheckAlerts() {
 		// 检查是否有超时未恢复的关键帧请求（超过5秒）
 		if e.keyframeTracker != nil {
 			e.keyframeTracker.CheckTimeout(5 * time.Second)
+		}
+
+		// INDUSTRIAL-FIX-2026-07-25-R31 [P2]: PTZ 延迟追踪器超时清理
+		// 设备离线或网络异常时 PTZ 应答不会到达，pending 条目需定期清理防止内存泄漏
+		if e.ptzTracker != nil {
+			e.ptzTracker.CheckPTZTimeout(10 * time.Second)
 		}
 	}
 }
@@ -1042,8 +1094,8 @@ func (e *VideoEngine) Start() error {
 
 func (e *VideoEngine) Stop() {
 	e.running.Store(false)
-	// AUTO-FIX-2026-06-28: 停止质量监控协程
-	close(e.qualityStopCh)
+	// FIXED [P1]: 使用 sync.Once 确保 qualityStopCh 只关闭一次，防止重复调用 Stop() 导致 panic
+	e.stopOnce.Do(func() { close(e.qualityStopCh) })
 	// AUTO-FIX-2026-07-02 [P1]: 停止 RTP 长连接池（含 UDP/TCP 空闲扫描协程 + 关闭所有连接）
 	if e.rtpPool != nil {
 		e.rtpPool.Stop()
@@ -1081,14 +1133,31 @@ func (e *VideoEngine) CreateSession(id, phone string, logicChannel, streamType b
 }
 
 func (e *VideoEngine) RemoveSession(id string) {
+	var streamID string
 	e.mu.Lock()
 	if s, ok := e.sessions[id]; ok {
 		if s.Conn != nil {
 			s.Conn.Close()
 		}
+		// R47-FIX-2026-07-26 [P1]: 在锁内收集 streamID，用于清理辅助 map
+		streamID = fmt.Sprintf("%s_ch%d", s.Phone, s.LogicChannel)
 		delete(e.sessions, id)
 	}
 	e.mu.Unlock()
+	// R47-FIX-2026-07-26 [P1]: 清理与该 session 关联的辅助 map，防止内存泄漏
+	if streamID != "" {
+		e.portsMu.Lock()
+		delete(e.streamPorts, streamID)
+		e.portsMu.Unlock()
+
+		e.streamModeMu.Lock()
+		delete(e.streamMode, streamID)
+		e.streamModeMu.Unlock()
+
+		e.udpFailMu.Lock()
+		delete(e.udpFailCount, streamID)
+		e.udpFailMu.Unlock()
+	}
 }
 
 func (e *VideoEngine) GetSession(id string) *StreamSession {
@@ -1104,11 +1173,15 @@ func (e *VideoEngine) GetSession(id string) *StreamSession {
 // 返回是否切换成功（流不存在或新旧类型相同返回 false）。
 func (e *VideoEngine) SwitchStreamType(id string, streamType byte) bool {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	s, ok := e.sessions[id]
 	if !ok {
+		e.mu.Unlock()
 		return false
 	}
+	// FIXED [P1]: 加 session 写锁保护 StreamType 字段
+	s.mu.Lock()
+	e.mu.Unlock() // 释放引擎锁，避免与 session 锁嵌套
+	defer s.mu.Unlock()
 	if s.StreamType == streamType {
 		return false
 	}
@@ -1143,6 +1216,11 @@ func (e *VideoEngine) ProcessRTPData(sessionID string, rtpData []byte) error {
 	}
 
 	now := time.Now()
+
+	// FIXED [P1]: 加写锁保护统计字段，避免与 computeQualityAndCheckAlerts / GetQualityStats 并发访问
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
 	session.LastActive = now
 	session.Packets++
 	session.Bytes += uint64(len(rtpData))
@@ -1190,6 +1268,7 @@ func (e *VideoEngine) ProcessRTPData(sessionID string, rtpData []byte) error {
 		session.WindowFrames++
 	}
 
+	// 转发到 ZLMediaKit（锁内调用是安全的：ForwardRTP 不访问 StreamSession 统计字段）
 	if e.zlmAddr != "" {
 		if err := e.forwardToZLM(session, pkt); err != nil {
 			e.logger.Debug("forward to zlmediakit failed",
@@ -1401,8 +1480,11 @@ func (e *VideoEngine) GetStats() map[string]interface{} {
 	totalPackets := uint64(0)
 	totalBytes := uint64(0)
 	for _, s := range e.sessions {
+		// FIXED [P1]: 加读锁保护统计字段并发访问
+		s.mu.RLock()
 		totalPackets += s.Packets
 		totalBytes += s.Bytes
+		s.mu.RUnlock()
 	}
 
 	return map[string]interface{}{

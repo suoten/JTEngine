@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
+	"fmt"
 	"testing"
 )
 
@@ -148,9 +149,9 @@ func TestSRTPSession_IVUniqueness(t *testing.T) {
 	master := make([]byte, 16)
 	s, _ := NewSRTPSession(master, "AES-128-CM")
 
-	iv1 := s.buildIV(0x12345678, 0x1000)
-	iv2 := s.buildIV(0x12345678, 0x1001)
-	iv3 := s.buildIV(0x87654321, 0x1000)
+	iv1 := s.buildIV(0x12345678, 0x1000, 0)
+	iv2 := s.buildIV(0x12345678, 0x1001, 0)
+	iv3 := s.buildIV(0x87654321, 0x1000, 0)
 
 	if string(iv1) == string(iv2) {
 		t.Fatal("相同 SSRC 不同 SeqNum 产生相同 IV (IV 复用)")
@@ -169,17 +170,20 @@ func TestSRTPSession_IVUniquenessAcrossRollover(t *testing.T) {
 	ssrc := uint32(0xCAFEBABE)
 
 	// ROC=0, SEQ=0x0000
-	ivBefore := s.buildIV(ssrc, 0x0000)
+	ivBefore := s.buildIV(ssrc, 0x0000, 0)
 
 	// 模拟回绕：0xFFFF -> 0x0000，触发 ROC 自增到 1
+	s.mu.Lock()
 	s.updateROC(0xFFFF)
 	s.updateROC(0x0000)
 	if s.roc != 1 {
+		s.mu.Unlock()
 		t.Fatalf("回绕后 ROC = %d, want 1", s.roc)
 	}
+	s.mu.Unlock()
 
 	// ROC=1, SEQ=0x0000 —— 修复前与 ivBefore 相同（IV 复用漏洞），修复后必须不同
-	ivAfter := s.buildIV(ssrc, 0x0000)
+	ivAfter := s.buildIV(ssrc, 0x0000, 1)
 	if string(ivBefore) == string(ivAfter) {
 		t.Fatal("SeqNum 回绕后 IV 复用 (ROC 未折叠进 IV) —— 安全漏洞")
 	}
@@ -327,4 +331,264 @@ type mockSM4Provider struct{}
 
 func (m *mockSM4Provider) NewCipher(key []byte) (cipher.Block, error) {
 	return aes.NewCipher(key)
+}
+
+// ===================================================================
+// P0 SRTP 解析冲突修复测试 —— FIXED-2026-07-22
+// ===================================================================
+
+// TestP0_RealtimeRequest_Standard22B_NoSRTPFalsePositive 验证标准 22B 报文
+// （含 TransportMode=0）不会被误判为 SRTP 启用。
+// 修复前：srtpStart 回退到 21，data[21]=TransportMode 被当作 SRTPEnabled 检查。
+// 修复后：TransportMode==0 时不解析 SRTP。
+func TestP0_RealtimeRequest_Standard22B_NoSRTPFalsePositive(t *testing.T) {
+	// 构造 22B 报文：标准 21B + TransportMode=0
+	data := make([]byte, 22)
+	copy(data[0:16], []byte("192.168.1.100"))
+	binary.BigEndian.PutUint16(data[16:18], 10000)
+	data[18] = 1 // LogicChannel
+	data[19] = 0 // MediaType
+	data[20] = 0 // StreamType
+	data[21] = 0 // TransportMode = 0 (UDP)
+
+	parsed := &RealtimeRequestMessage{}
+	if err := parsed.Unmarshal(data); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if parsed.SRTPEnabled {
+		t.Fatal("TransportMode=0 时不应触发 SRTP（标准 22B 报文不含 SRTP）")
+	}
+	if parsed.TransportMode != 0 {
+		t.Errorf("TransportMode: got %d, want 0", parsed.TransportMode)
+	}
+}
+
+// TestP0_RealtimeRequest_Standard21B_NoSRTP 验证标准 21B 报文不触发 SRTP。
+func TestP0_RealtimeRequest_Standard21B_NoSRTP(t *testing.T) {
+	data := make([]byte, 21)
+	copy(data[0:16], []byte("192.168.1.100"))
+	binary.BigEndian.PutUint16(data[16:18], 10000)
+	data[18] = 1 // LogicChannel
+	data[19] = 0 // MediaType
+	data[20] = 0 // StreamType
+
+	parsed := &RealtimeRequestMessage{}
+	if err := parsed.Unmarshal(data); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if parsed.SRTPEnabled {
+		t.Fatal("标准 21B 报文不应触发 SRTP")
+	}
+	if parsed.TransportMode != 0 {
+		t.Errorf("TransportMode: got %d, want 0 (默认 UDP)", parsed.TransportMode)
+	}
+}
+
+// TestP0_RealtimeRequest_TransportMode1_NoSRTP 验证 TransportMode=1 但无 SRTP 字段时不误判。
+// 22B 报文，data[21]=1（TCP 模式），但 len(data) 不超过 22，不应触发 SRTP。
+func TestP0_RealtimeRequest_TransportMode1_NoSRTP(t *testing.T) {
+	data := make([]byte, 22)
+	copy(data[0:16], []byte("192.168.1.100"))
+	binary.BigEndian.PutUint16(data[16:18], 10000)
+	data[18] = 1 // LogicChannel
+	data[19] = 0 // MediaType
+	data[20] = 0 // StreamType
+	data[21] = 1 // TransportMode = 1 (TCP)
+
+	parsed := &RealtimeRequestMessage{}
+	if err := parsed.Unmarshal(data); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if parsed.SRTPEnabled {
+		t.Fatal("22B 报文（len==srtpStart）不应触发 SRTP")
+	}
+	if parsed.TransportMode != 1 {
+		t.Errorf("TransportMode: got %d, want 1", parsed.TransportMode)
+	}
+}
+
+// TestP0_RealtimeRequest_SRTPWithTransportMode1 验证 TransportMode=1 + SRTP 字段正确解析。
+func TestP0_RealtimeRequest_SRTPWithTransportMode1(t *testing.T) {
+	masterKey := []byte("0123456789abcdef") // 16B
+	orig := &RealtimeRequestMessage{
+		IPAddress:    "192.168.1.100",
+		Port:         10000,
+		LogicChannel: 1,
+		MediaType:    0,
+		StreamType:   0,
+		TransportMode: 1,
+		SRTPEnabled:  true,
+		CipherSuite:  "AES-128-CM",
+		MasterKey:    masterKey,
+	}
+	data, err := orig.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// 21B + TransportMode(1B) + SRTPEnabled(1B) + MasterKeyEncrypted(1B) + CSLen(1B) + CS(10B) + MKLen(1B) + MK(16B) = 52
+	if len(data) != 52 {
+		t.Fatalf("encoded length = %d, want 52", len(data))
+	}
+
+	parsed := &RealtimeRequestMessage{}
+	if err := parsed.Unmarshal(data); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !parsed.SRTPEnabled {
+		t.Fatal("SRTPEnabled = false, want true")
+	}
+	if parsed.TransportMode != 1 {
+		t.Errorf("TransportMode: got %d, want 1", parsed.TransportMode)
+	}
+	if parsed.CipherSuite != orig.CipherSuite {
+		t.Errorf("CipherSuite = %q, want %q", parsed.CipherSuite, orig.CipherSuite)
+	}
+	if string(parsed.MasterKey) != string(orig.MasterKey) {
+		t.Errorf("MasterKey mismatch")
+	}
+}
+
+// TestP0_RealtimeRequest_SRTPWithUDP_ReturnsError 验证 SRTP + TransportMode=0 在 Marshal 时返回错误。
+func TestP0_RealtimeRequest_SRTPWithUDP_ReturnsError(t *testing.T) {
+	orig := &RealtimeRequestMessage{
+		IPAddress:    "192.168.1.100",
+		Port:         10000,
+		LogicChannel: 1,
+		TransportMode: 0, // UDP
+		SRTPEnabled:  true,
+		CipherSuite:  "AES-128-CM",
+		MasterKey:    make([]byte, 16),
+	}
+	_, err := orig.Marshal()
+	if err == nil {
+		t.Fatal("SRTP with TransportMode=0 should return error")
+	}
+}
+
+// TestP0_RealtimeRequest_22BWithByte1AtPos21 验证 22B 报文中 data[21]=1
+// （TransportMode=1）不会被误判为 SRTPEnabled=true。
+// 修复前：srtpStart=21，data[21]=1 会被当作 SRTPEnabled=true。
+// 修复后：srtpStart 固定为 22，TransportMode > 0 时检查 data[22]（不存在，不触发）。
+func TestP0_RealtimeRequest_22BWithByte1AtPos21(t *testing.T) {
+	data := make([]byte, 22)
+	copy(data[0:16], []byte("10.0.0.1\x00\x00\x00\x00\x00\x00\x00\x00"))
+	binary.BigEndian.PutUint16(data[16:18], 8080)
+	data[18] = 3  // LogicChannel
+	data[19] = 2  // MediaType
+	data[20] = 1  // StreamType
+	data[21] = 1  // TransportMode=1 (TCP) — 修复前会被误判为 SRTPEnabled
+
+	parsed := &RealtimeRequestMessage{}
+	if err := parsed.Unmarshal(data); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if parsed.SRTPEnabled {
+		t.Fatal("data[21]=1 是 TransportMode，不应被误判为 SRTPEnabled")
+	}
+	if parsed.TransportMode != 1 {
+		t.Errorf("TransportMode: got %d, want 1", parsed.TransportMode)
+	}
+}
+
+// TestSRTPSession_ConcurrentEncryptDecrypt [P0-1] 验证 SRTPSession 在 100 个 goroutine
+// 并发调用 Encrypt/Decrypt 时不发生数据竞争或 panic。
+// 使用 -race 标志运行可检测竞态条件。
+func TestSRTPSession_ConcurrentEncryptDecrypt(t *testing.T) {
+	master := make([]byte, 16)
+	for i := range master {
+		master[i] = byte(i + 1)
+	}
+	enc, err := NewSRTPSession(master, "AES-128-CM")
+	if err != nil {
+		t.Fatalf("new encrypt session: %v", err)
+	}
+	dec, err := NewSRTPSession(master, "AES-128-CM")
+	if err != nil {
+		t.Fatalf("new decrypt session: %v", err)
+	}
+
+	const goroutines = 100
+	done := make(chan error, goroutines*2)
+
+	// 并发加密：每个 goroutine 使用不同的 seqNum
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			seq := uint16(idx % 0xFFFF)
+			rtp := makeRTP(seq, 0x12345678, []byte("concurrent payload"))
+			srtp, err := enc.Encrypt(rtp)
+			if err != nil {
+				done <- fmt.Errorf("goroutine %d encrypt: %w", idx, err)
+				return
+			}
+			// 立即解密验证
+			decrypted, err := dec.Decrypt(srtp)
+			if err != nil {
+				done <- fmt.Errorf("goroutine %d decrypt: %w", idx, err)
+				return
+			}
+			if string(decrypted) != string(rtp) {
+				done <- fmt.Errorf("goroutine %d: decrypted != original", idx)
+				return
+			}
+			done <- nil
+		}(i)
+	}
+
+	// 并发解密：额外 100 个 goroutine 直接调用 Decrypt（使用预加密数据）
+	prtp := makeRTP(0x7FFF, 0x87654321, []byte("pre-encrypted"))
+	psrtp, err := enc.Encrypt(prtp)
+	if err != nil {
+		t.Fatalf("pre-encrypt: %v", err)
+	}
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			// 复制 srtp 避免共享底层数组
+			srtpCopy := make([]byte, len(psrtp))
+			copy(srtpCopy, psrtp)
+			// 由于 Decrypt 会修改 ROC 状态，并发调用同一 dec 可能导致 ROC 不一致
+			// 这里验证不 panic / 不 data race 即可
+			_, _ = dec.Decrypt(srtpCopy)
+			done <- nil
+		}(i)
+	}
+
+	// 收集结果
+	for i := 0; i < goroutines*2; i++ {
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+// TestRealtimeRequest_InvalidIP_ReturnsError [P1-6] 验证非合法 IPv4 地址在 Marshal 时返回错误
+func TestRealtimeRequest_InvalidIP_ReturnsError(t *testing.T) {
+	tests := []struct {
+		name    string
+		ip      string
+		wantErr bool
+	}{
+		{"valid_ipv4", "192.168.1.100", false},
+		{"valid_ipv4_short", "10.0.0.1", false},
+		{"empty_ip", "", false}, // 空 IP 允许（由终端填充）
+		{"invalid_not_ip", "not-an-ip", true},
+		{"invalid_with_port", "192.168.1.1:8080", true},
+		{"invalid_ipv6", "::1", true}, // 1078 仅支持 IPv4
+		{"invalid_too_long", "999.999.999.999.999.999", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := &RealtimeRequestMessage{
+				IPAddress:    tt.ip,
+				Port:         10000,
+				LogicChannel: 1,
+			}
+			_, err := msg.Marshal()
+			if tt.wantErr && err == nil {
+				t.Fatal("expected error for invalid IP, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error for IP %q: %v", tt.ip, err)
+			}
+		})
+	}
 }

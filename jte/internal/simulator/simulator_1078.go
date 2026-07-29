@@ -1,3 +1,4 @@
+// FIXED: [P2] simulator_1078.go readLoop/streamRTP goroutine 缺少 recover() [2026-07-17]
 package simulator
 
 import (
@@ -93,7 +94,14 @@ func (s *Simulator1078) runTerminal(phone string) {
 		return
 	}
 
-	go s.readLoop(conn, phone)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("simulator1078 readLoop panic", zap.Any("panic", r), zap.String("phone", phone))
+			}
+		}()
+		s.readLoop(conn, phone)
+	}()
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -242,8 +250,8 @@ func (s *Simulator1078) handleServerFrame(conn net.Conn, phone string, frame []b
 	}
 
 	content := frame[1 : len(frame)-1]
-	unescaped := jt808.Unescape(content)
-	if len(unescaped) < 5 {
+	unescaped, err := jt808.Unescape(content)
+	if err != nil || len(unescaped) < 5 {
 		return
 	}
 
@@ -315,7 +323,14 @@ func (s *Simulator1078) startStreaming(conn net.Conn, phone string, channel byte
 		zap.String("phone", phone),
 		zap.Uint8("channel", channel))
 
-	go s.streamRTP(conn, phone, channel)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("simulator1078 streamRTP panic", zap.Any("panic", r), zap.String("phone", phone), zap.Uint8("channel", channel))
+			}
+		}()
+		s.streamRTP(conn, phone, channel)
+	}()
 }
 
 func (s *Simulator1078) stopStreaming(phone string, channel byte) {

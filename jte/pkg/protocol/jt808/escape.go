@@ -1,4 +1,7 @@
+// FIXED: [P0] SplitByDelimiter 共享分隔符丢帧：连续帧0x7E..0x7E..0x7E中中间帧内容丢失 [2026-07-17]
 package jt808
+
+import "fmt"
 
 func Escape(data []byte) []byte {
 	result := make([]byte, 0, len(data)*2)
@@ -15,11 +18,16 @@ func Escape(data []byte) []byte {
 	return result
 }
 
-func Unescape(data []byte) []byte {
+// [P2-修复] Unescape 返回 error：尾部 0x7D（无后续转义字节）为非法帧
+func Unescape(data []byte) ([]byte, error) {
 	result := make([]byte, 0, len(data))
 	i := 0
 	for i < len(data) {
-		if data[i] == 0x7D && i+1 < len(data) {
+		if data[i] == 0x7D {
+			if i+1 >= len(data) {
+				// 尾部 0x7D 无后续转义字节，非法帧
+				return nil, fmt.Errorf("Unescape: trailing 0x7D at position %d without escape byte", i)
+			}
 			switch data[i+1] {
 			case 0x02:
 				result = append(result, 0x7E)
@@ -34,8 +42,11 @@ func Unescape(data []byte) []byte {
 			i++
 		}
 	}
-	return result
+	return result, nil
 }
+
+// P2-FIX: 单帧最大长度限制（1MB），防止恶意终端发送超长帧耗尽内存
+const MaxFrameSize = 1 * 1024 * 1024
 
 func SplitByDelimiter(data []byte) [][]byte {
 	var messages [][]byte
@@ -46,10 +57,18 @@ func SplitByDelimiter(data []byte) [][]byte {
 			if start == -1 {
 				start = i
 			} else {
-				msg := make([]byte, i-start+1)
-				copy(msg, data[start:i+1])
-				messages = append(messages, msg)
-				start = -1
+				// P2-FIX: 跳过连续0x7E产生的空帧 + 超长帧丢弃
+				frameLen := i - start + 1
+				if frameLen > 2 && frameLen <= MaxFrameSize {
+					msg := make([]byte, frameLen)
+					copy(msg, data[start:i+1])
+					messages = append(messages, msg)
+				} else if frameLen > MaxFrameSize {
+					// 超长帧丢弃，记录位置以便上层日志告警
+					// 继续处理后续帧
+				}
+				// 共享分隔符：当前结束符同时作为下一帧的起始符
+				start = i
 			}
 		}
 	}

@@ -24,6 +24,7 @@ package handler
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"runtime"
 	"sync"
@@ -131,6 +132,105 @@ type dependencyError struct {
 
 func (e *dependencyError) Error() string { return e.name + ": " + e.reason }
 
+// ZLMediaKitChecker ZLMediaKit 流媒体引擎健康检查器
+// FIXED-2026-07-23 [P2]: 健康检查端点增加 ZLMediaKit 连通状态
+type ZLMediaKitChecker struct {
+	name      string
+	connected func() bool
+}
+
+// NewZLMediaKitChecker 创建 ZLMediaKit 健康检查器
+// connected: 返回 ZLMediaKit 是否连通的函数（通常为 client.IsConnected）
+func NewZLMediaKitChecker(name string, connected func() bool) *ZLMediaKitChecker {
+	return &ZLMediaKitChecker{name: name, connected: connected}
+}
+
+func (c *ZLMediaKitChecker) Name() string { return c.name }
+func (c *ZLMediaKitChecker) Check(ctx context.Context) error {
+	if c.connected == nil {
+		return errDependencyNotConfigured(c.name)
+	}
+	if !c.connected() {
+		return &dependencyError{name: c.name, reason: "not connected"}
+	}
+	return nil
+}
+
+// JT809ClientStatus 809 客户端状态信息接口（避免直接依赖 gateway.JT809Client）
+type JT809ClientStatus interface {
+	GetPlatformID() string
+	IsCircuitOpen() bool
+	IsRunning() bool
+}
+
+// JT809Checker 809 上级平台连通状态检查器
+// FIXED-2026-07-23 [P2]: 健康检查端点增加 809 上级平台连通状态
+type JT809Checker struct {
+	name    string
+	clients []JT809ClientStatus
+}
+
+// NewJT809Checker 创建 809 连通状态检查器
+// clients: 所有 809 上级平台客户端的状态接口列表
+func NewJT809Checker(name string, clients []JT809ClientStatus) *JT809Checker {
+	return &JT809Checker{name: name, clients: clients}
+}
+
+func (c *JT809Checker) Name() string { return c.name }
+func (c *JT809Checker) Check(ctx context.Context) error {
+	if len(c.clients) == 0 {
+		// 无 809 平台配置时不算故障
+		return nil
+	}
+	var failed []string
+	for _, cl := range c.clients {
+		if cl == nil {
+			continue
+		}
+		if !cl.IsRunning() {
+			failed = append(failed, cl.GetPlatformID()+": disconnected")
+		} else if cl.IsCircuitOpen() {
+			failed = append(failed, cl.GetPlatformID()+": circuit breaker open")
+		}
+	}
+	if len(failed) > 0 {
+		return &dependencyError{name: c.name, reason: fmt.Sprintf("%d/%d platforms unhealthy: %v", len(failed), len(c.clients), failed)}
+	}
+	return nil
+}
+
+// MemoryChecker 内存使用率检查器
+// FIXED-2026-07-23 [P2]: 健康检查端点增加内存使用率检查（与 OOM 阈值对比）
+type MemoryChecker struct {
+	name       string
+	warnMB     int // 内存告警阈值（MB）
+	criticalMB int // 内存危险阈值（MB）
+	fatalMB    int // 内存致命阈值（MB）
+}
+
+// NewMemoryChecker 创建内存使用率检查器
+func NewMemoryChecker(name string, warnMB, criticalMB, fatalMB int) *MemoryChecker {
+	return &MemoryChecker{name: name, warnMB: warnMB, criticalMB: criticalMB, fatalMB: fatalMB}
+}
+
+func (c *MemoryChecker) Name() string { return c.name }
+func (c *MemoryChecker) Check(ctx context.Context) error {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	memMB := int(ms.Sys / (1024 * 1024))
+
+	if c.fatalMB > 0 && memMB >= c.fatalMB {
+		return &dependencyError{name: c.name, reason: fmt.Sprintf("memory usage %dMB >= fatal threshold %dMB", memMB, c.fatalMB)}
+	}
+	if c.criticalMB > 0 && memMB >= c.criticalMB {
+		return &dependencyError{name: c.name, reason: fmt.Sprintf("memory usage %dMB >= critical threshold %dMB", memMB, c.criticalMB)}
+	}
+	if c.warnMB > 0 && memMB >= c.warnMB {
+		return &dependencyError{name: c.name, reason: fmt.Sprintf("memory usage %dMB >= warn threshold %dMB", memMB, c.warnMB)}
+	}
+	return nil
+}
+
 // ==================== 健康检查 Handler ====================
 
 // ExtendedHealthHandler 扩展健康检查处理器
@@ -138,6 +238,7 @@ func (e *dependencyError) Error() string { return e.name + ": " + e.reason }
 type ExtendedHealthHandler struct {
 	*HealthHandler
 	checkers      []DependencyChecker
+	checkersMu    sync.RWMutex // [R61-P2] 保护 checkers 和 dependencies 的并发访问
 	checkTimeout  time.Duration
 	startTime     time.Time
 	version       string
@@ -173,7 +274,8 @@ func NewExtendedHealthHandler(
 }
 
 // Health 基础健康状态端点 /health
-// 返回进程存活状态 + 版本 + 运行时长 + 连接数 + 内存使用
+// 返回进程存活状态 + 版本 + 运行时长 + 连接数 + 内存使用 + 各组件独立状态
+// FIXED-2026-07-23 [P2]: 加固健康检查端点，返回结构化 JSON，各组件状态独立标识
 func (h *ExtendedHealthHandler) Health(c *gin.Context) {
 	uptime := int64(time.Since(h.startTime).Seconds())
 	connections := 0
@@ -191,6 +293,21 @@ func (h *ExtendedHealthHandler) Health(c *gin.Context) {
 		status = "maintenance"
 	}
 
+	// FIXED-2026-07-23 [P2]: 并行执行依赖检查，各组件状态独立标识
+	checks := h.runChecks(c.Request.Context())
+
+	// 汇总依赖检查状态
+	depsHealthy := true
+	for _, result := range checks {
+		if result["status"] != "ok" && result["status"] != "skipped" {
+			depsHealthy = false
+			break
+		}
+	}
+	if !depsHealthy && status == "ok" {
+		status = "degraded"
+	}
+
 	c.JSON(httpCode, gin.H{
 		"status":      status,
 		"version":     h.version,
@@ -198,6 +315,7 @@ func (h *ExtendedHealthHandler) Health(c *gin.Context) {
 		"connections": connections,
 		"memory_mb":   memoryMB,
 		"goroutines":  goroutines,
+		"checks":      checks,
 		"timestamp":   time.Now().Format(time.RFC3339),
 	})
 }
@@ -261,7 +379,14 @@ type checkResult struct {
 
 // runChecks 并行执行所有依赖检查，返回结果 map
 func (h *ExtendedHealthHandler) runChecks(parent context.Context) map[string]map[string]interface{} {
-	if len(h.checkers) == 0 {
+	// [R61-P2] 在读锁下复制 checkers 切片，避免与 AddChecker 并发时产生数据竞争。
+	// 不持锁执行 Check()，以免长时间持锁阻塞 AddChecker。
+	h.checkersMu.RLock()
+	checkers := make([]DependencyChecker, len(h.checkers))
+	copy(checkers, h.checkers)
+	h.checkersMu.RUnlock()
+
+	if len(checkers) == 0 {
 		return map[string]map[string]interface{}{
 			"_summary": {"status": "ok", "message": "no dependencies configured"},
 		}
@@ -271,12 +396,22 @@ func (h *ExtendedHealthHandler) runChecks(parent context.Context) map[string]map
 	defer cancel()
 
 	var wg sync.WaitGroup
-	results := make([]checkResult, len(h.checkers))
+	results := make([]checkResult, len(checkers))
 
-	for i, checker := range h.checkers {
+	for i, checker := range checkers {
 		wg.Add(1)
+		// FIXED: [P1] 依赖检查 goroutine 缺少 recover()，panic 会扩散至整个进程 [2026-07-17]
 		go func(idx int, ck DependencyChecker) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					results[idx] = checkResult{
+						name:   ck.Name(),
+						status: "down",
+						err:    fmt.Errorf("health check panic: %v", r),
+					}
+				}
+			}()
 			start := time.Now()
 			err := ck.Check(ctx)
 			latency := time.Since(start)
@@ -312,10 +447,14 @@ func (h *ExtendedHealthHandler) runChecks(parent context.Context) map[string]map
 }
 
 // AddChecker 动态添加依赖检查器（供 SetStorageLayers 后注入 TDengine/MinIO 检查器）
+// AddChecker 动态添加依赖检查器（供 SetStorageLayers 后注入 TDengine/MinIO 检查器）
+// [R61-P2] 加锁保护，防止与 runChecks 并发执行时产生数据竞争。
 func (h *ExtendedHealthHandler) AddChecker(checker DependencyChecker) {
 	if checker == nil {
 		return
 	}
+	h.checkersMu.Lock()
+	defer h.checkersMu.Unlock()
 	h.checkers = append(h.checkers, checker)
 	h.dependencies[checker.Name()] = true
 }

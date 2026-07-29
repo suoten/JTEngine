@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/suoten/jt-engine/internal/gateway"
@@ -47,10 +48,34 @@ func (h *PlatformHandler) List(c *gin.Context) {
 		}
 	}
 
+	// AUTO-FIX-2026-07-15 [ConvergeLoop-语义一致性]: 添加分页支持
+	// 原先直接返回全部平台会话，10 倍流量场景下 1 万设备在线时
+	// 10 个并发请求遍历 10 万次生成新切片，CPU 飙升
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 1000 {
+		pageSize = 20
+	}
+	total := len(platforms)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"code":    0,
-		"message": "ok",
-		"data":    platforms,
+		"code":      0,
+		"message":   "ok",
+		"data":      platforms[start:end],
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
 	})
 }
 

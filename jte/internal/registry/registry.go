@@ -32,6 +32,17 @@ var NewFeatureRegistry = pkgregistry.NewFeatureRegistry
 // Var alias — free features list.
 var FreeFeatures = pkgregistry.FreeFeatures
 
+// Func aliases — PluginRegistry functions (Garble 混淆兼容)。
+// 模块通过 init() 注册自身到全局注册表，宿主加载器在 plugin.Lookup 失败时
+// 通过注册表查找模块实例，确保 Garble 混淆编译后插件仍能正常加载。
+var (
+	RegisterPluginModule  = pkgregistry.RegisterPluginModule
+	GetPluginModule       = pkgregistry.GetPluginModule
+	UnregisterPluginModule = pkgregistry.UnregisterPluginModule
+	ListPluginModules     = pkgregistry.ListPluginModules
+	ClearPluginModules    = pkgregistry.ClearPluginModules
+)
+
 // Const re-exports — feature identifiers.
 const (
 	FeatureJT808       = pkgregistry.FeatureJT808

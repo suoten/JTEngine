@@ -61,7 +61,7 @@ func (c *WebsiteClient) BindLicense(licenseKey, machineFP string) (*BindLicenseR
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // AUTO-FIX-2026-07-25 [P2-R9]: 限制 1MB
 		return nil, fmt.Errorf("bind license failed: status %d, body: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -140,7 +140,7 @@ func (c *WebsiteClient) DownloadModule(moduleName, token string) ([]byte, error)
 		return nil, fmt.Errorf("download module failed: status %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 100<<20)) // AUTO-FIX-2026-07-25 [P2-R9]: 模块下载限制 100MB
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}

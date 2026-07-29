@@ -13,7 +13,7 @@
         <el-option label="超速统计" value="overspeed" />
       </el-select>
     </div>
-    <el-table :data="filteredReports" stripe>
+    <el-table :data="filteredReports" stripe v-loading="loading">
       <el-table-column prop="report_id" label="报表ID" min-width="180" />
       <el-table-column prop="type" label="类型" width="120">
         <template #default="{ row }">{{ typeLabels[row.type] || row.type }}</template>
@@ -96,6 +96,7 @@ import { reportApi } from '../api'
 import { ElMessage } from 'element-plus'
 
 const reports = ref([])
+const loading = ref(false)
 const filterType = ref('')
 const showGenerate = ref(false)
 const showDetail = ref(false)
@@ -171,6 +172,7 @@ function fmtDuration(sec) {
 }
 
 async function fetchReports() {
+  loading.value = true
   try {
     const res = await reportApi.getList()
     if (res.code === 0 && res.data) {
@@ -181,7 +183,12 @@ async function fetchReports() {
         data: r.data || r,
       }))
     }
-  } catch (e) { console.error(e) }
+  } catch (e) {
+    console.error(e)
+    ElMessage.error('加载报表列表失败，请检查网络或稍后重试')
+  } finally {
+    loading.value = false
+  }
 }
 
 async function generate() {
@@ -421,7 +428,8 @@ function exportPDF(row) {
 </body>
 </html>`
 
-  const printWindow = window.open('', '_blank')
+  // FIXED: [XSS] window.open 添加 noopener,noreferrer 防止反向钓鱼 [2026-07-17]
+  const printWindow = window.open('', '_blank', 'noopener,noreferrer')
   if (!printWindow) {
     ElMessage.warning('弹窗被浏览器拦截，请允许弹窗后重试')
     return

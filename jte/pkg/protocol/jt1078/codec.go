@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"net"
 
 	"github.com/suoten/jt-engine/pkg/protocol"
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -15,9 +16,15 @@ const (
 	// AUTO-FIX-2026-06-26: 补充终端主动发起实时音视频传输消息（1078-2016）
 	MsgIDTermAVRequest      uint16 = 0x9103 // 终端→平台 终端发起实时音视频传输请求
 	MsgIDTermAVResponse     uint16 = 0x9104 // 平台→终端 平台应答终端实时音视频传输
-	// AUTO-FIX-2026-06-27: 0x9105/0x9106 误映射修复，原 ControlRequest/Response 改为单条音视频检索请求/应答
-	MsgIDSingleAVRetrievalRequest  uint16 = 0x9105 // 单条音视频检索请求（平台→终端）
-	MsgIDSingleAVRetrievalResponse  uint16 = 0x9106 // 单条音视频检索应答（终端→平台）
+	// FIXED-2026-07-17 [P0]: 0x9105/0x9106 按 JT/T 1078-2016 标准修正为实时音视频传输状态通知/应答
+	// 原错误映射为"单条音视频检索请求/应答"，实际 0x9105 = 实时音视频传输状态通知（终端→平台），
+	// 0x9106 = 实时音视频传输状态通知应答（平台→终端）。
+	// 单条音视频检索功能应由 0x9201/0x9202 历史音视频检索承担。
+	MsgIDAVStatusNotification         uint16 = 0x9105 // 实时音视频传输状态通知（终端→平台）
+	MsgIDAVStatusNotificationResponse uint16 = 0x9106 // 实时音视频传输状态通知应答（平台→终端）
+	// 向后兼容别名（已弃用，新代码请使用 MsgIDAVStatusNotification）
+	MsgIDSingleAVRetrievalRequest  = MsgIDAVStatusNotification
+	MsgIDSingleAVRetrievalResponse = MsgIDAVStatusNotificationResponse
 	MsgIDPlaybackRequest    uint16 = 0x9201
 	MsgIDPlaybackResponse   uint16 = 0x9202
 	MsgIDPlaybackControl    uint16 = 0x9203
@@ -98,13 +105,25 @@ func (c *JT1078Codec) ParseHeader(data []byte) (*protocol.MessageHeader, int, er
 	header.MsgID = binary.BigEndian.Uint16(data[0:2])
 	header.BodyAttr = binary.BigEndian.Uint16(data[2:4])
 	header.BodyLen = int(header.BodyAttr & 0x03FF)
+	header.EncryptMethod = uint8((header.BodyAttr >> 10) & 0x07)
+	header.Version2019 = (header.BodyAttr & 0x8000) != 0
 	header.HasPack = (header.BodyAttr & 0x2000) != 0
 
-	phoneBCD := data[4:10]
-	header.Phone = bcdToString(phoneBCD)
-	header.SeqNum = binary.BigEndian.Uint16(data[10:12])
+	// AUTO-FIX-2026-07-17: Bit15=1 时，data[4] 为协议版本号，Phone 从 data[5] 开始
+	phoneStart := 4
+	if header.Version2019 {
+		if len(data) < 13 {
+			return nil, 0, fmt.Errorf("1078 2019 header too short: %d bytes", len(data))
+		}
+		header.ProtocolVer = data[4]
+		phoneStart = 5
+	}
 
-	offset := 12
+	phoneBCD := data[phoneStart : phoneStart+6]
+	header.Phone = bcdToStringSafe(phoneBCD)
+	header.SeqNum = binary.BigEndian.Uint16(data[phoneStart+6 : phoneStart+8])
+
+	offset := phoneStart + 8
 	if header.HasPack && len(data) >= offset+4 {
 		header.PackTotal = binary.BigEndian.Uint16(data[offset : offset+2])
 		header.PackIndex = binary.BigEndian.Uint16(data[offset+2 : offset+4])
@@ -122,6 +141,12 @@ func (c *JT1078Codec) EncodeHeader(header *protocol.MessageHeader) ([]byte, erro
 	buf = append(buf, msgIDBytes...)
 
 	bodyAttr := uint16(header.BodyLen) & 0x03FF
+	// AUTO-FIX-2026-07-17: 设置 Bit 10-12 加密方式
+	bodyAttr |= (uint16(header.EncryptMethod) & 0x07) << 10
+	// AUTO-FIX-2026-07-17: 设置 Bit 15 版本标识
+	if header.Version2019 {
+		bodyAttr |= 0x8000
+	}
 	if header.HasPack {
 		bodyAttr |= 0x2000
 	}
@@ -129,7 +154,15 @@ func (c *JT1078Codec) EncodeHeader(header *protocol.MessageHeader) ([]byte, erro
 	binary.BigEndian.PutUint16(bodyAttrBytes, bodyAttr)
 	buf = append(buf, bodyAttrBytes...)
 
-	phoneBCD := stringToBCD(header.Phone)
+	// AUTO-FIX-2026-07-17: 2019 版本写入协议版本号字节
+	if header.Version2019 {
+		buf = append(buf, header.ProtocolVer)
+	}
+
+	phoneBCD, err := stringToBCD6(header.Phone)
+	if err != nil {
+		return nil, fmt.Errorf("encode header: %w", err)
+	}
 	buf = append(buf, phoneBCD...)
 
 	seqBytes := make([]byte, 2)
@@ -164,11 +197,11 @@ func (c *JT1078Codec) ParseBody(msgID uint16, data []byte) (protocol.MessageBody
 		body = &TermAVRequestMessage{}
 	case MsgIDTermAVResponse:
 		body = &TermAVResponseMessage{}
-	// AUTO-FIX-2026-06-27: 0x9105/0x9106 改为单条音视频检索请求/应答
-	case MsgIDSingleAVRetrievalRequest:
-		body = &SingleAVRetrievalRequestMessage{}
-	case MsgIDSingleAVRetrievalResponse:
-		body = &SingleAVRetrievalResponseMessage{}
+	// FIXED-2026-07-17 [P0]: 0x9105/0x9106 修正为实时音视频传输状态通知/应答
+	case MsgIDAVStatusNotification:
+		body = &AVStatusNotificationMessage{}
+	case MsgIDAVStatusNotificationResponse:
+		body = &AVStatusNotificationResponseMessage{}
 	case MsgIDPlaybackRequest:
 		body = &PlaybackRequestMessage{}
 	case MsgIDPlaybackResponse:
@@ -300,6 +333,12 @@ type RealtimeRequestMessage struct {
 func (m *RealtimeRequestMessage) MsgID() uint16 { return MsgIDRealtimeRequest }
 
 func (m *RealtimeRequestMessage) Marshal() ([]byte, error) {
+	// [P1-6] IP 地址格式校验：非空时必须为合法 IPv4
+	if m.IPAddress != "" {
+		if ip := net.ParseIP(m.IPAddress); ip == nil || ip.To4() == nil {
+			return nil, fmt.Errorf("invalid IPv4 address: %q", m.IPAddress)
+		}
+	}
 	buf := make([]byte, 0, 22)
 	ipBuf := make([]byte, 16)
 	copy(ipBuf, []byte(m.IPAddress))
@@ -315,10 +354,12 @@ func (m *RealtimeRequestMessage) Marshal() ([]byte, error) {
 	}
 	// AUTO-FIX-2026-06-30 [P2-8]: SRTP 参数（可选，SRTPEnabled 时追加）。
 	// AUTO-FIX-2026-07-02 [P2-1.3.2]: 新增 MasterKeyEncrypted 标志位。
+	// FIXED-2026-07-22 [P0]: SRTP 要求 TransportMode > 0，移除 TransportMode=0 占位逻辑。
+	// 原 TransportMode=0 时追加 0 字节占位，但 Unmarshal 在 TransportMode=0 时不解析 SRTP，
+	// 导致 SRTP 参数无法被正确接收。现要求 SRTP 场景必须 TransportMode > 0。
 	if m.SRTPEnabled {
 		if m.TransportMode == 0 {
-			// SRTP 需要明确传输模式，强制写入 TransportMode 占位以保持字段对齐
-			buf = append(buf, 0)
+			return nil, fmt.Errorf("srtp requires TransportMode > 0 (UDP mode does not support SRTP)")
 		}
 		if len(m.MasterKey) > 255 || len(m.CipherSuite) > 255 {
 			return nil, fmt.Errorf("srtp param too long")
@@ -355,15 +396,16 @@ func (m *RealtimeRequestMessage) Unmarshal(data []byte) error {
 	}
 	// AUTO-FIX-2026-06-30 [P2-8]: 解析可选的 SRTP 参数（紧跟 TransportMode 之后）。
 	// AUTO-FIX-2026-07-02 [P2-1.3.2]: 新增 MasterKeyEncrypted 标志位解析。
-	// 格式: SRTPEnabled(1B) + MasterKeyEncrypted(1B) + CipherSuiteLen(1B) + CipherSuite + MasterKeyLen(1B) + MasterKey
+	// FIXED-2026-07-22 [P0]: 移除 srtpStart=21 回退逻辑。
+	// 原 TransportMode==0 时 srtpStart 回退到 21，与 TransportMode 字段位置冲突，
+	// 导致标准 22B 报文被误判为 SRTP 启用（data[21]=TransportMode 被当作 SRTPEnabled）。
+	// 修复：SRTP 解析仅在 TransportMode > 0 且 len(data) > 22 时触发。
+	// 标准 21B 报文不含 SRTP，TransportMode==0（UDP）不支持 SRTP。
 	m.SRTPEnabled = false
 	m.MasterKeyEncrypted = false
 	srtpStart := 22
-	if m.TransportMode == 0 && len(data) >= 22 {
-		srtpStart = 21 // 无 TransportMode 字段时回退（兼容性）
-	}
-	// 兼容旧格式（无 MasterKeyEncrypted 字段）：data[srtpStart] == 1 表示 SRTPEnabled
-	if len(data) > srtpStart && data[srtpStart] == 1 {
+	// 仅当 TransportMode > 0（TCP 模式扩展）且数据超过 22B 时才尝试解析 SRTP
+	if m.TransportMode > 0 && len(data) > srtpStart && data[srtpStart] == 1 {
 		// 检查是否有 MasterKeyEncrypted 字段（新格式至少 4B: enabled + encrypted + csLen + ...）
 		if len(data) < srtpStart+3 {
 			return fmt.Errorf("srtp cipher suite length missing")
@@ -464,111 +506,70 @@ func (m *TermAVResponseMessage) Unmarshal(data []byte) error {
 	return nil
 }
 
-// AUTO-FIX-2026-06-27: 0x9105 单条音视频检索请求（平台→终端）
-// 标准: 逻辑通道号(1B) + 开始时间BCD(6B) + 结束时间BCD(6B) + 报警标志(4B uint32) +
-//       媒体类型(1B) + 码流类型(1B) + 存储器类型(1B) + 流水号(2B) = 22B
-// 注: 任务清单标注 "= 28B" 为字段和笔误，实际字段累加为 22B（与 0x9106 资源项 28B 区分）。
-type SingleAVRetrievalRequestMessage struct {
-	LogicChannel byte
-	StartTime    string // BCD YYMMDDHHMMSS
-	EndTime      string // BCD YYMMDDHHMMSS
-	AlarmFlag    uint32
-	MediaType    byte
-	StreamType   byte
-	StorageType  byte
-	SeqNum       uint16
+// FIXED-2026-07-17 [P0]: 0x9105 实时音视频传输状态通知（终端→平台）
+// JT/T 1078-2016 标准: 流水号(2B) + 逻辑通道号(1B) + 丢失包数(2B) + 乱序包数(2B) +
+//   RTP丢包率(2B uint16, 0-1000 表示 0.00%-100.00%) + 当前码率(4B uint32, bps) + 终端异常状态(2B) = 15B
+// 终端在实时音视频传输过程中周期性上报传输质量状态，平台据此监控视频流健康度。
+type AVStatusNotificationMessage struct {
+	SeqNum         uint16 // 流水号（与 0x9101 请求中的流水号对应）
+	LogicChannel   byte   // 逻辑通道号
+	LostPackets    uint16 // 丢失包数
+	DisorderPackets uint16 // 乱序包数
+	LossRate       uint16 // RTP丢包率（0-1000，实际值 = 值 / 10.0，如 50 = 5.0%）
+	CurrentBitrate uint32 // 当前码率（bps）
+	TerminalStatus uint16 // 终端异常状态（位标志：bit0=视频丢帧 bit1=音频断续 bit2=网络抖动 等）
 }
 
-func (m *SingleAVRetrievalRequestMessage) MsgID() uint16 { return MsgIDSingleAVRetrievalRequest }
+func (m *AVStatusNotificationMessage) MsgID() uint16 { return MsgIDAVStatusNotification }
 
-func (m *SingleAVRetrievalRequestMessage) Marshal() ([]byte, error) {
-	buf := make([]byte, 0, 22)
-	buf = append(buf, m.LogicChannel)
-	buf = append(buf, stringToBCD(m.StartTime)...)
-	buf = append(buf, stringToBCD(m.EndTime)...)
-	buf = append(buf, byte(m.AlarmFlag>>24), byte(m.AlarmFlag>>16), byte(m.AlarmFlag>>8), byte(m.AlarmFlag))
-	buf = append(buf, m.MediaType, m.StreamType, m.StorageType)
-	buf = append(buf, byte(m.SeqNum>>8), byte(m.SeqNum))
+func (m *AVStatusNotificationMessage) Marshal() ([]byte, error) {
+	buf := make([]byte, 15)
+	binary.BigEndian.PutUint16(buf[0:2], m.SeqNum)
+	buf[2] = m.LogicChannel
+	binary.BigEndian.PutUint16(buf[3:5], m.LostPackets)
+	binary.BigEndian.PutUint16(buf[5:7], m.DisorderPackets)
+	binary.BigEndian.PutUint16(buf[7:9], m.LossRate)
+	binary.BigEndian.PutUint32(buf[9:13], m.CurrentBitrate)
+	binary.BigEndian.PutUint16(buf[13:15], m.TerminalStatus)
 	return buf, nil
 }
 
-func (m *SingleAVRetrievalRequestMessage) Unmarshal(data []byte) error {
-	if len(data) < 22 {
-		return fmt.Errorf("single av retrieval request too short")
+func (m *AVStatusNotificationMessage) Unmarshal(data []byte) error {
+	if len(data) < 15 {
+		return fmt.Errorf("av status notification too short: %d, need 15", len(data))
 	}
-	m.LogicChannel = data[0]
-	m.StartTime = bcdToStringFixed(data[1:7])
-	m.EndTime = bcdToStringFixed(data[7:13])
-	m.AlarmFlag = binary.BigEndian.Uint32(data[13:17])
-	m.MediaType = data[17]
-	m.StreamType = data[18]
-	m.StorageType = data[19]
-	m.SeqNum = binary.BigEndian.Uint16(data[20:22])
+	m.SeqNum = binary.BigEndian.Uint16(data[0:2])
+	m.LogicChannel = data[2]
+	m.LostPackets = binary.BigEndian.Uint16(data[3:5])
+	m.DisorderPackets = binary.BigEndian.Uint16(data[5:7])
+	m.LossRate = binary.BigEndian.Uint16(data[7:9])
+	m.CurrentBitrate = binary.BigEndian.Uint32(data[9:13])
+	m.TerminalStatus = binary.BigEndian.Uint16(data[13:15])
 	return nil
 }
 
-// AUTO-FIX-2026-06-27: 0x9106 单条音视频检索应答（终端→平台）
-// 标准: 流水号(2B) + 检索总数(2B) + 资源项列表(N × 28B)
-// 每项: 通道号(1B) + 开始BCD(6B) + 结束BCD(6B) + 报警标志(4B) + 媒体类型(1B) +
-//       码流类型(1B) + 存储器类型(1B) + 文件大小(8B uint64) = 28B
-type SingleAVRetrievalResponseMessage struct {
-	SeqNum uint16
-	Count  uint16
-	Items  []SingleAVRetrievalItem
+// FIXED-2026-07-17 [P0]: 0x9106 实时音视频传输状态通知应答（平台→终端）
+// JT/T 1078-2016 标准: 流水号(2B) + 逻辑通道号(1B) = 3B
+type AVStatusNotificationResponseMessage struct {
+	SeqNum       uint16 // 流水号（与 0x9105 通知中的流水号对应）
+	LogicChannel byte   // 逻辑通道号
 }
 
-// SingleAVRetrievalItem 单条音视频检索资源项（28B）
-type SingleAVRetrievalItem struct {
-	ChannelID   byte
-	StartTime   string // BCD YYMMDDHHMMSS
-	EndTime     string // BCD YYMMDDHHMMSS
-	AlarmFlag   uint32
-	MediaType   byte
-	StreamType  byte
-	StorageType byte
-	FileSize    uint64
-}
+func (m *AVStatusNotificationResponseMessage) MsgID() uint16 { return MsgIDAVStatusNotificationResponse }
 
-func (m *SingleAVRetrievalResponseMessage) MsgID() uint16 { return MsgIDSingleAVRetrievalResponse }
-
-func (m *SingleAVRetrievalResponseMessage) Marshal() ([]byte, error) {
-	buf := make([]byte, 0, 4+len(m.Items)*28)
-	buf = append(buf, byte(m.SeqNum>>8), byte(m.SeqNum))
-	buf = append(buf, byte(len(m.Items)>>8), byte(len(m.Items)))
-	for _, it := range m.Items {
-		buf = append(buf, it.ChannelID)
-		buf = append(buf, stringToBCD(it.StartTime)...)
-		buf = append(buf, stringToBCD(it.EndTime)...)
-		buf = append(buf, byte(it.AlarmFlag>>24), byte(it.AlarmFlag>>16), byte(it.AlarmFlag>>8), byte(it.AlarmFlag))
-		buf = append(buf, it.MediaType, it.StreamType, it.StorageType)
-		var szBytes [8]byte
-		binary.BigEndian.PutUint64(szBytes[:], it.FileSize)
-		buf = append(buf, szBytes[:]...)
-	}
+func (m *AVStatusNotificationResponseMessage) Marshal() ([]byte, error) {
+	buf := make([]byte, 3)
+	binary.BigEndian.PutUint16(buf[0:2], m.SeqNum)
+	buf[2] = m.LogicChannel
 	return buf, nil
 }
 
-func (m *SingleAVRetrievalResponseMessage) Unmarshal(data []byte) error {
-	if len(data) < 4 {
-		return fmt.Errorf("single av retrieval response too short")
+func (m *AVStatusNotificationResponseMessage) Unmarshal(data []byte) error {
+	if len(data) < 3 {
+		return fmt.Errorf("av status notification response too short: %d, need 3", len(data))
 	}
 	m.SeqNum = binary.BigEndian.Uint16(data[0:2])
-	m.Count = binary.BigEndian.Uint16(data[2:4])
-	m.Items = make([]SingleAVRetrievalItem, 0, m.Count)
-	offset := 4
-	for i := 0; i < int(m.Count) && offset+28 <= len(data); i++ {
-		var it SingleAVRetrievalItem
-		it.ChannelID = data[offset]
-		it.StartTime = bcdToStringFixed(data[offset+1 : offset+7])
-		it.EndTime = bcdToStringFixed(data[offset+7 : offset+13])
-		it.AlarmFlag = binary.BigEndian.Uint32(data[offset+13 : offset+17])
-		it.MediaType = data[offset+17]
-		it.StreamType = data[offset+18]
-		it.StorageType = data[offset+19]
-		it.FileSize = binary.BigEndian.Uint64(data[offset+20 : offset+28])
-		m.Items = append(m.Items, it)
-		offset += 28
-	}
+	m.LogicChannel = data[2]
 	return nil
 }
 
@@ -578,7 +579,7 @@ func (m *SingleAVRetrievalResponseMessage) Unmarshal(data []byte) error {
 //  1. 调整结构体字段顺序为标准顺序(原为 LogicChannel/MediaType/StreamType/PlaybackMode 在前, 时间在后)
 //  2. 添加 Speed byte 字段(原缺失)
 //  3. Marshal 时间改用 stringToBCD (原为 []byte 直接写ASCII，与BCD标准不符)
-//  4. Unmarshal 时间改用 bcdToStringFixed (原为 string，会读取ASCII而非BCD)
+//  4. Unmarshal 时间改用 bcdToString (原为 string，会读取ASCII而非BCD)
 //  5. 最小长度改为16(任务指定)；Speed 在 data[16]，仅当 len>=17 时读取以避免越界panic。
 //     注: 字段总和为17B(1+6+6+1+1+1+1)，任务中"16字节"为字段和笔误，此处min=16兼容旧版16B报文。
 // AUTO-FIX-2026-06-27: 0x9201 增加 StorageType（存储器类型 1B），最小长度 16→18。
@@ -600,8 +601,16 @@ func (m *PlaybackRequestMessage) MsgID() uint16 { return MsgIDPlaybackRequest }
 func (m *PlaybackRequestMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 18)
 	buf = append(buf, m.LogicChannel)
-	buf = append(buf, stringToBCD(m.StartTime)...)
-	buf = append(buf, stringToBCD(m.EndTime)...)
+	startBCD, err := stringToBCD6(m.StartTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, startBCD...)
+	endBCD, err := stringToBCD6(m.EndTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, endBCD...)
 	buf = append(buf, m.StreamType, m.MediaType, m.PlaybackMode, m.Speed, m.StorageType)
 	return buf, nil
 }
@@ -611,8 +620,8 @@ func (m *PlaybackRequestMessage) Unmarshal(data []byte) error {
 		return fmt.Errorf("playback request too short")
 	}
 	m.LogicChannel = data[0]
-	m.StartTime = bcdToStringFixed(data[1:7])
-	m.EndTime = bcdToStringFixed(data[7:13])
+	m.StartTime = bcdToStringSafe(data[1:7])
+	m.EndTime = bcdToStringSafe(data[7:13])
 	m.StreamType = data[13]
 	m.MediaType = data[14]
 	m.PlaybackMode = data[15]
@@ -621,44 +630,74 @@ func (m *PlaybackRequestMessage) Unmarshal(data []byte) error {
 	return nil
 }
 
+// bcdToString 将 BCD 字节转换为字符串，不剥除前导零。
 // AUTO-FIX-2026-06-29 [P0]: 原 bcdToString 剥除前导零，导致 SIM/Phone（6字节 BCD = 12 位
 // 定长数字，常以 0 开头如 013800000000）解码后丢失前导零（→ 13800000000），引发：
 //   1) RTP 会话 streamID 不匹配，视频流被丢弃（视频不通）
 //   2) byPhone 索引与 API 传入的完整 SIM 不一致，指令下发失败
 //   3) DB 存储的 SIM 与协议解码不一致，跨系统对账错误
-// 修复：SIM/Phone 是定长 BCD 字段，不应剥除前导零。已移除剥零循环。
-func bcdToString(bcd []byte) string {
+// [P2-修复] bcdToStringFixed 已与 bcdToString 实现相同，已合并。
+// FIXED-2026-07-23 [P2]: bcdToString 添加 BCD 合法性校验，高位或低位 > 9 时返回 error。
+// 字符串始终完整返回（best-effort），error 仅表示存在非法 BCD 字节。
+func bcdToString(bcd []byte) (string, error) {
 	result := make([]byte, 0, len(bcd)*2)
-	for _, b := range bcd {
-		result = append(result, (b>>4)+'0', (b&0x0F)+'0')
+	var firstErr error
+	for i, b := range bcd {
+		high := b >> 4
+		low := b & 0x0F
+		if high > 9 || low > 9 {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("bcdToString: invalid BCD byte 0x%02X at position %d", b, i)
+			}
+		}
+		result = append(result, high+'0', low+'0')
 	}
-	return string(result)
+	return string(result), firstErr
 }
 
-// bcdToStringFixed 将 BCD 字节转换为字符串，不剥除前导零。
-// AUTO-FIX-2026-06-26: 用于时间字段（BCD[6]=YYMMDDHHmmss），原 bcdToString 会剥除前导零导致时间错乱。
-func bcdToStringFixed(bcd []byte) string {
-	result := make([]byte, 0, len(bcd)*2)
-	for _, b := range bcd {
-		result = append(result, (b>>4)+'0', (b&0x0F)+'0')
-	}
-	return string(result)
+// bcdToStringSafe 调用 bcdToString 并忽略 error，返回 best-effort 字符串。
+// 用于 Unmarshal/ParseHeader 等 BCD 校验错误不应中断主流程的场景。
+func bcdToStringSafe(bcd []byte) string {
+	s, _ := bcdToString(bcd)
+	return s
 }
 
-func stringToBCD(s string) []byte {
-	for len(s) < 12 {
+
+// [P1-修复] stringToBCD 添加输入校验：先过滤非数字字符，再验证
+// FIXED-2026-07-23 [P2]: stringToBCD 增加 targetLen 参数，支持不同长度的 BCD 字段。
+func stringToBCD(s string, targetLen int) ([]byte, error) {
+	if targetLen <= 0 {
+		targetLen = 6
+	}
+	filtered := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			filtered = append(filtered, s[i])
+		}
+	}
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("stringToBCD: no digit characters in input %q", s)
+	}
+	s = string(filtered)
+	targetChars := targetLen * 2
+	for len(s) < targetChars {
 		s = "0" + s
 	}
-	if len(s) > 12 {
-		s = s[len(s)-12:]
+	if len(s) > targetChars {
+		s = s[len(s)-targetChars:]
 	}
-	bcd := make([]byte, 6)
-	for i := 0; i < 6; i++ {
+	bcd := make([]byte, targetLen)
+	for i := 0; i < targetLen; i++ {
 		high := s[i*2] - '0'
 		low := s[i*2+1] - '0'
 		bcd[i] = (high << 4) | low
 	}
-	return bcd
+	return bcd, nil
+}
+
+// stringToBCD6 是 stringToBCD(s, 6) 的包装函数。
+func stringToBCD6(s string) ([]byte, error) {
+	return stringToBCD(s, 6)
 }
 
 var _ protocol.MessageBody = (*RawMessage)(nil)
@@ -668,9 +707,9 @@ var _ protocol.MessageBody = (*RealtimeResponseMessage)(nil)
 var _ protocol.MessageBody = (*TermAVRequestMessage)(nil)
 var _ protocol.MessageBody = (*TermAVResponseMessage)(nil)
 // AUTO-FIX-2026-06-27: ControlRequestMessage/ControlResponseMessage 已重命名为
-// SingleAVRetrievalRequestMessage/SingleAVRetrievalResponseMessage
-var _ protocol.MessageBody = (*SingleAVRetrievalRequestMessage)(nil)
-var _ protocol.MessageBody = (*SingleAVRetrievalResponseMessage)(nil)
+// AVStatusNotificationMessage/AVStatusNotificationResponseMessage (FIXED-2026-07-17 [P0])
+var _ protocol.MessageBody = (*AVStatusNotificationMessage)(nil)
+var _ protocol.MessageBody = (*AVStatusNotificationResponseMessage)(nil)
 var _ protocol.MessageBody = (*PlaybackRequestMessage)(nil)
 var _ protocol.MessageBody = (*PlaybackControlMessage)(nil)
 var _ protocol.MessageBody = (*DownloadRequestMessage)(nil)
@@ -774,7 +813,10 @@ func (m *AlarmVideoRequestMessage) Marshal() ([]byte, error) {
 	buf = append(buf, m.LogicChannel)
 	buf = append(buf, byte(m.AlarmFlag>>24), byte(m.AlarmFlag>>16), byte(m.AlarmFlag>>8), byte(m.AlarmFlag))
 	buf = append(buf, byte(m.AlarmType>>8), byte(m.AlarmType))
-	timeBCD := stringToBCD(m.AlarmTime)
+	timeBCD, err := stringToBCD6(m.AlarmTime)
+	if err != nil {
+		return nil, err
+	}
 	buf = append(buf, timeBCD...)
 	buf = append(buf, byte(m.AlarmLongitude>>24), byte(m.AlarmLongitude>>16), byte(m.AlarmLongitude>>8), byte(m.AlarmLongitude))
 	buf = append(buf, byte(m.AlarmLatitude>>24), byte(m.AlarmLatitude>>16), byte(m.AlarmLatitude>>8), byte(m.AlarmLatitude))
@@ -797,7 +839,7 @@ func (m *AlarmVideoRequestMessage) Unmarshal(data []byte) error {
 	m.LogicChannel = data[2]
 	m.AlarmFlag = uint32(data[3])<<24 | uint32(data[4])<<16 | uint32(data[5])<<8 | uint32(data[6])
 	m.AlarmType = binary.BigEndian.Uint16(data[7:9])
-	m.AlarmTime = bcdToStringFixed(data[9:15])
+	m.AlarmTime = bcdToStringSafe(data[9:15])
 	m.AlarmLongitude = uint32(data[15])<<24 | uint32(data[16])<<16 | uint32(data[17])<<8 | uint32(data[18])
 	m.AlarmLatitude = uint32(data[19])<<24 | uint32(data[20])<<16 | uint32(data[21])<<8 | uint32(data[22])
 	m.AlarmAltitude = binary.BigEndian.Uint16(data[23:25])
@@ -1070,10 +1112,24 @@ type DownloadRequestMessage struct {
 func (m *DownloadRequestMessage) MsgID() uint16 { return MsgIDDownloadRequest }
 
 func (m *DownloadRequestMessage) Marshal() ([]byte, error) {
+	// [P2-3] 校验 IP 地址格式：非空时必须为合法 IPv4
+	if m.IPAddress != "" {
+		if ip := net.ParseIP(m.IPAddress); ip == nil || ip.To4() == nil {
+			return nil, fmt.Errorf("invalid IPv4 address: %q", m.IPAddress)
+		}
+	}
 	buf := make([]byte, 0, 65+len(m.FilePath))
 	buf = append(buf, m.LogicChannel)
-	buf = append(buf, stringToBCD(m.StartTime)...)
-	buf = append(buf, stringToBCD(m.EndTime)...)
+	startBCD, err := stringToBCD6(m.StartTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, startBCD...)
+	endBCD, err := stringToBCD6(m.EndTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, endBCD...)
 	buf = append(buf, byte(m.AlarmFlag>>24), byte(m.AlarmFlag>>16), byte(m.AlarmFlag>>8), byte(m.AlarmFlag))
 	buf = append(buf, m.MediaType, m.StreamType, m.StorageType, m.DownloadType)
 	// IP 16B ASCII
@@ -1102,8 +1158,8 @@ func (m *DownloadRequestMessage) Unmarshal(data []byte) error {
 		return fmt.Errorf("download request too short")
 	}
 	m.LogicChannel = data[0]
-	m.StartTime = bcdToStringFixed(data[1:7])
-	m.EndTime = bcdToStringFixed(data[7:13])
+	m.StartTime = bcdToStringSafe(data[1:7])
+	m.EndTime = bcdToStringSafe(data[7:13])
 	m.AlarmFlag = binary.BigEndian.Uint32(data[13:17])
 	m.MediaType = data[17]
 	m.StreamType = data[18]
@@ -1134,12 +1190,25 @@ func encodeGBKFixed(s string, size int) ([]byte, error) {
 	}
 	buf := make([]byte, size)
 	if len(encoded) > size {
-		// 按 GBK 字节流截断（可能截断到半个汉字，但保持长度一致性）
-		copy(buf, encoded[:size])
+		// [P1-2] 截断时检查截断点是否在 GBK 双字节字符中间。
+		// GBK lead byte 范围: 0x81-0xFE，若截断点前一字节是 lead byte，
+		// 则回退 1 字节截断（少 1 字节而非半字符），用 0x00 填充末尾。
+		truncateAt := size
+		if truncateAt > 0 && isGBKLeadByte(encoded[truncateAt-1]) {
+			truncateAt--
+		}
+		copy(buf, encoded[:truncateAt])
+		// 截断回退后剩余字节用 0x00 填充（buf 已初始化为零值，无需额外操作）
 	} else {
 		copy(buf, encoded)
 	}
 	return buf, nil
+}
+
+// isGBKLeadByte 判断字节是否为 GBK 双字节字符的首字节（lead byte）。
+// GBK lead byte 范围: 0x81-0xFE
+func isGBKLeadByte(b byte) bool {
+	return b >= 0x81 && b <= 0xFE
 }
 
 // AUTO-FIX-2026-06-27: decodeGBKFixed 将固定长度 GBK 字节流解码为字符串，并 TrimRight \x00。
@@ -1195,8 +1264,16 @@ func (m *TerminalLogRequestMessage) MsgID() uint16 { return MsgIDTerminalLogReq 
 func (m *TerminalLogRequestMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 13)
 	buf = append(buf, m.LogicChannel)
-	buf = append(buf, stringToBCD(m.StartTime)...)
-	buf = append(buf, stringToBCD(m.EndTime)...)
+	startBCD, err := stringToBCD6(m.StartTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, startBCD...)
+	endBCD, err := stringToBCD6(m.EndTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, endBCD...)
 	return buf, nil
 }
 
@@ -1205,8 +1282,8 @@ func (m *TerminalLogRequestMessage) Unmarshal(data []byte) error {
 		return fmt.Errorf("terminal log request too short")
 	}
 	m.LogicChannel = data[0]
-	m.StartTime = bcdToStringFixed(data[1:7])
-	m.EndTime = bcdToStringFixed(data[7:13])
+	m.StartTime = bcdToStringSafe(data[1:7])
+	m.EndTime = bcdToStringSafe(data[7:13])
 	return nil
 }
 
@@ -1256,6 +1333,12 @@ type TerminalLogUploadMessage struct {
 func (m *TerminalLogUploadMessage) MsgID() uint16 { return MsgIDTerminalLogUpload }
 
 func (m *TerminalLogUploadMessage) Marshal() ([]byte, error) {
+	// [P2-3] 校验 IP 地址格式：非空时必须为合法 IPv4
+	if m.IPAddress != "" {
+		if ip := net.ParseIP(m.IPAddress); ip == nil || ip.To4() == nil {
+			return nil, fmt.Errorf("invalid IPv4 address: %q", m.IPAddress)
+		}
+	}
 	buf := make([]byte, 0, 55)
 	buf = append(buf, m.LogicChannel)
 	// IP 16B ASCII（不足补0x00）
@@ -1274,8 +1357,16 @@ func (m *TerminalLogUploadMessage) Marshal() ([]byte, error) {
 		return nil, fmt.Errorf("encode password gbk: %w", err)
 	}
 	buf = append(buf, passBuf...)
-	buf = append(buf, stringToBCD(m.StartTime)...)
-	buf = append(buf, stringToBCD(m.EndTime)...)
+	startBCD, err := stringToBCD6(m.StartTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, startBCD...)
+	endBCD, err := stringToBCD6(m.EndTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, endBCD...)
 	return buf, nil
 }
 
@@ -1294,10 +1385,10 @@ func (m *TerminalLogUploadMessage) Unmarshal(data []byte) error {
 		return fmt.Errorf("decode password gbk: %w", err)
 	}
 	if len(data) >= 49 {
-		m.StartTime = bcdToStringFixed(data[43:49])
+		m.StartTime = bcdToStringSafe(data[43:49])
 	}
 	if len(data) >= 55 {
-		m.EndTime = bcdToStringFixed(data[49:55])
+		m.EndTime = bcdToStringSafe(data[49:55])
 	}
 	return nil
 }
@@ -1347,8 +1438,16 @@ func (m *PlaybackResponseMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(len(m.Items)>>8), byte(len(m.Items)))
 	for _, it := range m.Items {
 		buf = append(buf, it.ChannelID, it.MediaType, it.StreamType, it.StorageType)
-		buf = append(buf, stringToBCD(it.StartTime)...)
-		buf = append(buf, stringToBCD(it.EndTime)...)
+		itStartBCD, err := stringToBCD6(it.StartTime)
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, itStartBCD...)
+		itEndBCD, err := stringToBCD6(it.EndTime)
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, itEndBCD...)
 		buf = append(buf, byte(it.AlarmFlag>>24), byte(it.AlarmFlag>>16), byte(it.AlarmFlag>>8), byte(it.AlarmFlag))
 		var szBytes [8]byte
 		binary.BigEndian.PutUint64(szBytes[:], it.FileSize)
@@ -1376,8 +1475,8 @@ func (m *PlaybackResponseMessage) Unmarshal(data []byte) error {
 		it.MediaType = data[offset+1]
 		it.StreamType = data[offset+2]
 		it.StorageType = data[offset+3]
-		it.StartTime = bcdToStringFixed(data[offset+4 : offset+10])
-		it.EndTime = bcdToStringFixed(data[offset+10 : offset+16])
+		it.StartTime = bcdToStringSafe(data[offset+4 : offset+10])
+		it.EndTime = bcdToStringSafe(data[offset+10 : offset+16])
 		it.AlarmFlag = binary.BigEndian.Uint32(data[offset+16 : offset+20])
 		it.FileSize = binary.BigEndian.Uint64(data[offset+20 : offset+28])
 		m.Items = append(m.Items, it)
@@ -1434,8 +1533,16 @@ type PlatformNegotiateMessage struct {
 func (m *PlatformNegotiateMessage) MsgID() uint16 { return MsgIDAVNegotiate }
 
 func (m *PlatformNegotiateMessage) Marshal() ([]byte, error) {
+	// [P1-3] IP 地址长度校验：IPv4 最长 15 字符（如 255.255.255.255）
+	if len(m.IPAddress) > 15 {
+		return nil, fmt.Errorf("IP address too long: %d (max 15)", len(m.IPAddress))
+	}
 	buf := make([]byte, 0, 12)
-	buf = append(buf, stringToBCD(m.Phone)...)
+	phoneBCD, err := stringToBCD6(m.Phone)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, phoneBCD...)
 	buf = append(buf, m.LogicChannel, m.AVType, m.StreamType, m.ProtocolType)
 	buf = append(buf, []byte(m.IPAddress)...)
 	buf = append(buf, byte(m.Port>>8), byte(m.Port))
@@ -1446,14 +1553,16 @@ func (m *PlatformNegotiateMessage) Unmarshal(data []byte) error {
 	if len(data) < 10 {
 		return fmt.Errorf("platform negotiate too short")
 	}
-	m.Phone = bcdToString(data[0:6])
+	m.Phone = bcdToStringSafe(data[0:6])
 	m.LogicChannel = data[6]
 	m.AVType = data[7]
 	m.StreamType = data[8]
 	m.ProtocolType = data[9]
 	offset := 10
 	// IP地址为点分十进制字符串，端口为最后2字节
-	if len(data) > offset+2 {
+	// FIXED-2026-07-22 [P1]: len(data)==offset+2 时 Port 未解析。
+	// 将条件从 > 改为 >=，确保恰好 IP(0B)+Port(2B) 时 Port 字段被正确解析。
+	if len(data) >= offset+2 {
 		m.IPAddress = string(data[offset : len(data)-2])
 		portBytes := data[len(data)-2:]
 		m.Port = binary.BigEndian.Uint16(portBytes)
@@ -1474,8 +1583,16 @@ type PlatformNegotiateResponse struct {
 func (m *PlatformNegotiateResponse) MsgID() uint16 { return MsgIDAVNegotiateResp }
 
 func (m *PlatformNegotiateResponse) Marshal() ([]byte, error) {
+	// [P1-3] IP 地址长度校验：IPv4 最长 15 字符
+	if len(m.IPAddress) > 15 {
+		return nil, fmt.Errorf("IP address too long: %d (max 15)", len(m.IPAddress))
+	}
 	buf := make([]byte, 0, 12)
-	buf = append(buf, stringToBCD(m.Phone)...)
+	phoneBCD, err := stringToBCD6(m.Phone)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, phoneBCD...)
 	buf = append(buf, m.LogicChannel, m.Result)
 	buf = append(buf, []byte(m.IPAddress)...)
 	buf = append(buf, byte(m.Port>>8), byte(m.Port))
@@ -1486,11 +1603,13 @@ func (m *PlatformNegotiateResponse) Unmarshal(data []byte) error {
 	if len(data) < 10 {
 		return fmt.Errorf("platform negotiate resp too short")
 	}
-	m.Phone = bcdToString(data[0:6])
+	m.Phone = bcdToStringSafe(data[0:6])
 	m.LogicChannel = data[6]
 	m.Result = data[7]
 	offset := 8
-	if len(data) > offset+2 {
+	// FIXED-2026-07-22 [P1]: len(data)==offset+2 时 Port 未解析。
+	// 将条件从 > 改为 >=，确保恰好 IP(0B)+Port(2B) 时 Port 字段被正确解析。
+	if len(data) >= offset+2 {
 		m.IPAddress = string(data[offset : len(data)-2])
 		portBytes := data[len(data)-2:]
 		m.Port = binary.BigEndian.Uint16(portBytes)
@@ -1513,10 +1632,22 @@ func (m *PlatformForwardMessage) MsgID() uint16 { return MsgIDAVForward }
 
 func (m *PlatformForwardMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 22)
-	buf = append(buf, stringToBCD(m.Phone)...)
+	phoneBCD, err := stringToBCD6(m.Phone)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, phoneBCD...)
 	buf = append(buf, m.LogicChannel, m.AVType, m.StreamType)
-	buf = append(buf, stringToBCD(m.StartTime)...)
-	buf = append(buf, stringToBCD(m.EndTime)...)
+	startBCD, err := stringToBCD6(m.StartTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, startBCD...)
+	endBCD, err := stringToBCD6(m.EndTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, endBCD...)
 	return buf, nil
 }
 
@@ -1524,12 +1655,12 @@ func (m *PlatformForwardMessage) Unmarshal(data []byte) error {
 	if len(data) < 21 {
 		return fmt.Errorf("platform forward too short")
 	}
-	m.Phone = bcdToString(data[0:6])
+	m.Phone = bcdToStringSafe(data[0:6])
 	m.LogicChannel = data[6]
 	m.AVType = data[7]
 	m.StreamType = data[8]
-	m.StartTime = bcdToStringFixed(data[9:15])
-	m.EndTime = bcdToStringFixed(data[15:21])
+	m.StartTime = bcdToStringSafe(data[9:15])
+	m.EndTime = bcdToStringSafe(data[15:21])
 	return nil
 }
 
@@ -1545,7 +1676,11 @@ func (m *PlatformForwardResponse) MsgID() uint16 { return MsgIDAVForwardResp }
 
 func (m *PlatformForwardResponse) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 8)
-	buf = append(buf, stringToBCD(m.Phone)...)
+	phoneBCD, err := stringToBCD6(m.Phone)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, phoneBCD...)
 	buf = append(buf, m.LogicChannel, m.Result)
 	return buf, nil
 }
@@ -1554,7 +1689,7 @@ func (m *PlatformForwardResponse) Unmarshal(data []byte) error {
 	if len(data) < 8 {
 		return fmt.Errorf("platform forward resp too short")
 	}
-	m.Phone = bcdToString(data[0:6])
+	m.Phone = bcdToStringSafe(data[0:6])
 	m.LogicChannel = data[6]
 	m.Result = data[7]
 	return nil
@@ -1646,8 +1781,16 @@ func (m *FileUploadRequestMessage) MsgID() uint16 { return MsgIDFileUploadReques
 func (m *FileUploadRequestMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 65+len(m.FilePath))
 	buf = append(buf, m.LogicChannel)
-	buf = append(buf, stringToBCD(m.StartTime)...)
-	buf = append(buf, stringToBCD(m.EndTime)...)
+	startBCD, err := stringToBCD6(m.StartTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, startBCD...)
+	endBCD, err := stringToBCD6(m.EndTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, endBCD...)
 	buf = append(buf, byte(m.AlarmFlag>>24), byte(m.AlarmFlag>>16), byte(m.AlarmFlag>>8), byte(m.AlarmFlag))
 	buf = append(buf, m.MediaType, m.StreamType, m.StorageType, m.DownloadType)
 	ipBuf := make([]byte, 16)
@@ -1674,8 +1817,8 @@ func (m *FileUploadRequestMessage) Unmarshal(data []byte) error {
 		return fmt.Errorf("file upload request too short")
 	}
 	m.LogicChannel = data[0]
-	m.StartTime = bcdToStringFixed(data[1:7])
-	m.EndTime = bcdToStringFixed(data[7:13])
+	m.StartTime = bcdToStringSafe(data[1:7])
+	m.EndTime = bcdToStringSafe(data[7:13])
 	m.AlarmFlag = binary.BigEndian.Uint32(data[13:17])
 	m.MediaType = data[17]
 	m.StreamType = data[18]

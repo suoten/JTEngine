@@ -1,3 +1,4 @@
+// FIXED: [P1] media.go globalDownloadTracker.StartCleanup goroutine 缺少 recover() [2026-07-17]
 package handler
 
 import (
@@ -5,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -218,6 +220,16 @@ type MediaHandler struct {
 }
 
 func NewMediaHandler(store storage.Interface, logger *zap.Logger, cfg *config.Config, mediaClient *media.ZLMediaKitClient, commandSender *CommandSender, videoEngine *jt1078.VideoEngine) *MediaHandler {
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 启动下载任务清理 goroutine
+	// FIXED: [P1] 添加 recover 防止 StartCleanup panic 崩溃进程 [2026-07-17]
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("downloadTracker.StartCleanup panic", zap.Any("panic", r))
+			}
+		}()
+		globalDownloadTracker.StartCleanup(context.Background())
+	}()
 	return &MediaHandler{
 		store:         store,
 		logger:        logger,
@@ -378,6 +390,11 @@ func (h *MediaHandler) Start(c *gin.Context) {
 
 	if req.LogicChannel == 0 {
 		req.LogicChannel = 1
+	}
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 校验 VehicleID 防 streamID 注入
+	if !isValidIDField(req.VehicleID) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid vehicle_id: only [A-Za-z0-9_-] allowed, max 64 chars"})
+		return
 	}
 	// streamID must not contain a slash: ZLMediaKit uses app/stream path segments,
 	// so a slash in the stream id would break URL routing. Use "xxx_ch1" with app "rtp".
@@ -606,7 +623,8 @@ func (h *MediaHandler) KeyFrame(c *gin.Context) {
 		Speed:        0,
 	}
 	if err := h.commandSender.SendToDevice(req.VehicleID, jt1078.MsgIDPlaybackControl, ctrlReq); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		h.logger.Warn("keyframe request send failed", zap.String("vehicle_id", req.VehicleID), zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "failed to send keyframe request to terminal"})
 		return
 	}
 
@@ -739,7 +757,7 @@ func (h *MediaHandler) SwitchStream(c *gin.Context) {
 			zap.Int("channel", req.LogicChannel),
 			zap.Int("stream_type", req.StreamType),
 			zap.Error(err))
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "failed to send stream switch command to terminal"})
 		return
 	}
 
@@ -899,7 +917,8 @@ func (h *MediaHandler) PTZ(c *gin.Context) {
 		ControlInstruction: jt1078.BuildPTZControlInstruction(0, byte(req.Direction), byte(req.Speed), byte(req.Speed)),
 	}
 	if err := h.commandSender.SendToDevice(req.VehicleID, jt1078.MsgIDPTZControl, ptzReq); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		h.logger.Warn("PTZ command send failed", zap.String("vehicle_id", req.VehicleID), zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "failed to send PTZ command to terminal"})
 		return
 	}
 
@@ -925,6 +944,11 @@ func (h *MediaHandler) Playback(c *gin.Context) {
 	}
 	if req.LogicChannel == 0 {
 		req.LogicChannel = 1
+	}
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 校验 VehicleID 防 streamID 注入
+	if !isValidIDField(req.VehicleID) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid vehicle_id: only [A-Za-z0-9_-] allowed, max 64 chars"})
+		return
 	}
 
 	streamID := fmt.Sprintf("%s_ch%d_playback", req.VehicleID, req.LogicChannel)
@@ -952,10 +976,11 @@ func (h *MediaHandler) Playback(c *gin.Context) {
 			StartTime:    req.StartTime,
 			EndTime:      req.EndTime,
 		}
-		if err := h.commandSender.SendToDevice(req.VehicleID, jt1078.MsgIDPlaybackRequest, pbReq); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
-			return
-		}
+	if err := h.commandSender.SendToDevice(req.VehicleID, jt1078.MsgIDPlaybackRequest, pbReq); err != nil {
+		h.logger.Warn("playback request send failed", zap.String("vehicle_id", req.VehicleID), zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "failed to send playback request to terminal"})
+		return
+	}
 	}
 
 	resp := MediaStartResponse{StreamID: streamID, RTPPort: rtpPort}
@@ -995,7 +1020,8 @@ func (h *MediaHandler) Download(c *gin.Context) {
 		DownloadType: byte(req.PlaybackMode),
 	}
 	if err := h.commandSender.SendToDevice(req.VehicleID, jt1078.MsgIDDownloadRequest, dlReq); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		h.logger.Warn("download request send failed", zap.String("vehicle_id", req.VehicleID), zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "failed to send download request to terminal"})
 		return
 	}
 
@@ -1027,7 +1053,7 @@ func (h *MediaHandler) Streams(c *gin.Context) {
 	}
 	streams, err := h.media.ListStreams()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		respondInternalError(c, h.logger, err, "MediaHandler.Streams.ListStreams")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": streams})
@@ -1047,12 +1073,14 @@ func (h *MediaHandler) WebRTC(c *gin.Context) {
 	}
 
 	if h.media == nil {
+		// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: URL 编码防注入
+		escapedStream := url.QueryEscape(req.Stream)
 		c.JSON(http.StatusBadRequest, gin.H{
 			"code":    400,
 			"message": "WebRTC not available: ZLMediaKit not configured",
 			"fallback": gin.H{
-				"flv_url": fmt.Sprintf("/api/v1/media/start?vehicle_id=%s", req.Stream),
-				"hls_url": fmt.Sprintf("/api/v1/media/start?vehicle_id=%s", req.Stream),
+				"flv_url": fmt.Sprintf("/api/v1/media/start?vehicle_id=%s", escapedStream),
+				"hls_url": fmt.Sprintf("/api/v1/media/start?vehicle_id=%s", escapedStream),
 			},
 		})
 		return
@@ -1330,14 +1358,18 @@ type DownloadStatus struct {
 
 // downloadTracker 全局下载任务跟踪器（进程内）
 type downloadTracker struct {
-	mu       sync.RWMutex
-	tasks    map[string]*DownloadStatus // key: download_id
-	byDevice map[string]map[string]bool // key: vehicle_id -> set of download_id
+	mu          sync.RWMutex
+	tasks       map[string]*DownloadStatus // key: download_id
+	byDevice    map[string]map[string]bool // key: vehicle_id -> set of download_id
+	maxTasks    int                        // 最大任务数，超出时淘汰最旧任务
+	taskTTL     time.Duration              // 任务保留时长，超时后淘汰
 }
 
 var globalDownloadTracker = &downloadTracker{
 	tasks:    make(map[string]*DownloadStatus),
 	byDevice: make(map[string]map[string]bool),
+	maxTasks: 10000,              // AUTO-FIX-2026-07-15: 上限 1 万条，防 OOM
+	taskTTL:  7 * 24 * time.Hour, // AUTO-FIX-2026-07-15: 7 天 TTL
 }
 
 // CreateDownloadTask 创建下载任务并返回 download_id
@@ -1357,6 +1389,8 @@ func (dt *downloadTracker) CreateDownloadTask(vehicleID string, channel int, sta
 		UpdatedAt:  now,
 	}
 	dt.mu.Lock()
+	// AUTO-FIX-2026-07-15 [ConvergeLoop-严重]: 惰性清理过期/超量任务，防 OOM
+	dt.cleanExpiredLocked(now)
 	dt.tasks[id] = task
 	if dt.byDevice[vehicleID] == nil {
 		dt.byDevice[vehicleID] = make(map[string]bool)
@@ -1364,6 +1398,50 @@ func (dt *downloadTracker) CreateDownloadTask(vehicleID string, channel int, sta
 	dt.byDevice[vehicleID][id] = true
 	dt.mu.Unlock()
 	return id
+}
+
+// cleanExpiredLocked 清理过期和超量任务（调用方必须持有写锁）
+func (dt *downloadTracker) cleanExpiredLocked(now time.Time) {
+	// 1. 清理超过 TTL 的已完成/失败任务
+	for id, task := range dt.tasks {
+		if now.Sub(task.CreatedAt) > dt.taskTTL && task.Status != "pending" && task.Status != "downloading" {
+			delete(dt.tasks, id)
+			if ids, ok := dt.byDevice[task.VehicleID]; ok {
+				delete(ids, id)
+				if len(ids) == 0 {
+					delete(dt.byDevice, task.VehicleID)
+				}
+			}
+		}
+	}
+	// 2. 如果仍超量，按 CreatedAt 淘汰最旧任务
+	if len(dt.tasks) <= dt.maxTasks {
+		return
+	}
+	// 找出最旧的 N 个任务淘汰
+	// AUTO-FIX-2026-07-15 [ConvergeLoop-一般]: 改用 sort.Slice O(n log n) 替代选择排序 O(n²)
+	excess := len(dt.tasks) - dt.maxTasks
+	type taskAge struct {
+		id        string
+		createdAt time.Time
+	}
+	ages := make([]taskAge, 0, len(dt.tasks))
+	for id, task := range dt.tasks {
+		ages = append(ages, taskAge{id, task.CreatedAt})
+	}
+	sort.Slice(ages, func(i, j int) bool {
+		return ages[i].createdAt.Before(ages[j].createdAt)
+	})
+	for i := 0; i < excess && i < len(ages); i++ {
+		task := dt.tasks[ages[i].id]
+		delete(dt.tasks, ages[i].id)
+		if ids, ok := dt.byDevice[task.VehicleID]; ok {
+			delete(ids, ages[i].id)
+			if len(ids) == 0 {
+				delete(dt.byDevice, task.VehicleID)
+			}
+		}
+	}
 }
 
 // UpdateProgress 更新下载进度
@@ -1407,6 +1485,40 @@ func (dt *downloadTracker) ListByDevice(vehicleID string) []*DownloadStatus {
 		}
 	}
 	return result
+}
+
+// StartCleanup 启动定期清理 goroutine，清理过期下载任务防止内存泄漏
+// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: downloadTracker 无淘汰机制修复
+// 每 24 小时清理一次，保留 7 天内的 task
+func (dt *downloadTracker) StartCleanup(ctx context.Context) {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			dt.cleanupExpired(7 * 24 * time.Hour)
+		}
+	}
+}
+
+// cleanupExpired 清理超过 maxAge 的下载任务
+func (dt *downloadTracker) cleanupExpired(maxAge time.Duration) {
+	cutoff := time.Now().Add(-maxAge)
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	for id, task := range dt.tasks {
+		if task.UpdatedAt.Before(cutoff) {
+			delete(dt.tasks, id)
+			if ids, ok := dt.byDevice[task.VehicleID]; ok {
+				delete(ids, id)
+				if len(ids) == 0 {
+					delete(dt.byDevice, task.VehicleID)
+				}
+			}
+		}
+	}
 }
 
 // DownloadProgress godoc
@@ -1483,7 +1595,8 @@ func (h *MediaHandler) PlaybackControl(c *gin.Context) {
 		Speed:        byte(req.Speed),
 	}
 	if err := h.commandSender.SendToDevice(req.VehicleID, jt1078.MsgIDPlaybackControl, ctrlReq); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+		h.logger.Warn("playback control send failed", zap.String("vehicle_id", req.VehicleID), zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "failed to send playback control to terminal"})
 		return
 	}
 	h.logger.Info("playback control sent",

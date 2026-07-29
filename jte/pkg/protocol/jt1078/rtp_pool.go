@@ -1,3 +1,4 @@
+// FIXED: [P2] rtp_pool.go net.Dial TCP 缺少拨号超时，ZLMediaKit 无响应时永久阻塞 [2026-07-17]
 package jt1078
 
 // AUTO-FIX-2026-07-02 [P1]: RTP 转发长连接池
@@ -14,6 +15,7 @@ package jt1078
 
 import (
 	"container/list"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -22,6 +24,10 @@ import (
 
 	"go.uber.org/zap"
 )
+
+// ErrPoolFull 连接池已满且所有连接均为活跃状态，无法淘汰。
+// FIXED-2026-07-22 [P1]: LRU 淘汰不再中断正在传输的视频流。
+var ErrPoolFull = errors.New("rtp conn pool full: all connections are active")
 
 // RTPConnPool RTP 转发长连接池，统一管理 UDP/TCP 连接复用。
 type RTPConnPool struct {
@@ -91,8 +97,18 @@ func NewRTPConnPool(zlmAddr string, idleTimeout time.Duration, maxConns int, log
 }
 
 // StartSweep 启动后台空闲扫描协程（每 30 秒扫描一次）。
+// FIXED: [P1] sweepLoop goroutine 缺少 recover()，panic 会扩散至整个进程 [2026-07-17]
 func (p *RTPConnPool) StartSweep() {
-	go p.sweepLoop()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				p.logger.Error("rtp pool sweepLoop panic recovered",
+					zap.Any("panic", r),
+					zap.Stack("stack"))
+			}
+		}()
+		p.sweepLoop()
+	}()
 }
 
 // Stop 关闭池中所有连接并停止后台扫描。
@@ -151,7 +167,12 @@ func (p *RTPConnPool) GetUDP(port int) (*net.UDPConn, error) {
 	}
 	// 仅在真正创建新连接时计 miss
 	p.misses.Add(1)
-	p.evictIfNeededLocked(1)
+	// FIXED-2026-07-22 [P1]: evictIfNeededLocked 可能返回 ErrPoolFull
+	if err := p.evictIfNeededLocked(1); err != nil {
+		conn.Close()
+		p.misses.Add(-1) // 回退 miss 计数
+		return nil, err
+	}
 	p.udpConns[port] = &pooledUDPEntry{conn: conn}
 	p.udpLastActive[port] = time.Now()
 	p.touchLRU("udp", port)
@@ -173,7 +194,8 @@ func (p *RTPConnPool) GetTCP(port int) (net.Conn, error) {
 	p.mu.Unlock()
 
 	addr := net.JoinHostPort(p.zlmAddr, fmt.Sprintf("%d", port))
-	conn, err := net.Dial("tcp", addr)
+	// FIXED: [P2] 添加 5s 拨号超时，防止 ZLMediaKit 无响应时永久阻塞 [2026-07-17]
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("dial tcp %s: %w", addr, err)
 	}
@@ -190,7 +212,12 @@ func (p *RTPConnPool) GetTCP(port int) (net.Conn, error) {
 	}
 	// 仅在真正创建新连接时计 miss
 	p.misses.Add(1)
-	p.evictIfNeededLocked(1)
+	// FIXED-2026-07-22 [P1]: evictIfNeededLocked 可能返回 ErrPoolFull
+	if err := p.evictIfNeededLocked(1); err != nil {
+		conn.Close()
+		p.misses.Add(-1) // 回退 miss 计数
+		return nil, err
+	}
 	p.tcpConns[port] = &pooledTCPEntry{conn: conn}
 	p.tcpLastActive[port] = time.Now()
 	p.touchLRU("tcp", port)
@@ -316,17 +343,34 @@ func (p *RTPConnPool) sweepIdle() {
 
 // evictIfNeededLocked 当连接总数达到上限时，按 LRU 淘汰最久未用连接。
 // reserved: 本次将要新增的连接数，需为淘汰预留空间。
-func (p *RTPConnPool) evictIfNeededLocked(reserved int) {
+// FIXED-2026-07-22 [P1]: 增加连接活跃度检查，最近 10 秒内有数据传输的连接不可淘汰。
+// 全部连接都活跃时返回 ErrPoolFull 而非强制淘汰。
+func (p *RTPConnPool) evictIfNeededLocked(reserved int) error {
 	if p.maxConns <= 0 {
-		return
+		return nil
 	}
+	const activeThreshold = 10 * time.Second
+	now := time.Now()
 	current := len(p.udpConns) + len(p.tcpConns)
 	for current+reserved > p.maxConns {
-		elem := p.lru.Front()
-		if elem == nil {
-			break
+		// 从 LRU 前端（最久未用）开始查找可淘汰的连接
+		var evictElem *list.Element
+		for elem := p.lru.Front(); elem != nil; elem = elem.Next() {
+			node := elem.Value.(*lruNode)
+			if !p.isConnActiveLocked(node.protocol, node.port, now, activeThreshold) {
+				evictElem = elem
+				break
+			}
 		}
-		node := elem.Value.(*lruNode)
+		if evictElem == nil {
+			// 所有连接都是活跃的，不能强制淘汰
+			p.logger.Warn("rtp pool: all connections active, cannot evict",
+				zap.Int("current", current),
+				zap.Int("max", p.maxConns),
+				zap.Int("reserved", reserved))
+			return ErrPoolFull
+		}
+		node := evictElem.Value.(*lruNode)
 		p.removeLRU(node.protocol, node.port)
 		switch node.protocol {
 		case "udp":
@@ -346,6 +390,23 @@ func (p *RTPConnPool) evictIfNeededLocked(reserved int) {
 		current--
 		p.logger.Debug("rtp pool: LRU evict", zap.String("proto", node.protocol), zap.Int("port", node.port))
 	}
+	return nil
+}
+
+// isConnActiveLocked 检查指定连接是否在活跃阈值内有数据传输。调用方需持锁。
+func (p *RTPConnPool) isConnActiveLocked(protocol string, port int, now time.Time, threshold time.Duration) bool {
+	var lastActive time.Time
+	var ok bool
+	switch protocol {
+	case "udp":
+		lastActive, ok = p.udpLastActive[port]
+	case "tcp":
+		lastActive, ok = p.tcpLastActive[port]
+	}
+	if !ok {
+		return false
+	}
+	return now.Sub(lastActive) < threshold
 }
 
 // touchLRU 将连接移到 LRU 尾部（最近使用）。调用方需持锁。

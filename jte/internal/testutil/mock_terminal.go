@@ -184,7 +184,10 @@ func (m *MockTerminal) readResponse() (*jt808Message, error) {
 	}
 
 	inner := data[1 : len(data)-1]
-	unescaped := jt808.Unescape(inner)
+	unescaped, err := jt808.Unescape(inner)
+	if err != nil {
+		return nil, fmt.Errorf("unescape failed: %w", err)
+	}
 
 	codec := &jt808.JT808Codec{}
 	header, offset, err := codec.ParseHeader(unescaped)

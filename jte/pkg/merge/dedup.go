@@ -37,10 +37,12 @@ type DedupResult struct {
 
 // Deduplicator 808+809 位置数据去重器。
 type Deduplicator struct {
-	mu      sync.RWMutex
-	window  time.Duration // 去重时间窗口（同 key 在此窗口内视为重复）
-	seen    map[string]dedupEntry
-	maxSize int // seen map 最大条目数（防内存膨胀）
+	mu            sync.RWMutex
+	window        time.Duration // 去重时间窗口（同 key 在此窗口内视为重复）
+	seen          map[string]dedupEntry
+	maxSize       int           // seen map 最大条目数（防内存膨胀）
+	lastEvictTime time.Time     // [P2-2] 上次执行 evictExpired 的时间，避免每次 Check 都全表扫描
+	evictInterval time.Duration // [P2-2] 触发 evictExpired 的最小间隔
 }
 
 type dedupEntry struct {
@@ -60,9 +62,10 @@ func NewDeduplicator(window time.Duration, maxSize int) *Deduplicator {
 		maxSize = 100000
 	}
 	return &Deduplicator{
-		window:  window,
-		seen:    make(map[string]dedupEntry),
-		maxSize: maxSize,
+		window:        window,
+		seen:          make(map[string]dedupEntry),
+		maxSize:       maxSize,
+		evictInterval: window, // [P2-2] 清理间隔等于去重窗口，避免每次 Check 全表扫描
 	}
 }
 
@@ -81,8 +84,13 @@ func (d *Deduplicator) Check(loc *storage.LocationData) DedupResult {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// 先清理过期条目（懒清理）
-	d.evictExpired(loc.Time)
+	// [P2-2] 基于时间桶的清理：仅在距上次清理超过 evictInterval 时触发 evictExpired，
+	// 避免每次 Check 都全表扫描 seen map
+	now := loc.Time
+	if d.lastEvictTime.IsZero() || now.Sub(d.lastEvictTime) >= d.evictInterval {
+		d.evictExpired(now)
+		d.lastEvictTime = now
+	}
 
 	if existing, ok := d.seen[key]; ok {
 		// 找到重复：合并

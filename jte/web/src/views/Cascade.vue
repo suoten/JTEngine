@@ -261,10 +261,10 @@ let pollTimer = null
 async function loadPlatforms() {
   loading.value = true
   try {
-    const res = await cascadeApi.getPlatforms()
-    if (res.code === 0) {
-      platforms.value = res.data || []
-    }
+const res = await cascadeApi.getPlatforms()
+if (res.code === 0) {
+platforms.value = res.data?.items || res.data || []
+}
   } catch (e) {
     ElMessage.error('加载平台列表失败')
   } finally {
@@ -277,7 +277,7 @@ async function loadRules() {
   try {
     const res = await forwardRuleApi.getList()
     if (res.code === 0) {
-      forwardRules.value = res.data || []
+      forwardRules.value = Array.isArray(res.data) ? res.data : (res.data?.items || [])
     }
   } catch (e) {
     ElMessage.error('加载转发规则失败')
@@ -291,7 +291,7 @@ async function loadOnlinePlatforms() {
   try {
     const res = await cascadeApi.getOnlinePlatforms()
     if (res.code === 0) {
-      onlineSessions.value = res.data || []
+      onlineSessions.value = Array.isArray(res.data) ? res.data : (res.data?.items || [])
     }
   } catch (e) {
     // 静默处理

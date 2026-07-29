@@ -31,13 +31,22 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
+import { useRoute } from 'vue-router'
 import { deviceApi } from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
+// FIXED: [功能缺失] 从路由参数预填手机号（Devices.vue 跳转时携带） [2026-07-17]
+const route = useRoute()
 const form = ref({ phone: '', command: '', parameter: '' })
 const sending = ref(false)
 const results = ref([])
+
+onMounted(() => {
+  if (route.query.phone) {
+    form.value.phone = String(route.query.phone)
+  }
+})
 
 // AUTO-FIX-2026-06-30 [P1-7]: 指令下发二次确认（防误操作/恶意触发）
 async function sendCommand() {

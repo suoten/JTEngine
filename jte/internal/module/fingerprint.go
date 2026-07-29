@@ -8,23 +8,32 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
+)
+
+// P1-FIX: 指纹缓存——进程生命周期内指纹不变，避免每次校验都 fork 进程
+var (
+	fingerprintOnce sync.Once
+	fingerprintVal  string
+	fingerprintErr  error
 )
 
 func GetMachineFingerprint() (string, error) {
-	var data string
+	fingerprintOnce.Do(func() {
+		var data string
 
-	data += getCPUID()
-	data += getMACAddresses()
-	data += getDiskSerial()
-	data += getHostname()
-	data += getKernelVersion()
-	// AUTO-FIX-2026-06-30 [P2-9]: 增加主板序列号 + BIOS 序列号维度，
-	// 提升机器指纹唯一性，防止仅替换网卡/磁盘即绕过绑定。
-	data += getBaseboardSerial()
-	data += getBIOSSerial()
+		data += getCPUID()
+		data += getMACAddresses()
+		data += getDiskSerial()
+		data += getHostname()
+		data += getKernelVersion()
+		data += getBaseboardSerial()
+		data += getBIOSSerial()
 
-	hash := sha256.Sum256([]byte(data))
-	return fmt.Sprintf("%x", hash[:16]), nil
+		hash := sha256.Sum256([]byte(data))
+		fingerprintVal = fmt.Sprintf("%x", hash[:16])
+	})
+	return fingerprintVal, fingerprintErr
 }
 
 // getBaseboardSerial 获取主板序列号（Linux: dmidecode 不可用则降级到 /sys；

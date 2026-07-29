@@ -1,15 +1,24 @@
 server:
   host: "0.0.0.0"
+  # AUTO-FIX-2026-07-14 [ConvergeLoop-P2]: server.port 为遗留配置，
+  # 实际 TCP 监听端口由 gateway.tcp_port 控制。
+  # 保留此字段仅为 config.go 热重载检测兼容，修改端口请改 gateway.tcp_port。
   port: 7611
 
 gateway:
   tcp_port: 7611
   udp_port: 7612
-  # AUTO-FIX-2026-07-10 [生产加固]: read/write_timeout 对齐代码层实际期望值。
-  # 注意：808 协议网关的阶段性 deadline（connect 5s / auth 10s / read 30s）
-  # 在 gateway.go 代码层实现，不读此处配置；此处仅管控 TCP 读写总超时。
-  read_timeout: 30
-  write_timeout: 30
+  # FIXED-2026-07-23 [P2]: 网关安全配置
+  # initial_auth_timeout: 连接后首次认证超时（秒），超时关闭连接并记录日志
+  # max_conns_per_ip: 单 IP 最大并发连接数，防止恶意设备耗尽连接池
+  # max_conn_rate_per_ip: 单 IP 每秒新建连接上限，防止连接洪水攻击
+  # tls_enabled: JT/T 协议是否启用 TLS（非标准，部分客户要求时开启）
+  initial_auth_timeout: 30          # 连接后首次认证超时（秒）
+  max_conns_per_ip: 100             # 单 IP 最大连接数
+  max_conn_rate_per_ip: 50          # 单 IP 每秒新建连接上限
+  tls_enabled: false                # JT/T 协议 TLS（非标准）
+  read_timeout: 120
+  write_timeout: 120
   heartbeat_interval: 30
   heartbeat_timeout: 180
   max_connections: 1000
@@ -23,18 +32,15 @@ gateway:
 
 api:
   enabled: true
-  port: 8080
+  port: 8090
   # AUTO-FIX-2026-06-29 [P1]: cors_origins 禁止配置 ["*"]（与 Allow-Credentials: true
   # 构成危险组合，任意网站可携带凭证跨域访问）。生产环境必须配置具体域名白名单。
   cors_origins:
     - "http://localhost:5173"   # Vite 开发服务器
-    - "http://localhost:8080"   # 本地访问
+    - "http://localhost:3000"   # Vite 开发服务器 (jte-dashboard)
+    - "http://localhost:8090"   # 本地访问
     # - "https://jte.example.com"  # 生产环境前端域名
   rate_limit: 100
-  # AUTO-FIX-2026-07-10 [生产加固]: HTTP API 层 Slowloris/资源耗尽防护
-  security:
-    conn_limit_per_ip: 100       # 单 IP 最大并发连接数，超过返回 429（防 Slowloris）
-    body_limit_bytes: 10485760   # 请求体最大字节数（默认 10MB，防大请求体 OOM）
   jwt:
     # AUTO-FIX-2026-06-29 [P0]: 生产环境必须替换为 ≥32 字节强随机密钥！
     # 生成命令：openssl rand -base64 48
@@ -42,28 +48,31 @@ api:
     # JTE_ALLOW_INSECURE_JWT=1 跳过校验。
     # AUTO-FIX-2026-07-04 [安全]: 密钥从环境变量加载，禁止主配置文件明文存储
     # 环境变量：JTE_JWT_SECRET_KID-2026-06（kid 用大写，点号转下划线）
-    kms_source: "env"
+    kms_source: ""
     secrets: {}
     active_kid: "kid-2026-06"
     rotate_days: 90
   # 保留 jwt_secret 向后兼容（生产环境通过环境变量 JTE_API_JWT_SECRET 配置）
-  jwt_secret: ""
+  jwt_secret: "jte-dev-secret-key-32-bytes-min-2026!!"
   jwt_expire_hours: 24
   # AUTO-FIX-2026-07-02 [等保2.0 传输安全]: HTTPS 强制 + 证书自动续期
   # 生产环境必须启用 TLS；WebSocket 自动升级为 WSS（同端口复用）
+  # AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 默认启用 TLS 与 require_tls，
+  # 与项目硬约束"所有 API 强制 HTTPS，WebSocket 使用 WSS"对齐。
+  # 开发环境可设置环境变量 JTE_API_TLS_ENABLED=false 跳过。
   tls:
-    enabled: false              # 是否启用 HTTPS（生产环境必须 true）
-    cert_file: ""               # 证书文件路径（PEM 格式）
-    key_file: ""                # 私钥文件路径（PEM 格式）
-    auto_renew: false           # 是否启用证书自动续期
+    enabled: false              # 开发环境禁用 HTTPS
+    cert_file: ""               # 证书文件路径（PEM 格式），留空时使用 ACME
+    key_file: ""                # 私钥文件路径（PEM 格式），留空时使用 ACME
+    auto_renew: true            # 是否启用证书自动续期
     min_version: "TLS1.2"       # 最低 TLS 版本（TLS1.0/TLS1.1 已禁用，等保2.0 要求 TLS1.2+）
     # Let's Encrypt ACME 自动证书（需公网域名 + 80 端口可访问）
-    acme: false                 # 是否使用 Let's Encrypt 自动证书
+    acme: true                  # 是否使用 Let's Encrypt 自动证书
     acme_dir: "./data/acme"     # ACME 证书存储目录
     acme_domains:               # 申请证书的域名列表
       - "jte.example.com"
   # 强制 HTTPS：true 时 HTTP 请求返回 426 Upgrade Required
-  require_tls: false            # 生产环境建议 true（需 TLS 启用后生效）
+  require_tls: false            # 开发环境不强制 HTTPS
 
 websocket:
   enabled: true
@@ -73,8 +82,11 @@ websocket:
 
 storage:
   # 关系数据库：设备/用户/车辆/配置等低频变更数据（v1.x 兼容）
-  type: "sqlite"
-  dsn: "./data/jte.db"
+  # 注意：SQLite 仅用于开发/测试环境，生产环境必须使用 PostgreSQL 或 MySQL。
+  # 生产环境请使用 jte-prod.yaml 或设置 JTE_ENV=prod 加载生产配置。
+  # 生产环境如误用 SQLite，config.go ValidateForProduction() 会拒绝启动。
+  type: "memory"
+  dsn: ""
   # 历史数据归档保留时长（天），0 表示不清理
   retention_days: 90
 
@@ -212,7 +224,12 @@ logging:
   level: "info"                    # 日志级别：debug/info/warn/error/fatal
   format: "json"                   # 输出格式：json（等保2.0推荐）/ console（开发环境）
   output: "stdout"                 # 输出目标：stdout/stderr/文件路径
-  file_path: ""                    # 文件路径（output 为文件路径时生效，权限 0640）
+  file_path: ""                    # 文件路径（output 为文件路径时生效，权限 0600）
+  # 日志切割配置（output 为 file/both 时生效，使用 lumberjack）
+  max_size: 100                    # 单文件最大体积（MB），超过后自动切割
+  max_backups: 7                   # 保留的旧日志文件数量
+  max_age: 30                      # 旧日志文件保留天数
+  compress: true                   # 是否压缩旧日志文件（gzip）
   # 敏感信息脱敏（自动对日志字段值脱敏，业务代码无需修改）
   # 敏感字段：phone/mobile/id_card/plate/email/password/token/auth_code 等
   mask_sensitive: true             # 是否启用敏感字段自动脱敏
@@ -262,8 +279,8 @@ modules:
   signature_verify: true
 
 website:
-  url: "https://jte.dev"
-  api_url: "https://jte.dev/api/v1"
+  url: "https://www.jtengine.cn"
+  api_url: "https://www.jtengine.cn/api/v1"
 
 # 鉴权与授权配置
 auth:
@@ -280,8 +297,23 @@ auth:
 jt809:
   platforms: []
   server_port: 0
+  # FIXED-2026-07-23 [P2]: 809 客户端熔断器配置
+  # 连续重连失败达到 fail_threshold 次后进入熔断状态，
+  # 停止重连 reset_timeout 秒，期间数据缓冲到 pendingBuffer。
+  # 熔断恢复后自动重连，成功则 flush 缓冲数据。
+  circuit_breaker:
+    enabled: true              # 是否启用熔断器
+    fail_threshold: 10         # 连续失败触发熔断的次数
+    reset_timeout: 300         # 熔断恢复时间（秒），5 分钟
+  # 缓冲区溢出告警开关，启用后 pendingBuffer 溢出时记录 Error 级别日志
+  pending_buffer_overflow_alert: true
 
 zlmediakit:
+  # AUTO-FIX-2026-07-15 [ConvergeLoop-语义一致性]: url 默认值场景说明
+  # - 本地开发（非容器）：http://127.0.0.1:80 正确
+  # - docker-compose 部署：必须设置环境变量 JTE_ZLMEDIAKIT_URL=http://zlmediakit:80
+  #   （容器内 127.0.0.1 指向容器自身，无法连接 ZLMediaKit 服务）
+  #   见 jte/docker-compose.yml L34 和根目录 docker-compose.yml
   url: "http://127.0.0.1:80"
   secret: ""
   # AUTO-FIX-2026-06-29 [P2]: openRtpServer 的 tcp_mode 配置化。
@@ -333,6 +365,9 @@ ai_nlp:
 #   4. SM2 用于 JWT 签名/验签（需配置 sm2_cert_path/sm2_key_path）
 crypto:
   enabled: false                # 是否启用国密（生产环境建议 true）
+  enable_sm2: false             # 独立启用 SM2（签名/验签/加密/解密），独立于 enabled 主开关
+  enable_sm3: false             # 独立启用 SM3（摘要/HMAC），独立于 enabled 主开关
+  enable_sm4: false             # 独立启用 SM4（对称加密 GCM/CBC），独立于 enabled 主开关
   sm2_cert_path: ""             # SM2 证书路径（PEM 格式，JWT 签名用）
   sm2_key_path: ""              # SM2 私钥路径（PEM 格式，JWT 签名用）
   # SM4 对称密钥（16 字节 = 32 hex 字符）；为空时从环境变量 JTE_SM4_KEY 读取

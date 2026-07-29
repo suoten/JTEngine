@@ -288,6 +288,46 @@ func (t *PTZLatencyTracker) GetAverageLatency() float64 {
 	return float64(total.Milliseconds()) / float64(len(t.history))
 }
 
+// CheckPTZTimeout 检查超时未应答的 PTZ 请求，标记为失败并从 pending 移除。
+// INDUSTRIAL-FIX-2026-07-25-R31 [P2]: PTZLatencyTracker 缺少超时清理机制，
+// 设备离线或网络异常时 pending 条目永久残留，造成内存泄漏。
+// 与 KeyFrameRecoveryTracker.CheckTimeout 保持一致的清理策略。
+// timeout 为超时阈值（建议 10 秒，PTZ 应答通常 < 2s）。
+func (t *PTZLatencyTracker) CheckPTZTimeout(timeout time.Duration) []PTZLatencyResult {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := time.Now()
+	var timedOut []PTZLatencyResult
+	for seqNum, req := range t.pending {
+		if now.Sub(req.sentAt) >= timeout {
+			result := PTZLatencyResult{
+				StreamID:     req.streamID,
+				Phone:        req.phone,
+				LogicChannel: req.channel,
+				Direction:    req.direction,
+				Speed:        req.speed,
+				SentAt:       req.sentAt,
+				AckAt:        now,
+				Latency:      now.Sub(req.sentAt),
+				Within2s:     false,
+			}
+			timedOut = append(timedOut, result)
+			t.history = append(t.history, result)
+			if len(t.history) > 100 {
+				t.history = t.history[len(t.history)-100:]
+			}
+			delete(t.pending, seqNum)
+
+			t.logger.Warn("ptz latency timeout, no ack received",
+				zap.String("stream_id", req.streamID),
+				zap.Uint16("seq_num", seqNum),
+				zap.Duration("elapsed", result.Latency))
+		}
+	}
+	return timedOut
+}
+
 // ===================================================================
 // 验收标准4: 弱网自适应 - 自动恢复
 // 当网络恢复后（连续3秒丢包率<2%且码率>200kbps），自动切回主码流

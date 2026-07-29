@@ -72,7 +72,10 @@ func decodeFrame(t *testing.T, frame []byte) (*protocol.MessageHeader, protocol.
 	// StripDelimiter 去掉首尾 0x7e
 	escaped := jt808.StripDelimiter(frame)
 	// 反转义得到原始 payload = header + body + checksum
-	raw := jt808.Unescape(escaped)
+	raw, err := jt808.Unescape(escaped)
+	if err != nil {
+		t.Fatalf("Unescape failed: %v", err)
+	}
 	if len(raw) < 13 { // 12B header + 至少 1B body 或仅校验码
 		t.Fatalf("decoded payload too short: %d bytes (% x)", len(raw), raw)
 	}

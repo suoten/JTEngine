@@ -36,11 +36,13 @@ func newTestCfg(id, user string) *config.JT809PlatformConfig {
 // buildTestFrame 构建一个完整的 809 帧（0x5B + escaped(header+body+crc) + 0x5D）。
 // 供测试直接使用，不依赖 JT809Client.buildMessage（需要持锁）。
 func buildTestFrame(msgID uint16, seqNum uint16, body []byte) []byte {
-	header := make([]byte, jt809HeaderLen)
-	binary.BigEndian.PutUint16(header[0:2], msgID)
-	bodyAttr := uint16(len(body)) & 0x03FF
-	binary.BigEndian.PutUint16(header[2:4], bodyAttr)
-	binary.BigEndian.PutUint16(header[16:18], seqNum)
+	// AUTO-FIX-2026-07-16: 使用 JT/T 809-2019 标准22字节帧头
+	header := make([]byte, jt809HeaderLen) // 22 bytes
+	binary.BigEndian.PutUint16(header[0:2], uint16(jt809HeaderLen+len(body))) // 报文长度
+	binary.BigEndian.PutUint16(header[2:4], seqNum)                            // 报文序号
+	header[4] = 0x00                                                          // 加密方式
+	header[5] = 0x01                                                          // 车牌颜色
+	binary.BigEndian.PutUint16(header[18:20], msgID)                           // 子业务类型
 	payload := append(header, body...)
 	crc := crc32.ChecksumIEEE(payload)
 	crcBytes := make([]byte, 4)
@@ -308,8 +310,11 @@ func TestHandleUpstreamMessage_0x1002_ClearsAck(t *testing.T) {
 
 	// 构造 0x1002 应答（SN=42, result=0）
 	data := make([]byte, jt809HeaderLen+1+4)
-	binary.BigEndian.PutUint16(data[0:2], 0x1002)
-	binary.BigEndian.PutUint16(data[16:18], 42)
+	binary.BigEndian.PutUint16(data[0:2], uint16(jt809HeaderLen+1)) // 报文长度
+	binary.BigEndian.PutUint16(data[2:4], 42)                       // 报文序号
+	data[4] = 0x00                                                // 加密方式
+	data[5] = 0x01                                                // 车牌颜色
+	binary.BigEndian.PutUint16(data[18:20], 0x1002)               // 子业务类型
 	data[jt809HeaderLen] = 0x00
 	crc := crc32.ChecksumIEEE(data[:jt809HeaderLen+1])
 	binary.BigEndian.PutUint32(data[jt809HeaderLen+1:], crc)
@@ -334,8 +339,11 @@ func TestHandleUpstreamMessage_0x1007_ClearsAckAndUpdatesHeartbeat(t *testing.T)
 
 	// 构造 0x1007 应答（SN=10, 无 body）
 	data := make([]byte, jt809HeaderLen+4)
-	binary.BigEndian.PutUint16(data[0:2], 0x1007)
-	binary.BigEndian.PutUint16(data[16:18], 10)
+	binary.BigEndian.PutUint16(data[0:2], uint16(jt809HeaderLen)) // 报文长度
+	binary.BigEndian.PutUint16(data[2:4], 10)                    // 报文序号
+	data[4] = 0x00                                               // 加密方式
+	data[5] = 0x01                                               // 车牌颜色
+	binary.BigEndian.PutUint16(data[18:20], 0x1007)              // 子业务类型
 	crc := crc32.ChecksumIEEE(data[:jt809HeaderLen])
 	binary.BigEndian.PutUint32(data[jt809HeaderLen:], crc)
 
@@ -462,11 +470,11 @@ func TestDownlinkLogin_Handles9001(t *testing.T) {
 	if respFrame[0] != 0x5B || respFrame[len(respFrame)-1] != 0x5D {
 		t.Fatal("response not wrapped with 0x5B/0x5D")
 	}
-	inner := unescape809(respFrame[1 : len(respFrame)-1])
+	inner, _ := unescape809(respFrame[1 : len(respFrame)-1])
 	if len(inner) < 2 {
 		t.Fatal("response too short")
 	}
-	respMsgID := binary.BigEndian.Uint16(inner[0:2])
+	respMsgID := binary.BigEndian.Uint16(inner[18:20])
 	if respMsgID != 0x9002 {
 		t.Fatalf("expected 0x9002, got 0x%04X", respMsgID)
 	}
@@ -524,7 +532,7 @@ func TestDownlinkLogin_RejectedCredentials(t *testing.T) {
 		t.Fatalf("read response: %v", err)
 	}
 
-	inner := unescape809(resp[1 : n-1])
+	inner, _ := unescape809(resp[1 : n-1])
 	if len(inner) > jt809HeaderLen {
 		result := inner[jt809HeaderLen]
 		if result != 0x01 {
@@ -573,14 +581,14 @@ func TestDownlinkKeepalive_Handles9005(t *testing.T) {
 		t.Fatalf("read response: %v", err)
 	}
 
-	inner := unescape809(resp[1 : n-1])
-	respMsgID := binary.BigEndian.Uint16(inner[0:2])
+	inner, _ := unescape809(resp[1 : n-1])
+	respMsgID := binary.BigEndian.Uint16(inner[18:20])
 	if respMsgID != 0x9006 {
 		t.Fatalf("expected 0x9006, got 0x%04X", respMsgID)
 	}
 
 	// 验证 SN 回显
-	respSeq := binary.BigEndian.Uint16(inner[16:18])
+	respSeq := binary.BigEndian.Uint16(inner[2:4])
 	if respSeq != 5 {
 		t.Fatalf("response SN = %d, want 5", respSeq)
 	}
@@ -633,8 +641,8 @@ func TestDownlinkDisconnect_Handles9003(t *testing.T) {
 		t.Fatalf("read response: %v", err)
 	}
 
-	inner := unescape809(resp[1 : n-1])
-	respMsgID := binary.BigEndian.Uint16(inner[0:2])
+	inner, _ := unescape809(resp[1 : n-1])
+	respMsgID := binary.BigEndian.Uint16(inner[18:20])
 	if respMsgID != 0x9004 {
 		t.Fatalf("expected 0x9004, got 0x%04X", respMsgID)
 	}
@@ -738,17 +746,17 @@ func TestSendVideoData_GBKEncoding(t *testing.T) {
 	}
 
 	inner := frame[1 : len(frame)-1]
-	unescaped := unescape809(inner)
+	unescaped, _ := unescape809(inner)
 	if len(unescaped) < jt809HeaderLen+4 {
 		t.Fatalf("unescaped too short: %d", len(unescaped))
 	}
-	msgID := binary.BigEndian.Uint16(unescaped[0:2])
+	msgID := binary.BigEndian.Uint16(unescaped[18:20])
 	if msgID != 0x1B00 {
 		t.Fatalf("expected msgID 0x1B00, got 0x%04X", msgID)
 	}
 
-	bodyAttr := binary.BigEndian.Uint16(unescaped[2:4])
-	bodyLen := int(bodyAttr & 0x03FF)
+	msgLen := int(binary.BigEndian.Uint16(unescaped[0:2]))
+	bodyLen := msgLen - jt809HeaderLen
 	bodyBytes := unescaped[jt809HeaderLen : jt809HeaderLen+bodyLen]
 
 	// 验证 GBK 编码
@@ -822,8 +830,11 @@ func TestIntegration_ACKFlow_EndToEnd(t *testing.T) {
 
 	// 模拟：上级平台回 0x1002（SN=1）
 	respData := make([]byte, jt809HeaderLen+1+4)
-	binary.BigEndian.PutUint16(respData[0:2], 0x1002)
-	binary.BigEndian.PutUint16(respData[16:18], 1)
+	binary.BigEndian.PutUint16(respData[0:2], uint16(jt809HeaderLen+1)) // 报文长度
+	binary.BigEndian.PutUint16(respData[2:4], 1)                       // 报文序号
+	respData[4] = 0x00                                                // 加密方式
+	respData[5] = 0x01                                                // 车牌颜色
+	binary.BigEndian.PutUint16(respData[18:20], 0x1002)               // 子业务类型
 	respData[jt809HeaderLen] = 0x00
 	crc := crc32.ChecksumIEEE(respData[:jt809HeaderLen+1])
 	binary.BigEndian.PutUint32(respData[jt809HeaderLen+1:], crc)
@@ -855,8 +866,11 @@ func TestIntegration_KeepaliveACKFlow_EndToEnd(t *testing.T) {
 
 	// 模拟：上级平台回 0x1007（SN=5）
 	respData := make([]byte, jt809HeaderLen+4)
-	binary.BigEndian.PutUint16(respData[0:2], 0x1007)
-	binary.BigEndian.PutUint16(respData[16:18], 5)
+	binary.BigEndian.PutUint16(respData[0:2], uint16(jt809HeaderLen)) // 报文长度
+	binary.BigEndian.PutUint16(respData[2:4], 5)                    // 报文序号
+	respData[4] = 0x00                                             // 加密方式
+	respData[5] = 0x01                                             // 车牌颜色
+	binary.BigEndian.PutUint16(respData[18:20], 0x1007)            // 子业务类型
 	crc := crc32.ChecksumIEEE(respData[:jt809HeaderLen])
 	binary.BigEndian.PutUint32(respData[jt809HeaderLen:], crc)
 

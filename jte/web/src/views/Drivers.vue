@@ -159,6 +159,7 @@ async function fetchList() {
     list.value = (Array.isArray(data) ? data : (data.items || [])).map(normalize)
   } catch (e) {
     list.value = []
+    ElMessage.error('加载驾驶员列表失败，请检查网络或稍后重试')
   } finally {
     loading.value = false
   }

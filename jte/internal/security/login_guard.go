@@ -38,6 +38,10 @@ type LoginGuard struct {
 	lockoutDuration time.Duration // 锁定时长
 	historyLimit    int           // 登录历史保留条数
 	geoIPProvider   GeoIPProvider // IP 地理位置查询（可选）
+
+	// FIXED: [P1-1] 四张 Map 无限增长内存泄漏——增加后台清理协程
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // loginFailureState 登录失败状态
@@ -83,19 +87,200 @@ func DefaultLoginGuardConfig() LoginGuardConfig {
 }
 
 // NewLoginGuard 创建登录守卫
+// FIXED: [P1-1] 自动启动后台清理协程，定期清除过期的失败记录、历史记录和冷用户数据
 func NewLoginGuard(cfg LoginGuardConfig, logger *zap.Logger) *LoginGuard {
 	if cfg.MaxFailures <= 0 {
 		cfg = DefaultLoginGuardConfig()
 	}
-	return &LoginGuard{
-		loginFailures: make(map[string]*loginFailureState),
-		loginHistory:  make(map[string][]*LoginRecord),
-		knownDevices:  make(map[string]map[string]bool),
-		knownIPs:      make(map[string]map[string]bool),
-		logger:        logger,
-		maxFailures:   cfg.MaxFailures,
+	g := &LoginGuard{
+		loginFailures:   make(map[string]*loginFailureState),
+		loginHistory:    make(map[string][]*LoginRecord),
+		knownDevices:    make(map[string]map[string]bool),
+		knownIPs:        make(map[string]map[string]bool),
+		logger:          logger,
+		maxFailures:     cfg.MaxFailures,
 		lockoutDuration: cfg.LockoutDuration,
-		historyLimit:  cfg.HistoryLimit,
+		historyLimit:    cfg.HistoryLimit,
+		stopCh:          make(chan struct{}),
+	}
+	// R57-FIX [P1]: 添加 recover 防止 cleanupLoop panic 导致登录安全守卫静默死亡，
+	// 四张 Map 将无限增长导致内存泄漏
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if g.logger != nil {
+					g.logger.Error("login_guard cleanupLoop panic recovered",
+						zap.Any("panic", r), zap.Stack("stack"))
+				}
+			}
+		}()
+		g.cleanupLoop()
+	}()
+	return g
+}
+
+// Stop 停止后台清理协程（幂等，供 api.Server.Stop 调用）
+func (g *LoginGuard) Stop() {
+	g.stopOnce.Do(func() { close(g.stopCh) })
+}
+
+// cleanupLoop 后台定期清理过期的登录数据，防止四张 Map 无限增长
+// - loginFailures: 清理锁定已过期的条目（lockedUntil 已过且后续未再登录）
+// - loginHistory: 清理超过 30 天的记录
+// - knownDevices/knownIPs: 清理超过 90 天未活跃的用户
+const (
+	loginGuardCleanupInterval = 10 * time.Minute
+	loginHistoryTTL           = 30 * 24 * time.Hour // 30 天
+	knownDeviceTTL            = 90 * 24 * time.Hour // 90 天
+	// [P0-3] 分批清理上限：每次 cleanupExpired 最多处理 cleanupBatchSize 条，
+	// 剩余下次 cleanupLoop tick 继续处理，避免长时间持锁阻塞登录。
+	cleanupBatchSize = 1000
+)
+
+func (g *LoginGuard) cleanupLoop() {
+	ticker := time.NewTicker(loginGuardCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-g.stopCh:
+			return
+		case <-ticker.C:
+			// R62-FIX [P2]: 将 recover 移到循环内部，确保单次 cleanupExpired panic
+			// 不会导致清理协程退出。原实现 recover 在 goroutine 级别，
+			// panic 后协程退出，四张 Map 永不被清理，内存泄漏。
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						if g.logger != nil {
+							g.logger.Error("loginGuard cleanupExpired panic recovered",
+								zap.Any("panic", r),
+								zap.Stack("stack"))
+						}
+					}
+				}()
+				g.cleanupExpired()
+			}()
+		}
+	}
+}
+
+// cleanupExpired [P0-3] 两阶段清理，避免长时间持写锁阻塞登录请求：
+//
+//	阶段 1：RLock 快照所有待清理 keys 列表（读锁，不阻塞 CheckLogin 等读操作）
+//	阶段 2：逐条 Lock 删除单个条目（写锁仅持有极短时间，每次删除后立即释放）
+//
+// 同时引入分批上限 cleanupBatchSize，超大批量分多次 cleanupLoop tick 处理。
+func (g *LoginGuard) cleanupExpired() {
+	now := time.Now()
+
+	// ── 阶段 1：RLock 快照待清理 keys ──
+
+	// 1a. 快照 loginFailures 待删除 keys
+	type failKey struct {
+		username string
+	}
+	var failToDelete []failKey
+	g.mu.RLock()
+	for username, state := range g.loginFailures {
+		if now.After(state.lockedUntil) && now.Sub(state.lastFailure) > time.Hour {
+			failToDelete = append(failToDelete, failKey{username})
+			if len(failToDelete) >= cleanupBatchSize {
+				break
+			}
+		}
+	}
+	g.mu.RUnlock()
+
+	// 1b. 快照 loginHistory 待清理条目（过期的 username + 需要裁剪的历史）
+	type historyKey struct {
+		username   string
+		cutoffIdx  int // 需要裁剪的起始索引（>=0 表示需要处理）
+		deleteAll  bool
+	}
+	var historyToDelete []historyKey
+	historyCutoff := now.Add(-loginHistoryTTL)
+	g.mu.RLock()
+	for username, history := range g.loginHistory {
+		if len(history) == 0 {
+			historyToDelete = append(historyToDelete, historyKey{username: username, deleteAll: true})
+			continue
+		}
+		cutoffIdx := 0
+		for i, rec := range history {
+			if rec.Timestamp.After(historyCutoff) {
+				cutoffIdx = i
+				break
+			}
+			cutoffIdx = i + 1
+		}
+		if cutoffIdx >= len(history) {
+			historyToDelete = append(historyToDelete, historyKey{username: username, deleteAll: true})
+		} else if cutoffIdx > 0 {
+			historyToDelete = append(historyToDelete, historyKey{username: username, cutoffIdx: cutoffIdx})
+		}
+	}
+	g.mu.RUnlock()
+
+	// 1c. 快照 knownDevices/knownIPs 待清理 keys
+	type deviceKey struct {
+		username string
+	}
+	var deviceToDelete []deviceKey
+	deviceCutoff := now.Add(-knownDeviceTTL)
+	g.mu.RLock()
+	for username := range g.knownDevices {
+		history := g.loginHistory[username]
+		if len(history) == 0 {
+			deviceToDelete = append(deviceToDelete, deviceKey{username})
+			continue
+		}
+		lastActive := history[len(history)-1].Timestamp
+		if lastActive.Before(deviceCutoff) {
+			deviceToDelete = append(deviceToDelete, deviceKey{username})
+		}
+	}
+	// knownIPs 中不存在于 knownDevices 的残留
+	var ipResidueToDelete []string
+	for username := range g.knownIPs {
+		if _, exists := g.knownDevices[username]; !exists {
+			ipResidueToDelete = append(ipResidueToDelete, username)
+		}
+	}
+	g.mu.RUnlock()
+
+	// ── 阶段 2：逐条 Lock 删除（每次仅持锁极短时间） ──
+
+	// 2a. 删除 loginFailures
+	for _, fk := range failToDelete {
+		g.mu.Lock()
+		delete(g.loginFailures, fk.username)
+		g.mu.Unlock()
+	}
+
+	// 2b. 删除/裁剪 loginHistory
+	for _, hk := range historyToDelete {
+		g.mu.Lock()
+		if hk.deleteAll {
+			delete(g.loginHistory, hk.username)
+		} else if history, ok := g.loginHistory[hk.username]; ok && hk.cutoffIdx < len(history) {
+			g.loginHistory[hk.username] = history[hk.cutoffIdx:]
+		}
+		g.mu.Unlock()
+	}
+
+	// 2c. 删除 knownDevices/knownIPs
+	for _, dk := range deviceToDelete {
+		g.mu.Lock()
+		delete(g.knownDevices, dk.username)
+		delete(g.knownIPs, dk.username)
+		g.mu.Unlock()
+	}
+
+	// 2d. 删除 knownIPs 残留
+	for _, username := range ipResidueToDelete {
+		g.mu.Lock()
+		delete(g.knownIPs, username)
+		g.mu.Unlock()
 	}
 }
 
@@ -268,6 +453,7 @@ func (g *LoginGuard) detectAnomalyLocked(username, ip, fingerprint string, recor
 }
 
 // GetLoginHistory 获取用户登录历史
+// INDUSTRIAL-FIX-2026-07-25-R12 [P2]: 返回深拷贝而非内部指针，防止外部修改破坏内部状态。
 func (g *LoginGuard) GetLoginHistory(username string, limit int) []*LoginRecord {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -279,10 +465,11 @@ func (g *LoginGuard) GetLoginHistory(username string, limit int) []*LoginRecord 
 	if limit <= 0 || limit > len(history) {
 		limit = len(history)
 	}
-	// 返回最近 limit 条（倒序）
+	// 返回最近 limit 条（倒序），深拷贝避免外部修改内部记录
 	result := make([]*LoginRecord, 0, limit)
 	for i := len(history) - 1; i >= 0 && len(result) < limit; i-- {
-		result = append(result, history[i])
+		cp := *history[i]
+		result = append(result, &cp)
 	}
 	return result
 }

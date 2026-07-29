@@ -8,6 +8,7 @@
 package audit
 
 import (
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -137,20 +138,32 @@ func (a *AuditLogger) SetHMACKey(keyHex string) error {
 }
 
 // recoverChainState 从现有日志文件恢复链式哈希状态（重启后继续链式签名）
+// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 修复死代码 + 从后向前查找有效日志。
+// strings.Split 永远返回 >=1 长度，原 len(lines)==0 检查永远为 false。
 func (a *AuditLogger) recoverChainState() {
 	data, err := os.ReadFile(a.filePath)
 	if err != nil {
 		return
 	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) == 0 {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
 		return
 	}
-	// 取最后一条日志的 hash 作为 prevHash
-	lastLine := lines[len(lines)-1]
-	var entry AuditEntry
-	if err := json.Unmarshal([]byte(lastLine), &entry); err == nil && entry.Hash != "" {
-		a.prevHash = entry.Hash
+	lines := strings.Split(trimmed, "\n")
+	// 从后向前查找最后一条有效日志（跳过可能的空行/损坏行）
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		var entry AuditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err == nil && entry.Hash != "" {
+			a.prevHash = entry.Hash
+			return
+		}
+		a.logger.Warn("audit log chain may be broken: failed to parse last valid entry",
+			zap.String("file", a.filePath),
+			zap.Int("line", i+1))
 	}
 }
 
@@ -384,14 +397,16 @@ func (a *AuditLogger) VerifyChain() (int, error) {
 		if entry.PrevHash != expectedPrev {
 			return i, fmt.Errorf("行 %d prevHash 不匹配（链断裂）", i)
 		}
-		// 重新计算 hash 验证
+		// 重新计算 hash 验证（常量时间比较防时序攻击）
 		// 临时保存并清除 hash 字段以重算
 		savedHash := entry.Hash
 		savedPrev := a.prevHash
 		a.prevHash = entry.PrevHash
 		computedHash := a.computeHash(&entry)
 		a.prevHash = savedPrev
-		if computedHash != savedHash {
+		// FIXED [2026-07-17]: 使用 subtle.ConstantTimeCompare 替代字符串比较，
+		// 防止攻击者通过时序差异逐字节猜测哈希值。
+		if subtle.ConstantTimeCompare([]byte(computedHash), []byte(savedHash)) != 1 {
 			return i, fmt.Errorf("行 %d hash 不匹配（内容被篡改）", i)
 		}
 		expectedPrev = savedHash

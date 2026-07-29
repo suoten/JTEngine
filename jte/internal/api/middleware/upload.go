@@ -147,7 +147,13 @@ func FileUploadSecurity(cfg *UploadSecurityConfig) gin.HandlerFunc {
 
 					// MIME 检测（基于内容而非客户端声明）
 					detectedMime := detectMimeType(head)
-					if len(allowedMimeSet) > 0 && !allowedMimeSet[detectedMime] {
+					// INDUSTRIAL-FIX-2026-07-25 [P2-R32]: ZIP-based Office 格式（docx/xlsx）
+					// 的魔数为 PK\x03\x04，detectMimeType 只能返回 "application/zip"，
+					// 无法区分具体 Office 类型。此处对 docx/xlsx 扩展名放行 "application/zip"，
+					// 由后续 validateMagicNumber 做内容级校验，避免合法 DOCX/XLSX 被误拒。
+					mimeAccepted := len(allowedMimeSet) == 0 || allowedMimeSet[detectedMime] ||
+						(detectedMime == "application/zip" && (ext == "docx" || ext == "xlsx"))
+					if !mimeAccepted {
 						c.JSON(http.StatusBadRequest, gin.H{
 							"code":    400,
 							"message": fmt.Sprintf("文件类型不匹配：检测到 %s，不在允许列表中", detectedMime),
@@ -175,7 +181,9 @@ func FileUploadSecurity(cfg *UploadSecurityConfig) gin.HandlerFunc {
 							return
 						}
 						defer file.Close()
-						data, err := io.ReadAll(file)
+						// R57-FIX [P1]: 限制病毒扫描读取大小，防止超大文件导致 OOM
+						// 文件大小已通过 fileHeader.Size > cfg.MaxFileSize 校验，此处作为防御性二次保护
+						data, err := io.ReadAll(io.LimitReader(file, cfg.MaxFileSize+1))
 						if err != nil {
 							c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "文件读取失败"})
 							c.Abort()
@@ -245,7 +253,11 @@ func isText(data []byte) bool {
 			nonPrintable++
 		}
 	}
-	return nonPrintable < len(data)/10 // 允许少量控制字符
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 修复整数除法导致的短文本误判
+	// 原代码 nonPrintable < len(data)/10 在 len(data)<10 时因整数除法为 0，
+	// 导致任何含 1 个不可打印字符的短输入返回 false，单个可打印字符也返回 false。
+	// 改用乘法避免整数除法精度丢失：nonPrintable*10 < len(data)
+	return nonPrintable*10 < len(data) // 允许 10% 以下不可打印字符
 }
 
 // validateMagicNumber 校验文件魔数与扩展名是否一致（防伪造）

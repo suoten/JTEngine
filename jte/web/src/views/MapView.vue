@@ -142,8 +142,14 @@ const vehicles = ref([])
 const selectedVehicle = ref('')
 let mapInstance = null
 let markers = []
+let markersByPhone = {} // FIXED: [地图卡顿] 按 phone 索引 marker，避免全量重建 [2026-07-17]
+let markerCluster = null // FIXED: [地图性能] MarkerCluster 聚合，大量设备时避免卡顿 [2026-07-17]
 let refreshTimer = null
 let ws = null
+let wsReconnectTimer = null // FIXED: [WebSocket断连] 清理重连定时器 [2026-07-17]
+let wsReconnectCount = 0 // FIXED: [WebSocket断连] 指数退避计数 [2026-07-17]
+let manuallyClosed = false // FIXED: [WebSocket断连] 手动关闭标志 [2026-07-17]
+let wsHeartbeatTimer = null // FIXED: [WebSocket心跳] 定时发送心跳保活，防止代理超时断开 [2026-07-17]
 let mapConfig = { provider: 'tianditu', tianditu_key: '', amap_key: '', baidu_key: '' }
 
 const onlineCount = computed(() => vehicles.value.length)
@@ -177,8 +183,12 @@ async function initMap() {
 }
 
 function destroyMap() {
-  markers = []
+  clearMarkers()
+  markerCluster = null
   if (mapInstance) {
+    // 尝试销毁地图实例（不同引擎 API 不同）
+    try { mapInstance.map?.destroy?.() } catch {}
+    try { mapInstance.map?.remove?.() } catch {}
     mapInstance = null
   }
   if (mapContainer.value) {
@@ -257,18 +267,32 @@ async function loadBaidu(container) {
 function updateMarkers() {
   if (!mapInstance || !mapLoaded.value) return
 
-  clearMarkers()
-
+  // FIXED: [地图性能] 增量更新 marker，不全量 clear+readd [2026-07-17]
   const filtered = filterProtocol.value
     ? vehicles.value.filter(v => v.protocol === filterProtocol.value)
     : vehicles.value
 
+  // 收集当前应显示的 phone 集合
+  const phoneSet = new Set(filtered.map(v => v.phone))
+
+  // 移除不再显示的 marker
+  for (const phone of Object.keys(markersByPhone)) {
+    if (!phoneSet.has(phone)) {
+      removeSingleMarker(phone)
+    }
+  }
+
+  // 添加/更新 marker
   filtered.forEach(v => {
     if (v.latitude == null || v.longitude == null) return
-    addMarker(v)
+    if (markersByPhone[v.phone]) {
+      updateSingleMarker(v)
+    } else {
+      addMarker(v)
+    }
   })
 
-  if (filtered.length > 0) {
+  if (filtered.length > 0 && markers.length <= 50) {
     fitBounds(filtered)
   }
 }
@@ -286,6 +310,7 @@ function addMarker(vehicle) {
       marker.addEventListener('click', () => { selectedVehicle.value = phone })
       mapInstance.map.addOverLay(marker)
       markers.push({ type: 'tianditu', marker })
+      markersByPhone[phone] = markers[markers.length - 1] // FIXED: [地图卡顿] 索引 marker [2026-07-17]
       break
     }
     case 'amap': {
@@ -297,6 +322,7 @@ function addMarker(vehicle) {
       marker.on('click', () => { selectedVehicle.value = phone })
       mapInstance.map.add(marker)
       markers.push({ type: 'amap', marker })
+      markersByPhone[phone] = markers[markers.length - 1] // FIXED: [地图卡顿] 索引 marker [2026-07-17]
       break
     }
     case 'baidu': {
@@ -306,9 +332,56 @@ function addMarker(vehicle) {
       marker.addEventListener('click', () => { selectedVehicle.value = phone })
       mapInstance.map.addOverlay(marker)
       markers.push({ type: 'baidu', marker })
+      markersByPhone[phone] = markers[markers.length - 1] // FIXED: [地图卡顿] 索引 marker [2026-07-17]
       break
     }
   }
+}
+
+// FIXED: [地图卡顿] 更新单个 marker 位置，避免全量 clear+readd [2026-07-17]
+function updateSingleMarker(vehicle) {
+  if (!mapInstance || !mapLoaded.value) return
+  if (vehicle.latitude == null || vehicle.longitude == null) return
+
+  const existing = markersByPhone[vehicle.phone]
+  if (existing) {
+    // 更新现有 marker 位置
+    switch (mapInstance.type) {
+      case 'tianditu':
+        if (window.T) existing.marker.setLngLat(new window.T.LngLat(vehicle.longitude, vehicle.latitude))
+        break
+      case 'amap':
+        if (window.AMap) existing.marker.setPosition([vehicle.longitude, vehicle.latitude])
+        break
+      case 'baidu':
+        if (window.BMap) existing.marker.setPosition(new window.BMap.Point(vehicle.longitude, vehicle.latitude))
+        break
+    }
+  } else {
+    // 新车辆，添加 marker
+    addMarker(vehicle)
+  }
+}
+
+// FIXED: [地图性能] 移除单个 marker，不全量清理 [2026-07-17]
+function removeSingleMarker(phone) {
+  const entry = markersByPhone[phone]
+  if (!entry) return
+  try {
+    switch (entry.type) {
+      case 'tianditu':
+        mapInstance?.map?.removeOverLay(entry.marker)
+        break
+      case 'amap':
+        mapInstance?.map?.remove(entry.marker)
+        break
+      case 'baidu':
+        mapInstance?.map?.removeOverlay(entry.marker)
+        break
+    }
+  } catch {}
+  delete markersByPhone[phone]
+  markers = markers.filter(m => m !== entry)
 }
 
 function clearMarkers() {
@@ -326,6 +399,7 @@ function clearMarkers() {
     }
   })
   markers = []
+  markersByPhone = {} // FIXED: [地图卡顿] 同步清理 phone 索引 [2026-07-17]
 }
 
 function fitBounds(vehicles) {
@@ -398,16 +472,28 @@ async function fetchLocations() {
   }
 }
 
+// FIXED: [WebSocket断连] 增加 token 鉴权 + 指数退避重连 + 手动关闭标志 [2026-07-17]
 function connectWebSocket() {
+  if (manuallyClosed) return
+  
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const wsUrl = `${protocol}//${window.location.host}/ws/v1/stream`
+  const token = localStorage.getItem('jte_token') || ''
+  // FIXED: [P0] WebSocket 连接必须携带 JWT token，否则后端返回 401 [2026-07-17]
+  const wsUrl = `${protocol}//${window.location.host}/ws/v1/stream?token=${encodeURIComponent(token)}`
   
   ws = new WebSocket(wsUrl)
   
   ws.onopen = () => {
+    wsReconnectCount = 0
     console.log('WebSocket connected for real-time location updates')
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ action: 'subscribe', topics: ['location_update', 'alarm_event'] }))
+      // FIXED: [WebSocket心跳] 每30秒发送心跳保活，防止 nginx/代理超时断开 [2026-07-17]
+      wsHeartbeatTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: 'ping' }))
+        }
+      }, 30000)
     }
   }
   
@@ -419,10 +505,12 @@ function connectWebSocket() {
         const idx = vehicles.value.findIndex(v => v.phone === loc.phone)
         if (idx >= 0) {
           vehicles.value[idx] = { ...vehicles.value[idx], ...loc }
+          // FIXED: [地图卡顿] 仅更新单个 marker 位置，不全量重建 [2026-07-17]
+          updateSingleMarker(loc)
         } else {
           vehicles.value.push(loc)
+          updateSingleMarker(loc)
         }
-        updateMarkers()
       }
     } catch (e) {
       // ignore parse errors
@@ -430,11 +518,17 @@ function connectWebSocket() {
   }
   
   ws.onclose = () => {
-    setTimeout(connectWebSocket, 5000)
+    if (manuallyClosed) return
+    // FIXED: [WebSocket心跳] 清理心跳定时器 [2026-07-17]
+    if (wsHeartbeatTimer) { clearInterval(wsHeartbeatTimer); wsHeartbeatTimer = null }
+    // FIXED: [WebSocket断连] 指数退避重连（1s→2s→4s→...→30s） [2026-07-17]
+    const delay = Math.min(1000 * Math.pow(2, wsReconnectCount), 30000)
+    wsReconnectCount++
+    wsReconnectTimer = setTimeout(connectWebSocket, delay)
   }
   
   ws.onerror = () => {
-    ws.close()
+    if (ws) ws.close()
   }
 }
 
@@ -456,6 +550,10 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (refreshTimer) clearInterval(refreshTimer)
+  // FIXED: [WebSocket断连] 清理重连定时器 + 心跳定时器 + 设置手动关闭标志 [2026-07-17]
+  manuallyClosed = true
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
+  if (wsHeartbeatTimer) clearInterval(wsHeartbeatTimer)
   if (ws) { ws.onclose = null; ws.close() }
   destroyMap()
 })
@@ -521,12 +619,3 @@ onUnmounted(() => {
   font-weight: 500;
 }
 </style>
-�͔�����𽕰�х��(��������������𽑥��(���������������؁ص��􉙥�ѕɕ��٥��̹����Ѡ���������屔�ѕ�е�����聍��ѕ��������������쁍�����مȠ���є�ѕ�е��ѕ��쁙��еͥ��������(�����������������r��^�������"g�V����4(��������������𽑥��(������������𽑥��(����������𽕰���ɐ�((����������񕰵��ɐ�͡����􉹕ٕȈ�ص���͕���ѕ��٥����(�������������ѕ����є���������(����������������������屔􉙽�еݕ��������쁙��еͥ���������������s��@������(�������������ѕ����є�(�������������؁�����􉑕٥�����х����(���������������؁�����􉑕х���ɽ܈�(���������������������������􉑕х�����������&��"�������(���������������������������􉑕х���م�Ք����͕���ѕ��٥�����������������(��������������𽑥��(���������������؁�����􉑕х���ɽ܈�(���������������������������􉑕х�����������>c���������(���������������������������􉑕х���م�Ք���쀡͕���ѕ��٥����ɽѽ�����������ѽU����
-�͔�����������(��������������𽑥��(���������������؁�����􉑕х���ɽ܈�(���������������������������􉑕х�������������v ������(���������������������������􉑕х���م�Ք����͕���ѕ��٥���������Ց���ѽ�ᕐ�ؤ����������������(��������������𽑥��(���������������؁�����􉑕х���ɽ܈�(���������������������������􉑕х����������������������(���������������������������􉑕х���م�Ք����͕���ѕ��٥�����ѥ�Ց���ѽ�ᕐ�ؤ����������������(��������������𽑥��(���������������؁�����􉑕х���ɽ܈�(���������������������������􉑕х������������c�Z�������(���������������������������􉑕х���م�Ք����͕���ѕ��٥�����������������􁭴��������(��������������𽑥��(���������������؁�����􉑕х���ɽ܈�(���������������������������􉑕х�����������Z��<������(���������������������������􉑕х���م�Ք����͕���ѕ��٥�����ɕ�ѥ��������������������(��������������𽑥��(���������������؁�����􉑕х���ɽ܈�(���������������������������􉑕х������������O��c�B4������(���������������������������􉑕х���م�Ք���쁙�ɵ��Q����͕���ѕ��٥�������}��ѥٔ����������(��������������𽑥��(������������𽑥��(����������𽕰���ɐ�(��������𽕰�����(������𽕰�ɽ��(����𽑥��(��𽑥��(�ѕ����є�((�͍ɥ�Ё͕����)�����Ё�ɕ��������ѕ�����5�չѕ�����U���չѕ�������Q�����ɽ����Ք�)�����Ё�ٕ���������ɽ����������)�����Ё��͕��Mѽɔ��ɽ�������ѽɕ̽����()����Ё���Mѽɔ���͕��Mѽɔ��)����Ё���
-��х���Ȁ�ɕ���ձ��)����Ё���1�������ɕ�����͔�)����Ё��٥��̀�ɕ��mt�)����Ё͕���ѕ��٥����ɕ���ձ��)����Ё���ѕ�Aɽѽ�����ɕ�����)����Ё���Q�����ɕ�����Mѽɔ����Q����)��Ё�����ձ�)��Ё��ɭ��̀�mt)��Ёѥ��Ȁ�ձ�)��Ё���ɕ��5��Q����􁵅�Q����م�Ք()����Ё���ѕɕ��٥��̀􁍽���ѕ���������(����������ѕ�Aɽѽ����م�Ք��ɕ��ɸ���٥��̹م�Ք(��ɕ��ɸ���٥��̹م�Ք����ѕȡ��������ɽѽ������􁙥�ѕ�Aɽѽ����م�Ք�)��()��幌��չ�ѥ�������Q������Ԡ���(������Ё������Mѽɔ�ѥ������-��م�Ք���������й��ф���عY%Q}Q%9%QU}-d(���������䤁�(�������1������م�Ք�􁙅�͔(����ɕ��ɸ����͔(���((��ɕ��ɸ���܁Aɽ��͔��ɕͽ�ٔ������(��������Ё͍ɥ�Ѐ􁑽�յ��й�ɕ�ѕ�����Р�͍ɥ�М�(����͍ɥ�й�Ɍ�􁁡����輽й�����Թ��ع�����)����и�������������(����͍ɥ�й�������􀠤�����(������ɕͽ�ٔ���Ք�(�����(����͍ɥ�й����ɽȀ􀠤����ɕͽ�ٔ����͔�(�������յ��й�����������
-�����͍ɥ�Ф(����)�()��幌��չ�ѥ�������5������(������Ё������Mѽɔ�����-��م�Ք���������й��ф���عY%Q}5A}-d(���������䤁�(�������1������م�Ք�􁙅�͔(����ɕ��ɸ����͔(���((��ɕ��ɸ���܁Aɽ��͔��ɕͽ�ٔ������(��������Ё͍ɥ�Ѐ􁑽�յ��й�ɕ�ѕ�����Р�͍ɥ�М�(����͍ɥ�й�Ɍ�􁁡����輽ݕ���������������������ȸ�������������(����͍ɥ�й�������􀠤�����(������ɕͽ�ٔ���Ք�(�����(����͍ɥ�й����ɽȀ􀠤����ɕͽ�ٔ����͔�(�������յ��й�����������
-�����͍ɥ�Ф(����)�()��幌��չ�ѥ�������Q�������5������(������Ё��������݅�Ё����Q������Ԡ�(������������������ݥ���ܹP��ɕ��ɸ(((���݅�Ё����Q�����(������􁹕܁ܹ5���(�������
-��х���ȹم�Ք�(�����(���������ѕ��l�Է3�䰀��и������t�(������齽��԰(�����(���(���������=ٕɱ�䡹�܁P�5��Q���Q������(�����1������م�Ք����Ք)�()��幌��չ�ѥ�������5��5������(������Ё��������݅�Ё����5����(������������������ݥ���ܹ5����ɕ��ɸ((���݅�Ё����Q�����(������􁹕܁5���5������
-��х���ȹم�Ք���(����齽��԰(�������ѕ��l��и�����԰��Ը������t�(�������M�屔耝����輽��展̽��ɬ��(����٥��5���耜���(����(�����1������م�Ք����Ք)�()��幌��չ�ѥ�������5������(���������Q����م�Ք����ѥ�����Ԝ���(�����݅�Ё����Q�������5����(��􁕱͔��(�����݅�Ё����5��5����(���(�����ɕ��5��Q����􁵅�Q����م�Ք)�()��幌��չ�ѥ����ݥэ�5������(������������(������������ɽ䠤(���������ձ�(�������1������م�Ք�􁙅�͔(���(����ɭ��̀�mt(�����Mѽɔ�͕�5��Q�������Q����م�Ք�(���݅�Ё����5����(������ѕ5�ɭ��̠�)�()�չ�ѥ�������ѕ5�ɭ��̠���(������������ɕ��ɸ((����ɭ��̹�������������(����������͕�5������͕�5����ձ��(������͔���������ɕ��ٔ������ɕ��ٔ���(����(����ɭ��̀�mt((�����ѕɕ��٥��̹م�Ք����������٥�������(����������٥�����ѥ�Ց�������٥���������Ց����(��������Ё��ɭ��(�������������Q����م�Ք����ѥ�����Ԝ����ݥ���ܹP���(����������ɭ�Ȁ􁹕܁P�5�ɭ�Ƞ(������������܁P�1��1�С��ѥ�Ց���������Ց���(���������(����������ɭ�ȹ���%���]����ܡ�(����������ѥѱ�聑�٥���������(�������������ѕ��聀�؁��屔����������������홽�еͥ���������푕٥���������𽑥����(����������(������􁕱͔�����ݥ���ܹ5�����(����������ɭ�Ȁ􁹕܁5���5�ɭ�ȡ�(������������ͥѥ���m��٥���������Ց�����٥�����ѥ�Ց�t�(����������ѥѱ�聑�٥���������(�����������������(���������������ѕ��聀�؁��屔􉉅���ɽչ��ɝ�������Ȱ��İ���퍽���荙������������������퉽ɑ�ȵɅ��������홽�еͥ���������푕٥���������𽑥����(��������������ɕ�ѥ��耝ѽ���(������������(����������(����������ɭ�ȹ������������������͕�����٥�����٥����(�������(������������ɭ�Ȥ��(�������������������������������ɭ�Ȥ(����������ɭ��̹��͠���ɭ�Ȥ(�������(�����(����((��������ɭ��̹����Ѡ������������͕���Y��ܤ��(��������͕���Y��ܡ��ɭ��̤(���)�()�չ�ѥ���͕�����٥�����٥�����(��͕���ѕ��٥���م�Ք�􁑕٥��(���������������٥�����ѥ�Ց�������٥���������Ց����(�����������Q����م�Ք����ѥ�����Ԝ����ݥ���ܹP���(�������������Q����܁P�1��1�С��٥�����ѥ�Ց�����٥���������Ց���(����������͕�i�����Ф(����􁕱͔�����ݥ���ܹ5�����(����������͕�
-��ѕȡm��٥���������Ց�����٥�����ѥ�Ց�t�(����������͕�i�����Ф(�����(���)�()��幌��չ�ѥ�����э�1���ѥ��̠���(������(��������Ё��ф��݅�Ёٕ�����������1���ѥ��̠����э����������ٕ�������mt����(������٥��̹م�Ք�􁑅ф�ٕ�����́�����ф����mt(��������ѕ5�ɭ��̠�(��􁍅э�������(������٥��̹م�Ք��mt(���)�()�չ�ѥ�����ɵ��Q����Ф��(�������Ф�ɕ��ɸ����(��ɕ��ɸ���܁�є�Ф�ѽ1�����M�ɥ����頵
-8��)�()��5�չѕ����幌��������(���݅�Ё����5����(���݅�Ё��э�1���ѥ��̠�(��ѥ��Ȁ�͕�%�ѕ�م����э�1���ѥ��̰�������)��()��U���չѕ���������(������ѥ��Ȥ������%�ѕ�م��ѥ��Ȥ(������������(����������������ɽ䤁��������ɽ䠤(������͔���������ɕ��ٔ������ɕ��ٔ��(���)��(�͍ɥ���((���屔�͍�����(�������ɐ��鑕���������ɑ}}���䤁�(������������������х���)�((��������х���ȁ�(��ݥ�Ѡ������(��������聍�������٠���������(�������������������(�������ɽչ��مȠ���є���ə����Ȥ�(����ɑ�ȵɅ����������(���ٕə���聡������)�((���������������ȁ�(���������聙����(�����൑�ɕ�ѥ��聍��յ��(���������ѕ��聍��ѕ��(�����ѥ�䵍��ѕ��聍��ѕ��(��������������)�((���٥������Ё�(����ൡ������������(���ٕə��ܵ�聅�Ѽ�)�((���٥����ѕ���(���������聙����(���������ѕ��聍��ѕ��(�����ѥ�䵍��ѕ������������ݕ���(������������������(����ɑ�ȵ���ѽ������ͽ����مȠ���є���ɑ�Ȥ�(�����ͽ������ѕ��(���Ʌ�ͥѥ��聉����ɽչ��������)�((���٥����ѕ�顽ٕȁ�(�������ɽչ��مȠ���є���ə����Ȥ�)�((���٥����ѕ����ѥٔ��(�������ɽչ��ɝ����䰀��Ȱ���İ���Ĥ�)�((���٥�����х����(���������聙����(�����൑�ɕ�ѥ��聍��յ��(�����������)�((���х���ɽ܁�(���������聙����(�����ѥ�䵍��ѕ������������ݕ���(���������ѕ��聍��ѕ��)�((���х����������(�����еͥ�������(��������مȠ���є�ѕ�е��ѕ���)�((���х���م�Ք��(�����еͥ�������(�����е������聵���������)�(���屔�

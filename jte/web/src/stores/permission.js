@@ -135,6 +135,10 @@ export const usePermissionStore = defineStore('permission', {
         this.token = res.data.token
         // AUTO-FIX-2026-07-02 [等保2.0]: 保存 CSRF token（HttpOnly cookie + 响应体双下发）
         this.csrfToken = res.data.csrf_token || ''
+        // FIXED: [CSRF] 将 CSRF token 也存入 localStorage，作为 Cookie 不可读时的兜底 [2026-07-23]
+        if (this.csrfToken) {
+          localStorage.setItem('jte_csrf_token', this.csrfToken)
+        }
         this.currentUser = {
           id: res.data.id,
           username: res.data.username,

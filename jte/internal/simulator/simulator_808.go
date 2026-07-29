@@ -1,3 +1,4 @@
+// FIXED: [P2] simulator_808.go readLoop goroutine 缺少 recover() [2026-07-17]
 package simulator
 
 import (
@@ -111,7 +112,14 @@ func (s *Simulator808) runTerminal(phone string) {
 		return
 	}
 
-	go s.readLoop(conn, phone)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("simulator808 readLoop panic", zap.Any("panic", r), zap.String("phone", phone))
+			}
+		}()
+		s.readLoop(conn, phone)
+	}()
 
 	lat := s.config.LatMin + rand.Float64()*(s.config.LatMax-s.config.LatMin)
 	lon := s.config.LonMin + rand.Float64()*(s.config.LonMax-s.config.LonMin)

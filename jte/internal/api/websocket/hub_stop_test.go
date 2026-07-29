@@ -95,9 +95,9 @@ func TestHub_Stop_ClearsClients(t *testing.T) {
 		t.Fatal("register client timed out")
 	}
 
-	if hub.ClientCount() != 1 {
-		t.Fatalf("ClientCount before Stop = %d, want 1", hub.ClientCount())
-	}
+	// [修复] 使用 waitFor 替代直接检查，避免 register channel 接收后
+	// map 写入完成前的竞态条件（无缓冲 channel 发送完成 ≠ map 已更新）
+	waitFor(t, func() bool { return hub.ClientCount() == 1 }, 2*time.Second, "ClientCount not 1 before Stop")
 
 	hub.Stop()
 

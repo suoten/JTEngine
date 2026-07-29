@@ -19,6 +19,7 @@ jte/data/
 jte/modules/*.so
 jte/modules/*.sig
 jte/modules/*.dll
+jte/modules/*.json
 jte/spool/
 jte/logs/
 
@@ -29,6 +30,8 @@ jte/web/dist/
 # 覆盖率
 jte/coverage.out
 jte/coverage.html
+jte/coverage/
+jte/coverage
 
 # IDE / 编辑器
 .idea/
@@ -61,3 +64,5 @@ jte/configs/jte.local.yaml
 *.tmp
 *.bak
 *.log
+jte/stderr.txt
+jte/stdout.txt

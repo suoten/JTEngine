@@ -168,7 +168,17 @@ func (r *PacketReassembler) cleanupLoop() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		r.Cleanup()
+		// R62-FIX [P2]: 将 recover 移到循环内部，确保单次 Cleanup panic
+		// 不会导致清理协程退出。SafeGo 的 recover 在 goroutine 级别，
+		// panic 后协程退出，过期分片组永不被清理，内存泄漏。
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// SafeGo 已有 recover，此处二级 recover 确保循环不退出
+				}
+			}()
+			r.Cleanup()
+		}()
 	}
 }
 

@@ -416,10 +416,18 @@ var (
 	// ==================== 系统层指标 ====================
 	// ModuleStatus 模块状态
 	ModuleStatus = NewGauge("jte_module_status", "Module status: 1=running, 0=stopped, -1=failed")
+	// ModuleRestartCount 模块重启次数
+	ModuleRestartCount = NewGauge("jte_module_restart_count", "Module restart count (monitor instability)")
 	// LicenseTier 当前授权等级
 	LicenseTier = NewGauge("jte_license_tier", "Current license tier rank (0=free, 1=standard, 2=professional, 3=enterprise)")
-	// ModuleRestartCount 模块重启次数
-	ModuleRestartCount = NewGauge("jte_module_restart_count", "Module restart count in last hour")
+	// ==================== 会话层指标（INDUSTRIAL-FIX-2026-07-24） ====================
+	// SessionSendQueueDepth 会话发送队列深度（按会话标签）
+	// 用于监控慢客户端：队列深度持续高说明客户端写入缓慢，可能需要踢出
+	SessionSendQueueDepth = NewGauge("jte_session_send_queue_depth", "Session send queue depth (monitor slow clients)")
+	// SessionStateDistribution 会话状态分布（connected/registered/authenticated）
+	SessionStateDistribution = NewGauge("jte_session_state_distribution", "Session count by state (connected/registered/authenticated)")
+	// MessagesPerSession 每会话消息计数（用于检测消息洪水）
+	MessagesPerSession = NewCounter("jte_messages_per_session_total", "Total messages per session (flood detection)")
 )
 
 // ========== 原子计数器（高性能场景） ==========

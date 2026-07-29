@@ -2,7 +2,7 @@
   <div class="page-container">
     <div class="page-header">
       <h2>{{ $t('common.nav.devices') }}</h2>
-      <el-input v-model="searchPhone" placeholder="{{ $t('common.btn.search') }}手机号" style="width: 240px" clearable @clear="fetchDevices" @keyup.enter="fetchDevices">
+      <el-input v-model="searchPhone" :placeholder="$t('common.btn.search') + '手机号'" style="width: 240px" clearable @clear="fetchDevices" @keyup.enter="fetchDevices">
         <template #prefix><el-icon><Search /></el-icon></template>
       </el-input>
     </div>
@@ -31,7 +31,9 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { deviceApi } from '../api'
+import { ElMessage } from 'element-plus'
 
 const devices = ref([])
 const loading = ref(false)
@@ -44,19 +46,25 @@ async function fetchDevices() {
   loading.value = true
   try {
     const res = await deviceApi.getList({ phone: searchPhone.value, page: page.value, page_size: pageSize.value })
-    if (res.code === 0 && res.data) {
-      devices.value = res.data.items || res.data || []
-      total.value = res.data.total || 0
-    }
+if (res.code === 0 && res.data) {
+// FIXED-2026-07-24: API 返回 items:null 时 fallback 到空数组，避免 reduce/forEach 崩溃
+const items = res.data.items
+devices.value = Array.isArray(items) ? items : (Array.isArray(res.data) ? res.data : [])
+total.value = res.data.total || 0
+}
   } catch (e) {
     console.error(e)
+    ElMessage.error('加载设备列表失败，请检查网络或稍后重试')
   } finally {
     loading.value = false
   }
 }
 
+// FIXED: [功能缺失] sendCommand 从 console.log 桩改为路由跳转到指令下发页 [2026-07-17]
+const router = useRouter()
+
 function sendCommand(row) {
-  console.log('Send command to', row.phone)
+  router.push({ path: '/commands', query: { phone: row.phone } })
 }
 
 onMounted(fetchDevices)

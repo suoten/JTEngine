@@ -153,15 +153,16 @@ func TestJT809Client_buildMessage_Structure(t *testing.T) {
 	}
 	// 解开转义后应能读出 msgID=0x1006 和 seqNum=42
 	inner := msg[1 : len(msg)-1]
-	unescaped := unescape809(inner)
+	unescaped, _ := unescape809(inner)
 	if len(unescaped) < jt809HeaderLen {
 		t.Fatalf("unescaped too short: %d", len(unescaped))
 	}
-	msgID := uint16(unescaped[0])<<8 | uint16(unescaped[1])
+	// AUTO-FIX-2026-07-16: 809标准22字节帧头：msgID在[18:20], seqNum在[2:4]
+	msgID := uint16(unescaped[18])<<8 | uint16(unescaped[19])
 	if msgID != 0x1006 {
 		t.Fatalf("msgID = %#x, want 0x1006", msgID)
 	}
-	seqNum := uint16(unescaped[16])<<8 | uint16(unescaped[17])
+	seqNum := uint16(unescaped[2])<<8 | uint16(unescaped[3])
 	if seqNum != 42 {
 		t.Fatalf("seqNum = %d, want 42", seqNum)
 	}
@@ -177,7 +178,7 @@ func TestJT809Client_EscapeUnescape_RoundTrip(t *testing.T) {
 	}
 	for i, original := range cases {
 		escaped := escape809(original)
-		roundtrip := unescape809(escaped)
+		roundtrip, _ := unescape809(escaped)
 		if len(roundtrip) != len(original) {
 			t.Fatalf("case %d: length mismatch: got %d, want %d", i, len(roundtrip), len(original))
 		}

@@ -3,6 +3,7 @@ package handler
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -11,6 +12,15 @@ import (
 	"github.com/suoten/jt-engine/pkg/storage"
 	"go.uber.org/zap"
 )
+
+// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: ID 字段白名单正则
+// 允许字母/数字/下划线/短横线，最大 64 字符；用于 VehicleID/Type/Source 等标识符字段
+var idFieldPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// isValidIDField 校验 ID 字段是否仅含安全字符（防 SQL/路径/格式化字符串注入）
+func isValidIDField(s string) bool {
+	return idFieldPattern.MatchString(s)
+}
 
 type AlarmHandler struct {
 	store  storage.Interface
@@ -35,16 +45,16 @@ func (h *AlarmHandler) RegisterRoutes(r *gin.RouterGroup) {
 }
 
 // ListAlarms godoc
-// @Summary è·åæ¥è­¦åè¡¨
-// @Description åé¡µæ¥è¯¢ç»ç«¯æ¥è­¦äºä»¶è®°å½
-// @Tags æ¥è­¦
+// @Summary 获取报警列表
+// @Description 分页查询终端报警事件记录
+// @Tags 报警
 // @Accept json
 // @Produce json
-// @Param page query int false "é¡µç " default(1)
-// @Param page_size query int false "æ¯é¡µæ°é" default(20)
-// @Param phone query string false "ææºå·ç­é?
-// @Param start query string false "å¼å§æ¶é?
-// @Param end query string false "ç»ææ¶é´"
+// @Param page query int false "页码" default(1)
+// @Param page_size query int false "每页数量" default(20)
+// @Param phone query string false "手机号筛选"
+// @Param start query string false "开始时间"
+// @Param end query string false "结束时间"
 // @Success 200 {object} dto.ListResultDTO
 // @Router /api/v1/alarms [get]
 func (h *AlarmHandler) ListAlarms(c *gin.Context) {
@@ -106,11 +116,11 @@ func (h *AlarmHandler) ListAlarms(c *gin.Context) {
 }
 
 // GetAlarm godoc
-// @Summary è·åæ¥è­¦è¯¦æ
-// @Description æ ¹æ®æ¥è­¦IDè·åæ¥è­¦è¯¦ç»ä¿¡æ¯
-// @Tags æ¥è­¦
+// @Summary 获取报警详情
+// @Description 根据报警ID获取报警详细信息
+// @Tags 报警
 // @Produce json
-// @Param id path string true "æ¥è­¦ID"
+// @Param id path string true "报警ID"
 // @Success 200 {object} map[string]interface{}
 // @Router /api/v1/alarms/{id} [get]
 func (h *AlarmHandler) GetAlarm(c *gin.Context) {
@@ -120,10 +130,12 @@ func (h *AlarmHandler) GetAlarm(c *gin.Context) {
 		return
 	}
 
+	// FIXED-2026-07-17 [P0]: 原代码用 Phone: id 过滤，将报警 ID 当做手机号查询，永远查不到结果。
+	// 改用 AlarmID 字段按报警 ID 精确查询。
 	result, err := h.store.ListAlarms(c.Request.Context(), storage.ListOptions{
 		Page:     1,
 		PageSize: 1,
-		Phone:    id,
+		AlarmID:  id,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, dto.ErrorResponse{Code: 500, Message: "internal error"})
@@ -134,11 +146,11 @@ func (h *AlarmHandler) GetAlarm(c *gin.Context) {
 }
 
 // GetAlarmStats godoc
-// @Summary è·åæ¥è­¦ç»è®¡
-// @Description è·åæå®å¤©æ°åçæ¥è­¦æ°éç»è®¡
-// @Tags æ¥è­¦
+// @Summary 获取报警统计
+// @Description 获取指定天数内的报警数量统计
+// @Tags 报警
 // @Produce json
-// @Param days query int false "ç»è®¡å¤©æ°" default(7)
+// @Param days query int false "统计天数" default(7)
 // @Success 200 {object} map[string]interface{}
 // @Router /api/v1/alarms/stats [get]
 func (h *AlarmHandler) GetAlarmStats(c *gin.Context) {
@@ -203,6 +215,21 @@ func (h *AlarmHandler) ReceiveAlarm(c *gin.Context) {
 		return
 	}
 
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 输入白名单校验
+	// VehicleID/Type/Source 用于构造 redis key/日志/通知文本，须限定字符集防止注入
+	if !isValidIDField(req.VehicleID) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid vehicle_id: only [A-Za-z0-9_-] allowed, max 64 chars"})
+		return
+	}
+	if req.Type != "" && !isValidIDField(req.Type) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid type: only [A-Za-z0-9_-] allowed, max 64 chars"})
+		return
+	}
+	if req.Source != "" && !isValidIDField(req.Source) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid source: only [A-Za-z0-9_-] allowed, max 64 chars"})
+		return
+	}
+
 	// 时间解析（允许为空，默认当前时间）
 	var ts time.Time
 	if req.Time != "" {
@@ -239,11 +266,13 @@ func (h *AlarmHandler) ReceiveAlarm(c *gin.Context) {
 	}
 
 	if err := h.store.SaveAlarm(c.Request.Context(), alarm); err != nil {
+		// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 不向客户端泄露 err.Error()
+		// 原代码 "save alarm failed: " + err.Error() 会暴露数据库表名/列名/约束错误
 		h.logger.Error("save alarm failed",
 			zap.String("vehicle_id", req.VehicleID),
 			zap.String("type", req.Type),
 			zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "save alarm failed: " + err.Error()})
+		respondInternalError(c, h.logger, err, "ReceiveAlarm.SaveAlarm")
 		return
 	}
 

@@ -105,6 +105,8 @@ func TestRTPConnPool_ActiveNotSwept(t *testing.T) {
 }
 
 // TestRTPConnPool_LRUEvict 验证达到上限时按 LRU 淘汰最久未用连接。
+// FIXED-2026-07-22 [P1]: 活跃连接（10秒内有数据传输）不可淘汰。
+// 测试中需人为老化 port0 使其超过活跃阈值。
 func TestRTPConnPool_LRUEvict(t *testing.T) {
 	// 启动 3 个 UDP 监听端口
 	ports := make([]int, 3)
@@ -131,7 +133,11 @@ func TestRTPConnPool_LRUEvict(t *testing.T) {
 	if _, err := pool.GetUDP(ports[1]); err != nil {
 		t.Fatalf("GetUDP port1 again: %v", err)
 	}
-	// 创建 port2，应淘汰 port0
+	// FIXED-2026-07-22 [P1]: 人为老化 port0 使其超过活跃阈值（10秒），否则不会被淘汰
+	pool.mu.Lock()
+	pool.udpLastActive[ports[0]] = time.Now().Add(-15 * time.Second)
+	pool.mu.Unlock()
+	// 创建 port2，应淘汰 port0（已超过活跃阈值）
 	if _, err := pool.GetUDP(ports[2]); err != nil {
 		t.Fatalf("GetUDP port2: %v", err)
 	}

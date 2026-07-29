@@ -189,6 +189,7 @@ func (c *JT808Codec) ProtocolType() protocol.ProtocolType {
 }
 
 func (c *JT808Codec) ParseHeader(data []byte) (*protocol.MessageHeader, int, error) {
+	// AUTO-FIX-2026-07-17: JT/T 808-2019 版本头含 1 字节协议版本号，最小头长 13B；2011 版 12B。
 	if len(data) < 12 {
 		return nil, 0, fmt.Errorf("header too short: %d bytes", len(data))
 	}
@@ -198,13 +199,25 @@ func (c *JT808Codec) ParseHeader(data []byte) (*protocol.MessageHeader, int, err
 	header.BodyAttr = binary.BigEndian.Uint16(data[2:4])
 
 	header.BodyLen = int(header.BodyAttr & 0x03FF)
+	header.EncryptMethod = uint8((header.BodyAttr >> 10) & 0x07)
+	header.Version2019 = (header.BodyAttr & 0x8000) != 0
 	header.HasPack = (header.BodyAttr & 0x2000) != 0
 
-	phoneBCD := data[4:10]
-	header.Phone = BCDToString(phoneBCD)
-	header.SeqNum = binary.BigEndian.Uint16(data[10:12])
+	// AUTO-FIX-2026-07-17: Bit15=1 时，data[4] 为协议版本号，Phone 从 data[5] 开始
+	phoneStart := 4
+	if header.Version2019 {
+		if len(data) < 13 {
+			return nil, 0, fmt.Errorf("2019 header too short: %d bytes", len(data))
+		}
+		header.ProtocolVer = data[4]
+		phoneStart = 5
+	}
 
-	offset := 12
+	phoneBCD := data[phoneStart : phoneStart+6]
+	header.Phone = BCDToStringSafe(phoneBCD)
+	header.SeqNum = binary.BigEndian.Uint16(data[phoneStart+6 : phoneStart+8])
+
+	offset := phoneStart + 8
 	if header.HasPack {
 		if len(data) < offset+4 {
 			return nil, 0, fmt.Errorf("header with pack info too short")
@@ -218,13 +231,17 @@ func (c *JT808Codec) ParseHeader(data []byte) (*protocol.MessageHeader, int, err
 }
 
 func (c *JT808Codec) EncodeHeader(header *protocol.MessageHeader) ([]byte, error) {
-	buf := make([]byte, 0, 20)
+	buf := make([]byte, 0, 21)
 
 	msgIDBytes := make([]byte, 2)
 	binary.BigEndian.PutUint16(msgIDBytes, header.MsgID)
 	buf = append(buf, msgIDBytes...)
 
 	bodyAttr := uint16(header.BodyLen) & 0x03FF
+	bodyAttr |= (uint16(header.EncryptMethod) & 0x07) << 10
+	if header.Version2019 {
+		bodyAttr |= 0x8000
+	}
 	if header.HasPack {
 		bodyAttr |= 0x2000
 	}
@@ -232,7 +249,15 @@ func (c *JT808Codec) EncodeHeader(header *protocol.MessageHeader) ([]byte, error
 	binary.BigEndian.PutUint16(bodyAttrBytes, bodyAttr)
 	buf = append(buf, bodyAttrBytes...)
 
-	phoneBCD := StringToBCD(header.Phone)
+	// AUTO-FIX-2026-07-17: 2019 版本写入协议版本号字节
+	if header.Version2019 {
+		buf = append(buf, header.ProtocolVer)
+	}
+
+	phoneBCD, err := StringToBCD6(header.Phone)
+	if err != nil {
+		return nil, fmt.Errorf("encode header: %w", err)
+	}
 	buf = append(buf, phoneBCD...)
 
 	seqBytes := make([]byte, 2)
@@ -488,39 +513,72 @@ func CalcChecksum(data []byte) byte {
 //  3. DB 存储的 SIM 与协议解码不一致，跨系统对账错误
 //
 // 修复：SIM/Phone 是定长 BCD 字段，不应剥除前导零。已移除剥零循环。
-func BCDToString(bcd []byte) string {
+// FIXED-2026-07-23 [P2]: BCDToString 添加 BCD 合法性校验，高位或低位 > 9 时返回 error。
+// 字符串始终完整返回（best-effort），error 仅表示存在非法 BCD 字节。
+// 调用方可根据场景决定是否中断流程（Unmarshal 路径通常忽略 error，ParseHeader 路径可记录告警）。
+func BCDToString(bcd []byte) (string, error) {
 	result := make([]byte, 0, len(bcd)*2)
-	for _, b := range bcd {
-		result = append(result, (b>>4)+'0', (b&0x0F)+'0')
+	var firstErr error
+	for i, b := range bcd {
+		high := b >> 4
+		low := b & 0x0F
+		if high > 9 || low > 9 {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("BCDToString: invalid BCD byte 0x%02X at position %d", b, i)
+			}
+		}
+		result = append(result, high+'0', low+'0')
 	}
-	return string(result)
+	return string(result), firstErr
 }
 
-// BCDToStringFixed 将 BCD 字节转换为字符串，不剥除前导零。
-// AUTO-FIX-2026-06-26: 用于时间字段（BCD[6]=YYMMDDHHmmss）等定长BCD字段，
-// 原 BCDToString 会剥除前导零导致 "000101000000" 变为 "101000000"（长度错乱）。
-func BCDToStringFixed(bcd []byte) string {
-	result := make([]byte, 0, len(bcd)*2)
-	for _, b := range bcd {
-		high := (b >> 4) + '0'
-		low := (b & 0x0F) + '0'
-		result = append(result, high, low)
-	}
-	return string(result)
+// BCDToStringSafe 调用 BCDToString 并忽略 error，返回 best-effort 字符串。
+// 用于 Unmarshal/ParseHeader 等 BCD 校验错误不应中断主流程的场景。
+func BCDToStringSafe(bcd []byte) string {
+	s, _ := BCDToString(bcd)
+	return s
 }
 
-func StringToBCD(s string) []byte {
-	for len(s) < 12 {
+// [P2-修复] BCDToStringFixed 已与 BCDToString 实现相同，改为安全包装函数
+var BCDToStringFixed = BCDToStringSafe
+
+// [P1-修复] StringToBCD 添加输入校验：先过滤非数字字符（如时间分隔符 -/:/space），
+// 再验证剩余字符是否全为 '0'-'9'，避免非法字符导致 BCD 编码错误
+// FIXED-2026-07-23 [P2]: StringToBCD 增加 targetLen 参数，支持不同长度的 BCD 字段。
+// targetLen 为目标 BCD 字节数（如 Phone=6 表示 12 位，时间=6 表示 12 位）。
+// 保留 StringToBCD6 作为默认 6 字节的包装函数。
+func StringToBCD(s string, targetLen int) ([]byte, error) {
+	if targetLen <= 0 {
+		targetLen = 6
+	}
+	// 过滤非数字字符（兼容时间格式 "2026-01-01 00:00:00" → "20260101000000"）
+	filtered := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			filtered = append(filtered, s[i])
+		}
+	}
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("StringToBCD: no digit characters in input %q", s)
+	}
+	s = string(filtered)
+	targetChars := targetLen * 2
+	for len(s) < targetChars {
 		s = "0" + s
 	}
-	if len(s) > 12 {
-		s = s[len(s)-12:]
+	if len(s) > targetChars {
+		s = s[len(s)-targetChars:]
 	}
-	bcd := make([]byte, 6)
-	for i := 0; i < 6; i++ {
+	bcd := make([]byte, targetLen)
+	for i := 0; i < targetLen; i++ {
 		high := s[i*2] - '0'
 		low := s[i*2+1] - '0'
 		bcd[i] = (high << 4) | low
 	}
-	return bcd
+	return bcd, nil
+}
+
+// StringToBCD6 是 StringToBCD(s, 6) 的包装函数，用于默认 6 字节（12 位）BCD 字段。
+func StringToBCD6(s string) ([]byte, error) {
+	return StringToBCD(s, 6)
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -111,10 +112,11 @@ func (c *ZLMediaKitClient) apiRequest(method, path string, body io.Reader) (map[
 		return nil, err
 	}
 
+	// [P1-1] API secret 改用 Header 传递，避免泄露到 URL 日志。
+	// ZLMediaKit 的 REST API 支持通过 ?secret= 查询参数或 X-API-Secret Header 进行认证。
+	// 使用 Header 更安全：URL query 参数会被反向代理、访问日志、浏览器历史等记录。
 	if c.config.Secret != "" {
-		q := req.URL.Query()
-		q.Set("secret", c.config.Secret)
-		req.URL.RawQuery = q.Encode()
+		req.Header.Set("X-API-Secret", c.config.Secret)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -123,7 +125,7 @@ func (c *ZLMediaKitClient) apiRequest(method, path string, body io.Reader) (map[
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // AUTO-FIX-2026-07-25 [P2-R9]: 限制 1MB
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
@@ -144,7 +146,8 @@ func (c *ZLMediaKitClient) apiRequest(method, path string, body io.Reader) (map[
 func (c *ZLMediaKitClient) StartRTPServer(streamID string) (int, error) {
 	// port=0 lets ZLMediaKit auto-allocate a free port, avoiding conflicts.
 	// tcp_mode 由配置驱动：0=仅 UDP（不传该参数），1=TCP 主动，2=TCP 被动。
-	path := fmt.Sprintf("openRtpServer?port=0&stream_id=%s", streamID)
+	// FIXED [P2]: streamID 需 URL 编码，防止特殊字符（如 #、&、=）破坏查询参数解析
+	path := fmt.Sprintf("openRtpServer?port=0&stream_id=%s", url.QueryEscape(streamID))
 	if c.config.TcpMode > 0 {
 		path = fmt.Sprintf("%s&tcp_mode=%d", path, c.config.TcpMode)
 	}
@@ -171,7 +174,8 @@ func (c *ZLMediaKitClient) StartRTPServer(streamID string) (int, error) {
 }
 
 func (c *ZLMediaKitClient) StopRTPServer(streamID string) error {
-	_, err := c.apiRequest("GET", fmt.Sprintf("closeRtpServer?stream_id=%s", streamID), nil)
+	// FIXED [P2]: streamID 需 URL 编码
+	_, err := c.apiRequest("GET", fmt.Sprintf("closeRtpServer?stream_id=%s", url.QueryEscape(streamID)), nil)
 	if err != nil {
 		return err
 	}
@@ -243,9 +247,11 @@ func (c *ZLMediaKitClient) ListStreams() ([]StreamInfo, error) {
 	return streams, nil
 }
 
-func (c *ZLMediaKitClient) StartStreamProxy(app, stream, url string) error {
+func (c *ZLMediaKitClient) StartStreamProxy(app, stream, srcURL string) error {
+	// FIXED [P2]: 查询参数需 URL 编码；参数名改为 srcURL 避免遮蔽 net/url 包
 	_, err := c.apiRequest("GET",
-		fmt.Sprintf("addStreamProxy?app=%s&stream=%s&url=%s&enable_hls=1&enable_mp4=0", app, stream, url),
+		fmt.Sprintf("addStreamProxy?app=%s&stream=%s&url=%s&enable_hls=1&enable_mp4=0",
+			url.QueryEscape(app), url.QueryEscape(stream), url.QueryEscape(srcURL)),
 		nil)
 	if err != nil {
 		return err
@@ -258,8 +264,9 @@ func (c *ZLMediaKitClient) StartStreamProxy(app, stream, url string) error {
 }
 
 func (c *ZLMediaKitClient) StopStreamProxy(app, stream string) error {
+	// FIXED [P2]: 查询参数需 URL 编码
 	_, err := c.apiRequest("GET",
-		fmt.Sprintf("delStreamProxy?app=%s&stream=%s", app, stream),
+		fmt.Sprintf("delStreamProxy?app=%s&stream=%s", url.QueryEscape(app), url.QueryEscape(stream)),
 		nil)
 	return err
 }
@@ -270,17 +277,19 @@ func (c *ZLMediaKitClient) IsConnected() bool {
 }
 
 func (c *ZLMediaKitClient) ExchangeSDP(app, stream, sdpOffer string) (string, error) {
-	url := fmt.Sprintf("%s/index/api/webrtc?app=%s&stream=%s&type=play", c.config.APIURL, app, stream)
-	if c.config.Secret != "" {
-		url += "&secret=" + c.config.Secret
-	}
-
+	// FIXED [P2]: 查询参数需 URL 编码
+	reqURL := fmt.Sprintf("%s/index/api/webrtc?app=%s&stream=%s&type=play",
+		c.config.APIURL, url.QueryEscape(app), url.QueryEscape(stream))
 	reqBody := strings.NewReader(sdpOffer)
-	req, err := http.NewRequest("POST", url, reqBody)
+	req, err := http.NewRequest("POST", reqURL, reqBody)
 	if err != nil {
 		return "", fmt.Errorf("create webrtc request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/sdp")
+	// [P1-1] WebRTC 接口同样使用 Header 传递 secret
+	if c.config.Secret != "" {
+		req.Header.Set("X-API-Secret", c.config.Secret)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -288,7 +297,7 @@ func (c *ZLMediaKitClient) ExchangeSDP(app, stream, sdpOffer string) (string, er
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // AUTO-FIX-2026-07-25 [P2-R9]: 限制 1MB
 	if err != nil {
 		return "", fmt.Errorf("read webrtc response: %w", err)
 	}

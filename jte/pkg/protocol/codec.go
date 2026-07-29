@@ -13,14 +13,19 @@ const (
 )
 
 type MessageHeader struct {
-	MsgID     uint16
-	BodyAttr  uint16
-	Phone     string
-	SeqNum    uint16
-	PackTotal uint16
-	PackIndex uint16
-	BodyLen   int
-	HasPack   bool
+	MsgID         uint16
+	BodyAttr      uint16
+	Phone         string
+	SeqNum        uint16
+	PackTotal     uint16
+	PackIndex     uint16
+	BodyLen       int
+	HasPack       bool
+	EncryptMethod uint8 // Bit 10-12 加密方式 (0=不加密,1=RSA,2=SM2)
+	// [P1-修复] JT/T 809 帧头中的车牌颜色字段（809专用，808不使用）
+	PlateColor    byte  // 809 帧头 Byte5: 车牌颜色 (1=蓝,2=黄,3=黑,4=白,5=其他)
+	Version2019   bool  // Bit 15 版本标识 (true=2019, false=2011)
+	ProtocolVer   byte  // AUTO-FIX-2026-07-17: 2019版本协议版本号字节 (Bit15=1时存在)
 }
 
 type MessageBody interface {

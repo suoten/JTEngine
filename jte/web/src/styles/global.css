@@ -12,10 +12,33 @@
   --jte-warning: #f59e0b;
   --jte-danger: #ef4444;
   --jte-info: #3b82f6;
+  --jte-primary: #6366f1;
+}
+
+/* FIXED: [UI/UX] 亮色主题变量 [2026-07-17] */
+html:not(.dark) {
+  --jte-bg: #f5f5f5;
+  --jte-surface: #ffffff;
+  --jte-surface-2: #f0f0f0;
+  --jte-border: rgba(0, 0, 0, 0.08);
+  --jte-border-hover: rgba(0, 0, 0, 0.15);
+  --jte-text: #1f1f1f;
+  --jte-text-muted: #71717a;
+  --jte-accent: #6366f1;
+  --jte-accent-glow: rgba(99, 102, 241, 0.1);
+  --jte-success: #22c55e;
+  --jte-warning: #f59e0b;
+  --jte-danger: #ef4444;
+  --jte-info: #3b82f6;
+  --jte-primary: #6366f1;
 }
 
 html.dark {
   color-scheme: dark;
+}
+
+html:not(.dark) {
+  color-scheme: light;
 }
 
 * {

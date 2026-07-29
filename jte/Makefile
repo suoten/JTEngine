@@ -1,4 +1,4 @@
-# JTE — JT/T 部标协议引擎（开源版）
+# JTE — JT/T 部标协议引擎
 # Makefile — 常用开发命令
 
 GO ?= go
@@ -6,7 +6,7 @@ GOFLAGS ?= -count=1
 LDFLAGS := -s -w
 BINARY := jte
 
-.PHONY: all build build-binary test test-coverage vet lint benchmark clean fmt imports docker-build docker-run acceptance help
+.PHONY: all build test test-coverage vet lint benchmark clean fmt imports docker-build docker-run help
 
 ## all: 构建并测试（默认目标）
 all: build test
@@ -63,22 +63,27 @@ clean:
 	$(GO) clean -cache
 	rm -f bin/$(BINARY) coverage.out coverage.html
 
-## docker-build: 构建 Docker 镜像
+## docker-build: 构建 Docker 镜像（使用项目根 Dockerfile）
 docker-build:
-	docker build -t jte-engine:latest -f deploy/Dockerfile .
+	docker build -t jte-engine:latest -f Dockerfile .
 
 ## docker-run: 运行 Docker 容器
 docker-run:
 	docker run -d --name jte -p 8080:8080 -p 7611:7611 jte-engine:latest
 
-## acceptance: 运行端到端验收脚本
-acceptance:
-	@if [ -f ../scripts/acceptance_e2e.sh ]; then \
-		bash ../scripts/acceptance_e2e.sh ; \
-	else \
-		echo "验收脚本不存在，请检查 scripts/acceptance_e2e.sh" ; \
-		exit 1 ; \
-	fi
+## modules-build: 编译所有子模块
+modules-build:
+	@for dir in ../jte-modules/module-*; do \
+		echo "Building $$dir..." ; \
+		(cd $$dir && $(GO) build ./...) || exit 1 ; \
+	done
+
+## modules-test: 测试所有子模块
+modules-test:
+	@for dir in ../jte-modules/module-*; do \
+		echo "Testing $$dir..." ; \
+		(cd $$dir && $(GO) test $(GOFLAGS) -timeout 120s ./...) || exit 1 ; \
+	done
 
 ## help: 显示帮助
 help:

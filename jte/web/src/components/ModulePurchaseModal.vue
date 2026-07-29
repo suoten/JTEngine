@@ -69,7 +69,7 @@
         plain
         :loading="trialLoading"
         @click="$emit('start-trial', moduleName)"
-      >开始试用</el-button>
+      >前往官网申请试用</el-button>
       <el-button type="primary" @click="goPurchase">
         <el-icon><ShoppingCart /></el-icon>
         购买解锁
@@ -138,7 +138,8 @@ watch(() => props.modelValue, async (open) => {
 function goPurchase() {
   const url = new URL(purchaseURL.value, window.location.origin)
   if (props.moduleName) url.searchParams.set('module', props.moduleName)
-  window.open(url.toString(), '_blank')
+  // FIXED: [P2] window.open 缺少 noopener,noreferrer 安全参数（tabnabbing 防护） [2026-07-17]
+  window.open(url.toString(), '_blank', 'noopener,noreferrer')
 }
 </script>
 

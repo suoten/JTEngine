@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"context"
 	"net/http"
 	"time"
 
@@ -29,7 +28,7 @@ func (h *DriverHandler) List(c *gin.Context) {
 		PageSize: parseIntDefault(c.Query("page_size"), 20),
 		Phone:    c.Query("phone"),
 	}
-	result, err := h.store.QueryDrivers(context.Background(), opts)
+	result, err := h.store.QueryDrivers(c.Request.Context(), opts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
@@ -62,7 +61,7 @@ func (h *DriverHandler) Create(c *gin.Context) {
 	if d.Source == "" {
 		d.Source = "api"
 	}
-	if err := h.store.SaveDriverInfo(context.Background(), &d); err != nil {
+	if err := h.store.SaveDriverInfo(c.Request.Context(), &d); err != nil {
 		h.logger.Error("create driver failed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
@@ -85,7 +84,7 @@ func (h *DriverHandler) Update(c *gin.Context) {
 	if req.Source == "" {
 		req.Source = "api"
 	}
-	if err := h.store.SaveDriverInfo(context.Background(), &req); err != nil {
+	if err := h.store.SaveDriverInfo(c.Request.Context(), &req); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
 	}
@@ -96,7 +95,7 @@ func (h *DriverHandler) Update(c *gin.Context) {
 // DELETE /api/v1/drivers/:id
 func (h *DriverHandler) Delete(c *gin.Context) {
 	id := c.Param("id")
-	if err := h.store.DeleteDriver(context.Background(), id); err != nil {
+	if err := h.store.DeleteDriver(c.Request.Context(), id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": err.Error()})
 		return
 	}

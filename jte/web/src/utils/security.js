@@ -67,9 +67,9 @@ function getCanvasHash() {
     ctx.fillStyle = '#f60'
     ctx.fillRect(0, 0, 100, 20)
     ctx.fillStyle = '#069'
-    ctx.fillText('JTE-fingerprint-🚀', 2, 2)
+    ctx.fillText('JTE-fingerprint-v3', 2, 2)
     ctx.fillStyle = 'rgba(102, 204, 0, 0.7)'
-    ctx.fillText('JTE-fingerprint-🚀', 4, 4)
+    ctx.fillText('JTE-fingerprint-v3', 4, 4)
     const dataUrl = canvas.toDataURL()
     return hashString(dataUrl)
   } catch {

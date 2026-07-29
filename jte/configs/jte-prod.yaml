@@ -1,0 +1,177 @@
+# ===================================================================
+# 生产环境配置覆盖文件
+#
+# 使用方式：
+#   export JTE_ENV=prod
+# 系统自动加载 jte-prod.yaml 覆盖 jte.yaml 中的默认值
+#
+# 注意：SQLite 仅用于开发/测试环境，生产环境必须使用关系库 + 时序库分离架构
+#
+# 环境变量（必须通过环境变量注入敏感信息，禁止明文写入配置文件）：
+#   JTE_JWT_SECRET_KID-2026-06     — JWT 签名密钥
+#   JTE_TDENGINE_PASSWORD          — TDengine 密码
+#   JTE_STORAGE_CACHE_PASSWORD     — Redis 密码
+#   JTE_STORAGE_OBJECT_SECRET_KEY  — MinIO/S3 Secret Key
+#   JTE_API_JWT_SECRET             — JWT 兼容密钥（向后兼容）
+# ===================================================================
+
+server:
+  host: "0.0.0.0"
+
+gateway:
+  tcp_port: 7611
+  udp_port: 7612
+  # FIXED-2026-07-23 [P2]: 网关安全配置加固
+  initial_auth_timeout: 30          # 连接后首次认证超时（秒），超时关闭连接
+  max_conns_per_ip: 100             # 单 IP 最大并发连接数
+  max_conn_rate_per_ip: 50          # 单 IP 每秒新建连接上限
+  tls_enabled: false                # JT/T 协议是否启用 TLS（非标准，部分客户要求时开启）
+  read_timeout: 120
+  write_timeout: 120
+  heartbeat_interval: 30
+  heartbeat_timeout: 180
+  max_connections: 10000
+  max_devices: 100000
+  oom_protect:
+    enabled: true
+    warn_mb: 8192
+    critical_mb: 9216
+    fatal_mb: 9728
+    check_interval_seconds: 5
+
+api:
+  enabled: true
+  port: 8080
+  cors_origins:
+    - "https://jte.example.com"    # 生产环境前端域名（必须替换为实际域名）
+  rate_limit: 100
+  tls:
+    enabled: true
+    cert_file: ""
+    key_file: ""
+    auto_renew: true
+    min_version: "TLS1.2"
+    acme: true
+    acme_dir: "./data/acme"
+    acme_domains:
+      - "jte.example.com"
+  require_tls: true
+
+# FIXED-2026-07-23 [P2]: 生产环境存储配置
+# SQLite 仅用于开发/测试，生产环境必须使用关系库（PostgreSQL/MySQL）+ 时序库（TDengine）
+storage:
+  # 关系数据库：设备/用户/车辆/配置等
+  # PostgreSQL 示例：postgres://user:password@host:5432/jte?sslmode=disable
+  # MySQL 示例：user:password@tcp(host:3306)/jte?charset=utf8mb4&parseTime=true
+  type: "postgres"
+  dsn: "postgres://jte:JTE_PG_PASSWORD@127.0.0.1:5432/jte?sslmode=disable"
+  retention_days: 365
+
+  # 时序数据库：轨迹/报警/CAN 等高频时序数据
+  # 生产环境必须配置，SQLite 无法承载高频写入
+  time_series:
+    driver: "tdengine"
+    host: "127.0.0.1"
+    port: 6030
+    user: "root"
+    # 密码通过环境变量 JTE_TDENGINE_PASSWORD 注入
+    password: ""
+    database: "jte_ts"
+    keep_days: 365
+    batch_size: 2000
+    buffer_size: 50000
+    flush_interval_ms: 100
+    # 集群部署参数
+    replica: 3
+    vgroups: 100
+    days: 10
+    blocks: 6
+    # ws/unified 高性能写入
+    ws_enabled: true
+    ws_tls_enabled: false
+    ws_skip_verify: false
+    ws_auto_reconnect: true
+    ws_reconnect_retry_count: 10
+
+  # 缓存层：在线状态/最新位置/会话
+  cache:
+    driver: "redis"
+    mode: "single"
+    addr: "127.0.0.1:6379"
+    # 密码通过环境变量 JTE_STORAGE_CACHE_PASSWORD 注入
+    password: ""
+    db: 0
+    pool_size: 20
+    key_prefix: "jte:"
+    latest_location_ttl: 300
+    online_status_ttl: 120
+
+  # 对象存储：归档轨迹/原始视频
+  object:
+    driver: "minio"
+    endpoint: "127.0.0.1:9000"
+    access_key: "jte"
+    # SecretKey 通过环境变量 JTE_STORAGE_OBJECT_SECRET_KEY 注入
+    secret_key: ""
+    bucket: "jte-archive"
+    region: ""
+    use_ssl: false
+    archive_bucket: "jte-archive"
+    video_bucket: "jte-video"
+
+  archive:
+    enabled: true
+    schedule_hour: 2
+    keep_days: 0
+    ttl_buffer_days: 35
+    batch_days: 1
+    delete_delay_days: 7
+    max_device_scan: 500
+
+# JT/T 809 上级平台转发配置
+jt809:
+  platforms: []
+  server_port: 0
+  # FIXED-2026-07-23 [P2]: 809 客户端熔断器配置
+  circuit_breaker:
+    enabled: true              # 是否启用熔断器
+    fail_threshold: 10         # 连续失败触发熔断的次数
+    reset_timeout: 300         # 熔断恢复时间（秒），5 分钟
+  # 缓冲区溢出告警
+  pending_buffer_overflow_alert: true
+
+# ZLMediaKit 流媒体引擎
+zlmediakit:
+  url: "http://127.0.0.1:80"
+  secret: ""
+  tcp_mode: 1
+
+# 日志：生产环境使用 JSON 格式
+logging:
+  level: "info"
+  format: "json"
+  output: "both"
+  file_path: "/var/log/jte/jte.log"
+  max_size: 100
+  max_backups: 30
+  max_age: 90
+  compress: true
+  mask_sensitive: true
+
+# 监控告警
+monitor:
+  enabled: true
+  alert_channels:
+    dingtalk:
+      enabled: false
+      webhook: ""
+    wechat:
+      enabled: false
+      webhook: ""
+
+# 优雅停机
+shutdown:
+  drain_timeout_seconds: 300
+  api_shutdown_timeout_seconds: 10
+  reconnect_backoff_max_seconds: 300
+  drain_check_interval_seconds: 5

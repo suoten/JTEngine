@@ -3,6 +3,7 @@ package module
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -178,10 +179,18 @@ func (m *RBACManager) createDefaultAdmin() {
 		UpdatedAt:    time.Now(),
 	}
 	_ = m.save()
-	m.logger.Info("default admin user created with random password",
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P0]: 禁止在日志中明文记录密码！
+	// 日志文件会被多个系统收集（ELK/Loki/SIEM），明文密码长期暴露。
+	// 密码仅输出到 stdout（控制台一次性输出），不写入日志文件。
+	m.logger.Info("default admin user created",
 		zap.String("username", "admin"),
-		zap.String("password", defaultPassword),
-		zap.String("warning", "please record this password and change it immediately after first login"))
+		zap.String("warning", "initial password printed to stdout, please change it immediately after first login"))
+	// 密码仅输出到控制台，不通过 zap 记录到日志文件
+	fmt.Printf("========================================\n")
+	fmt.Printf("JTE Default Admin Password: %s\n", defaultPassword)
+	fmt.Printf("Username: admin\n")
+	fmt.Printf("⚠️  Please change this password immediately after first login!\n")
+	fmt.Printf("========================================\n")
 }
 
 // generateRandomPassword 生成指定长度的随机密码（字母+数字）。
@@ -462,28 +471,18 @@ func verifyPassword(hash, password string) bool {
 			return false
 		}
 		actual := sm3PasswordHash(salt, password, iterations)
-		// 常量时间比较防时序攻击
-		return constantTimeCompare(actual, expected)
+		// FIXED [2026-07-17]: 使用标准库 subtle.ConstantTimeCompare 替代自定义实现
+		return subtle.ConstantTimeCompare(actual, expected) == 1
 	}
 	// bcrypt 方案
 	if len(hash) > 0 && hash[0] == '$' {
 		return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 	}
 	// 旧版 SHA256+静态盐方案（仅兼容验证）
+	// FIXED [2026-07-17]: 使用 subtle.ConstantTimeCompare 替代字符串比较，防时序攻击
 	h := sha256.Sum256([]byte("jte-salt:" + password))
-	return hex.EncodeToString(h[:]) == hash
-}
-
-// constantTimeCompare 常量时间字节比较（防时序攻击）
-func constantTimeCompare(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var result byte
-	for i := 0; i < len(a); i++ {
-		result |= a[i] ^ b[i]
-	}
-	return result == 0
+	expectedHash := hex.EncodeToString(h[:])
+	return subtle.ConstantTimeCompare([]byte(expectedHash), []byte(hash)) == 1
 }
 
 func generateID() string {

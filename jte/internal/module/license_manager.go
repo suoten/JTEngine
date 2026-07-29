@@ -137,7 +137,6 @@ type LicenseManager struct {
 	client             *WebsiteClient
 	configDir          string
 	dailyTick          *time.Ticker
-	weeklyTick         *time.Ticker
 	stopCh             chan struct{}
 	stopOnce           sync.Once
 	offlineCache       map[string]*offlineCacheEntry
@@ -173,7 +172,13 @@ type expiredDataEntry struct {
 }
 
 var TrialModules = map[string]time.Duration{
-	"protocol_809": 30 * 24 * time.Hour,
+	"protocol_809":   30 * 24 * time.Hour,
+	"protocol_1045":  30 * 24 * time.Hour,
+	"protocol_1078":  30 * 24 * time.Hour,
+	"protocol_905":   30 * 24 * time.Hour,
+	"storage":       30 * 24 * time.Hour,
+	"ai":            30 * 24 * time.Hour,
+	"ai_nlp":        30 * 24 * time.Hour,
 }
 
 var (
@@ -286,6 +291,16 @@ func (m *LicenseManager) Activate(licenseKey string) error {
 		zap.Strings("modules", lic.Modules),
 		zap.Time("expires_at", lic.ExpiresAt))
 
+	// P1-FIX: 审计日志——记录授权码激活操作（等保2.0 要求）
+	m.logger.Info("AUDIT: license_activated",
+		zap.String("audit_action", "license_activate"),
+		zap.String("license_id", lic.ID),
+		zap.Strings("modules", lic.Modules),
+		zap.String("customer_id", lic.CustomerID),
+		zap.Time("expires_at", lic.ExpiresAt),
+		zap.String("fingerprint", m.fingerprint),
+		zap.String("tier", lic.Tier))
+
 	// AUTO-FIX-2026-06-30 [集成-7]: 更新授权等级指标
 	metrics.LicenseTier.Set(licenseTierRank(lic.Tier))
 
@@ -309,23 +324,22 @@ func licenseTierRank(tier string) float64 {
 	}
 }
 
-// defaultOfflineUnbindHMACSecret is the built-in fallback secret mixed into
-// the machine-fingerprint-derived HMAC key. It is ONLY used when the operator
-// has not configured auth.offline_unbind_secret, preserving backward
-// compatibility for offline unbind certificates signed before this fix.
-//
-// AUTO-FIX-2026-06-29 [P2]: 此前名为 offlineUnbindHMACSecret 且为唯一密钥来源，
-// 源码公开后任何人都可伪造合法凭证。现已支持通过 config.Auth.OfflineUnbindSecret
-// 注入部署专属密钥；该字段仅作为未配置时的兜底，不应在新部署中依赖。
-var defaultOfflineUnbindHMACSecret = []byte("jte-offline-unbind-v1-secret")
+// P0-FIX: 移除硬编码 defaultOfflineUnbindHMACSecret。
+// 原值 "jte-offline-unbind-v1-secret" 在源码公开后任何人都可伪造离线解绑凭证。
+// 现强制要求通过 config.Auth.OfflineUnbindSecret 注入部署专属密钥。
+// 未配置时离线解绑功能不可用（返回错误），防止凭证伪造。
+var defaultOfflineUnbindHMACSecret = []byte{} // 空切片，表示未配置
 
 // deriveOfflineUnbindKey derives an HMAC-SHA256 key from the machine
-// fingerprint combined with the application secret. 使用注入的 secret；
-// 若未注入（nil 或空）则回退到 defaultOfflineUnbindHMACSecret。
+// fingerprint combined with the application secret.
+// P0-FIX: 强制要求注入 secret，未配置时返回 nil（调用方应拒绝生成凭证）。
 func (m *LicenseManager) deriveOfflineUnbindKey(fingerprint string) []byte {
 	secret := m.offlineUnbindSecret
 	if len(secret) == 0 {
 		secret = defaultOfflineUnbindHMACSecret
+	}
+	if len(secret) == 0 {
+		return nil // 未配置 secret，拒绝生成 HMAC 密钥
 	}
 	h := sha256.Sum256(append([]byte(fingerprint), secret...))
 	return h[:]
@@ -344,6 +358,7 @@ func deriveOfflineUnbindKeyWithSecret(fingerprint string, secret []byte) []byte 
 // generateOfflineUnbindCert builds an offline unbind certificate for the given
 // license id. 优先使用本机 RSA 私钥签名（UNBIND-RSA- 前缀），RSA 不可用时
 // 降级为 HMAC-SHA256（UNBIND- 前缀，向后兼容）。
+// P0-FIX: HMAC 降级模式下强制要求配置 secret，未配置时拒绝生成凭证。
 func (m *LicenseManager) generateOfflineUnbindCert(id string) (string, error) {
 	if m.fingerprint == "" || m.fingerprint == "unknown" {
 		return "", fmt.Errorf("machine fingerprint not available")
@@ -358,7 +373,6 @@ func (m *LicenseManager) generateOfflineUnbindCert(id string) (string, error) {
 			signingPayload := fmt.Sprintf("%s|%s|%d", id, m.fingerprint, timestamp)
 			sig, err := m.localKeys.SignBase64([]byte(signingPayload))
 			if err == nil {
-				// 格式: licenseID|fingerprint|timestamp|publicKeyPEM(base64)|rsaSignature
 				pubKeyB64 := base64.StdEncoding.EncodeToString([]byte(pubKeyPEM))
 				certPayload := fmt.Sprintf("%s|%s|%d|%s|%s", id, m.fingerprint, timestamp, pubKeyB64, sig)
 				return "UNBIND-RSA-" + base64.StdEncoding.EncodeToString([]byte(certPayload)), nil
@@ -369,8 +383,11 @@ func (m *LicenseManager) generateOfflineUnbindCert(id string) (string, error) {
 	}
 
 	// 降级：HMAC-SHA256
-	signingPayload := fmt.Sprintf("%s|%s|%d", id, m.fingerprint, timestamp)
 	key := m.deriveOfflineUnbindKey(m.fingerprint)
+	if key == nil {
+		return "", fmt.Errorf("offline unbind HMAC secret not configured; set auth.offline_unbind_secret in config or use RSA mode")
+	}
+	signingPayload := fmt.Sprintf("%s|%s|%d", id, m.fingerprint, timestamp)
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(signingPayload))
 	signature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
@@ -585,6 +602,13 @@ func (m *LicenseManager) Remove(id string) error {
 	m.unloadOrphanedModules(removedModules)
 
 	m.logger.Info("license removed", zap.String("id", id))
+
+	// P1-FIX: 审计日志——记录授权码删除操作（等保2.0 要求）
+	m.logger.Info("AUDIT: license_removed",
+		zap.String("audit_action", "license_remove"),
+		zap.String("license_id", id),
+		zap.Strings("removed_modules", removedModules),
+		zap.String("fingerprint", m.fingerprint))
 	return nil
 }
 
@@ -927,17 +951,19 @@ func (m *LicenseManager) GetStatus() interface{} {
 func (m *LicenseManager) StartValidation() {
 	m.validateAll()
 
+	// P1-FIX: 拆分职责——daily ticker 仅本地校验，online ticker 仅联网校验
 	m.dailyTick = time.NewTicker(24 * time.Hour)
-	// AUTO-FIX-2026-06-30 [P2-9]: 联网验证频率从 7 天改为 1 天，
-	// 降低攻击者通过断网绕过在线吊销的窗口期。
-	m.weeklyTick = time.NewTicker(24 * time.Hour)
+	onlineInterval := 24 * time.Hour // P1-FIX: 联网验证频率为每天一次
 
-	util.SafeGo(m.logger, "licenseManager.goroutine3", func() {
+	util.SafeGo(m.logger, "licenseManager.validationLoop", func() {
+		onlineTicker := time.NewTicker(onlineInterval)
+		defer onlineTicker.Stop()
+
 		for {
 			select {
 			case <-m.dailyTick.C:
 				m.validateAll()
-			case <-m.weeklyTick.C:
+			case <-onlineTicker.C:
 				m.onlineValidate()
 			case <-m.stopCh:
 				return
@@ -956,9 +982,7 @@ func (m *LicenseManager) StopValidation() {
 	if m.dailyTick != nil {
 		m.dailyTick.Stop()
 	}
-	if m.weeklyTick != nil {
-		m.weeklyTick.Stop()
-	}
+	// P1-FIX: weeklyTick 已移除（合并到 goroutine 内部 ticker）
 	m.stopOnce.Do(func() { close(m.stopCh) })
 }
 
@@ -1275,18 +1299,26 @@ func parseAndVerifyLicense(licenseKey string) (*License, error) {
 		return nil, fmt.Errorf("decode signature: %w", err)
 	}
 
+	// [P0-安全] 显式初始化公钥，失败时返回错误而非 log.Fatal
+	if err := lazyInit(); err != nil {
+		return nil, fmt.Errorf("%w: signature key initialization failed: %v", ErrInvalidLicense, err)
+	}
+
+	// 通过线程安全方式获取公钥快照，避免数据竞争
+	rsaPubKey, ecdsaPubKey, _ := getPublicKeys()
+
 	// 公钥必须已初始化，否则拒绝任何 license（防止跳过签名验证）
-	if parsedRSAPublicKey == nil && parsedECDSAPublicKey == nil {
+	if rsaPubKey == nil && ecdsaPubKey == nil {
 		return nil, fmt.Errorf("%w: no public key available for verification", ErrInvalidLicense)
 	}
 
 	hash := sha256.Sum256(payload)
 	verified := false
-	if parsedECDSAPublicKey != nil {
-		verified = ecdsa.VerifyASN1(parsedECDSAPublicKey, hash[:], signature)
+	if ecdsaPubKey != nil {
+		verified = ecdsa.VerifyASN1(ecdsaPubKey, hash[:], signature)
 	}
-	if !verified && parsedRSAPublicKey != nil {
-		if err := rsa.VerifyPKCS1v15(parsedRSAPublicKey, crypto.SHA256, hash[:], signature); err != nil {
+	if !verified && rsaPubKey != nil {
+		if err := rsa.VerifyPKCS1v15(rsaPubKey, crypto.SHA256, hash[:], signature); err != nil {
 			return nil, fmt.Errorf("%w: signature verification failed", ErrInvalidLicense)
 		}
 		verified = true
@@ -1328,6 +1360,47 @@ type trialStateFile struct {
 	FirstStartedAt     time.Time `json:"first_started_at"`
 	MachineFingerprint string    `json:"machine_fingerprint"`
 	TrialCount         int       `json:"trial_count"`
+	// INDUSTRIAL-FIX-2026-07-24 [P0-红线]: RSA-SHA256 签名，防止篡改试用状态文件实现无限试用
+	// 签名原文：module_name|first_started_at|machine_fingerprint|trial_count
+	Signature string `json:"signature"`
+}
+
+// trialStateSigningPayload 构造试用状态文件的签名原文
+func (s *trialStateFile) trialStateSigningPayload() string {
+	return fmt.Sprintf("%s|%s|%s|%d",
+		s.ModuleName,
+		s.FirstStartedAt.Format(time.RFC3339Nano),
+		s.MachineFingerprint,
+		s.TrialCount,
+	)
+}
+
+// signTrialState 使用本机 RSA 私钥对试用状态文件签名
+func (m *LicenseManager) signTrialState(state *trialStateFile) {
+	if m.localKeys == nil {
+		return
+	}
+	sig, err := m.localKeys.SignBase64([]byte(state.trialStateSigningPayload()))
+	if err != nil {
+		m.logger.Warn("failed to sign trial state file", zap.Error(err))
+		return
+	}
+	state.Signature = sig
+}
+
+// verifyTrialStateSignature 校验试用状态文件签名
+func (m *LicenseManager) verifyTrialStateSignature(state *trialStateFile) bool {
+	if state.Signature == "" {
+		return false
+	}
+	if m.localKeys == nil {
+		return true // 无本机密钥时跳过校验（兼容旧数据）
+	}
+	sigBytes, err := base64.StdEncoding.DecodeString(state.Signature)
+	if err != nil {
+		return false
+	}
+	return VerifyLocalSignature(&m.localKeys.PrivateKey.PublicKey, []byte(state.trialStateSigningPayload()), sigBytes) == nil
 }
 
 func (m *LicenseManager) trialStateFilePath(moduleName string) string {
@@ -1346,7 +1419,17 @@ func (m *LicenseManager) checkTrialStateFile(moduleName string) error {
 
 	var state trialStateFile
 	if err := json.Unmarshal(data, &state); err != nil {
-		return nil
+		// INDUSTRIAL-FIX-2026-07-24 [P0-红线]: 损坏的试用状态文件视为已使用，阻止重置
+		m.logger.Warn("trial state file corrupted, treating as previously used",
+			zap.String("module", moduleName), zap.Error(err))
+		return fmt.Errorf("trial for %s has a corrupted state file (possible tampering), contact support", moduleName)
+	}
+
+	// INDUSTRIAL-FIX-2026-07-24 [P0-红线]: 校验签名，防止篡改试用状态文件
+	if !m.verifyTrialStateSignature(&state) {
+		m.logger.Warn("trial state file signature verification failed, possible tampering",
+			zap.String("module", moduleName))
+		return fmt.Errorf("trial for %s has an invalid state file signature (possible tampering), contact support", moduleName)
 	}
 
 	if state.MachineFingerprint != "" && state.MachineFingerprint != m.fingerprint {
@@ -1388,6 +1471,8 @@ func (m *LicenseManager) saveTrialStateFile(moduleName string, startedAt time.Ti
 	if state.FirstStartedAt.IsZero() {
 		state.FirstStartedAt = startedAt
 	}
+	// INDUSTRIAL-FIX-2026-07-24 [P0-红线]: 对试用状态文件签名
+	m.signTrialState(&state)
 
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {

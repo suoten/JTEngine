@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql" // AUTO-FIX-2026-07-14: MySQL 驱动注册，支持 sql.Open("mysql", ...)
 	"go.uber.org/zap"
 )
 
@@ -21,6 +22,33 @@ type MigratorConfig struct {
 	BatchSize    int
 	DryRun       bool
 	ConfigDir    string
+}
+
+// [P2-3] allowedTables 是迁移系统允许操作的表名白名单。
+// 表名来自硬编码列表，不接收外部输入，防止 SQL 注入。
+// migrateTable / countRows / Verify / sampleCompare 在拼接 SQL 前均校验此白名单。
+var allowedTables = map[string]bool{
+	"vehicles":      true,
+	"locations":     true,
+	"alarms":        true,
+	"sessions":      true,
+	"protocol_logs": true,
+}
+
+// [P1-52] sanitizeIdentifier 净化 SQL 标识符（表名/列名），
+// 仅允许字母、数字、下划线，防止通过列名注入 SQL。
+// 用于 sampleCompare 中对 rows.Columns() 返回的列名做防御性校验。
+func sanitizeIdentifier(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 type Migrator struct {
@@ -44,6 +72,11 @@ type TableProgress struct {
 	TotalRows    int64     `json:"total_rows"`
 	MigratedRows int64     `json:"migrated_rows"`
 	LastID       int64     `json:"last_id"`
+	// [P1-2] LastPK 记录上次迁移的主键游标（Keyset 分页）。
+	// 查询使用 WHERE id > LastPK ORDER BY id ASC LIMIT batch_size，
+	// 相比 OFFSET 分页具有 O(1) 性能优势，不受表数据量影响。
+	// 向后兼容：旧进度文件无 LastPK（值为 0）时，首次从 ID=0 开始。
+	LastPK       int64     `json:"last_pk"`
 	CompletedAt  time.Time `json:"completed_at,omitempty"`
 	Duration     string    `json:"duration,omitempty"`
 	VerifyStatus string    `json:"verify_status,omitempty"`
@@ -65,6 +98,11 @@ func (m *Migrator) Connect() error {
 	if err != nil {
 		return fmt.Errorf("open source db: %w", err)
 	}
+	// FIXED: [数据库连接池缺失] 迁移工具未设置连接池参数，可能导致连接耗尽 [2026-07-17]
+	srcDB.SetMaxOpenConns(10)
+	srcDB.SetMaxIdleConns(5)
+	srcDB.SetConnMaxLifetime(30 * time.Minute)
+	srcDB.SetConnMaxIdleTime(5 * time.Minute)
 	if err := srcDB.Ping(); err != nil {
 		srcDB.Close()
 		return fmt.Errorf("ping source db: %w", err)
@@ -75,6 +113,11 @@ func (m *Migrator) Connect() error {
 	if err != nil {
 		return fmt.Errorf("open target db: %w", err)
 	}
+	// FIXED: [数据库连接池缺失] 迁移工具目标库未设置连接池参数 [2026-07-17]
+	tgtDB.SetMaxOpenConns(10)
+	tgtDB.SetMaxIdleConns(5)
+	tgtDB.SetConnMaxLifetime(30 * time.Minute)
+	tgtDB.SetConnMaxIdleTime(5 * time.Minute)
 	if err := tgtDB.Ping(); err != nil {
 		tgtDB.Close()
 		return fmt.Errorf("ping target db: %w", err)
@@ -129,6 +172,10 @@ func (m *Migrator) Migrate() error {
 }
 
 func (m *Migrator) migrateTable(table string) error {
+	// [P2-3] 表名白名单校验：表名直接拼入 SQL，必须校验防止注入。
+	if !allowedTables[table] {
+		return fmt.Errorf("unknown table: %s", table)
+	}
 	tp, exists := m.progress.Tables[table]
 	if !exists {
 		tp = &TableProgress{}
@@ -151,10 +198,13 @@ func (m *Migrator) migrateTable(table string) error {
 		return nil
 	}
 
-	offset := tp.MigratedRows
-	for offset < tp.TotalRows {
-		query := fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d", table, m.config.BatchSize, offset)
-		rows, err := m.srcDB.QueryContext(context.Background(), query)
+	// [P1-2] Keyset 分页：使用 WHERE id > LastPK ORDER BY id ASC LIMIT ? 替代 OFFSET 分页。
+	// OFFSET 分页在大表上性能灾难：数据库需要扫描并跳过前 offset 行，时间复杂度 O(offset)。
+	// Keyset 分页利用主键索引，直接定位到 LastPK 之后的位置，时间复杂度 O(1)。
+	for tp.MigratedRows < tp.TotalRows {
+		// 使用 keyset 查询：WHERE id > LastPK ORDER BY id ASC LIMIT batch_size
+		query := fmt.Sprintf("SELECT * FROM %s WHERE id > ? ORDER BY id ASC LIMIT %d", table, m.config.BatchSize)
+		rows, err := m.srcDB.QueryContext(context.Background(), query, tp.LastPK)
 		if err != nil {
 			return fmt.Errorf("query source: %w", err)
 		}
@@ -190,12 +240,18 @@ func (m *Migrator) migrateTable(table string) error {
 		}
 
 		batchCount := int64(0)
+		batchLastPK := tp.LastPK // 追踪本批最大 ID
 		for rows.Next() {
 			if err := rows.Scan(valuePtrs...); err != nil {
 				stmt.Close()
 				tx.Rollback()
 				rows.Close()
 				return fmt.Errorf("scan row: %w", err)
+			}
+
+			// 更新本批最大主键（假设第一列为主键 ID）
+			if pkVal, ok := values[0].(int64); ok && pkVal > batchLastPK {
+				batchLastPK = pkVal
 			}
 
 			if _, err := stmt.Exec(valuePtrs...); err != nil {
@@ -214,7 +270,7 @@ func (m *Migrator) migrateTable(table string) error {
 		}
 
 		tp.MigratedRows += batchCount
-		offset += batchCount
+		tp.LastPK = batchLastPK // 更新主键游标
 
 		if batchCount > 0 {
 			_ = m.saveProgress()
@@ -223,7 +279,8 @@ func (m *Migrator) migrateTable(table string) error {
 		m.logger.Debug("batch migrated",
 			zap.String("table", table),
 			zap.Int64("progress", tp.MigratedRows),
-			zap.Int64("total", tp.TotalRows))
+			zap.Int64("total", tp.TotalRows),
+			zap.Int64("last_pk", tp.LastPK))
 
 		if batchCount < int64(m.config.BatchSize) {
 			break
@@ -239,6 +296,10 @@ func columnList(columns []string) string {
 }
 
 func (m *Migrator) countRows(table string) (int64, error) {
+	// [P2-3] 表名白名单校验
+	if !allowedTables[table] {
+		return 0, fmt.Errorf("unknown table: %s", table)
+	}
 	var count int64
 	err := m.srcDB.QueryRowContext(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count)
 	return count, err
@@ -253,6 +314,10 @@ func (m *Migrator) Verify() error {
 	allOK := true
 
 	for _, table := range tables {
+		// [P2-3] 表名白名单校验
+		if !allowedTables[table] {
+			return fmt.Errorf("unknown table: %s", table)
+		}
 		var srcCount, tgtCount int64
 		_ = m.srcDB.QueryRowContext(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&srcCount)
 		_ = m.tgtDB.QueryRowContext(context.Background(), fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&tgtCount)
@@ -295,6 +360,10 @@ func (m *Migrator) Verify() error {
 }
 
 func (m *Migrator) sampleCompare(table string, sampleSize int) int {
+	// [P2-3] 表名白名单校验：白名单不通过返回 0（无差异），避免注入
+	if !allowedTables[table] {
+		return 0
+	}
 	rows, err := m.srcDB.QueryContext(context.Background(),
 		fmt.Sprintf("SELECT * FROM %s ORDER BY RAND() LIMIT %d", table, sampleSize))
 	if err != nil {
@@ -318,11 +387,13 @@ func (m *Migrator) sampleCompare(table string, sampleSize int) int {
 			continue
 		}
 
-		pkCol := cols[0]
+		// [P1-52] 列名来自 rows.Columns()（数据库 schema），非用户输入。
+		// 此处做防御性校验，防止源库被篡改后通过列名注入 SQL。
+		pkCol := sanitizeIdentifier(cols[0])
 		pkVal := fmt.Sprintf("%v", vals[0])
 		var tgtVal interface{}
 		err := m.tgtDB.QueryRowContext(context.Background(),
-			fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", cols[0], table, pkCol), pkVal).Scan(&tgtVal)
+			fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", pkCol, table, pkCol), pkVal).Scan(&tgtVal)
 		if err != nil {
 			mismatches++
 			fmt.Printf("    %s row %s=%s: not found in target\n", table, pkCol, pkVal)

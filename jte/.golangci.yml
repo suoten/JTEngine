@@ -1,76 +1,234 @@
-# golangci-lint 配置 — JTE 项目代码质量规范
+# golangci-lint 配置文件
+# [P0-安全] 启用安全关键 linter，确保代码质量与安全性
+# 安装: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 # 运行: golangci-lint run ./...
 
+# 全局超时时间：5 分钟，大型项目需要足够时间
 run:
   timeout: 5m
-  tests: true
-  modules-download-mode: readonly
+  # Go 版本（与 go.mod 对齐）
+  go: "1.22"
+  # 包含的目录
+  dirs:
+    - .
+  # 排除的目录（第三方库、生成代码等）
+  exclude-dirs:
+    - vendor
+    - third_party
+    - testdata
+    - examples
+    - builtin
+  # 允许并行运行
+  allow-parallel-runners: true
 
-linters:
-  enable:
-    - errcheck       # 检查未处理的错误
-    - gosimple       # 简化代码
-    - govet          # go vet 检查
-    - ineffassign    # 检查无效赋值
-    - staticcheck    # 综合静态检查
-    - typecheck      # 类型检查
-    - unused         # 未使用代码检查
-    - misspell       # 拼写检查
-    - revive         # 代码规范（替代 golint）
-    - gofmt          # 格式化检查
-    - goimports      # import 排序检查
-    - bodyclose      # http.Response.Body.Close 检查
-    - dupl           # 重复代码检测
-    - funlen         # 函数长度限制
-    - gocognit       # 认知复杂度
-    - gocritic       # 代码评审建议
-    - gocyclo        # 圈复杂度
-    - nakedret       # 裸 return 检查
-    - prealloc       # 切片预分配建议
-    - unconvert      # 不必要的类型转换
-    - unparam        # 未使用的函数参数
-    - whitespace     # 多余空行
-
-linters-settings:
-  funlen:
-    lines: 80
-    statements: 50
-  gocyclo:
-    min-complexity: 25
-  gocognit:
-    min-complexity: 30
-  dupl:
-    threshold: 120
-  misspell:
-    locale: US
-  revive:
-    rules:
-      - name: exported
-        disabled: true  # 允许未注释导出函数（渐进式启用）
-
-issues:
-  exclude-rules:
-    # 测试文件放宽限制
-    - path: _test\.go
-      linters:
-        - funlen
-        - gocyclo
-        - gocognit
-        - dupl
-        - errcheck
-    # main 包放宽限制
-    - path: cmd/
-      linters:
-        - funlen
-        - gocyclo
-    # 生成代码跳过
-    - path: ".*\\.gen\\.go$"
-      linters:
-        - all
-  max-issues-per-linter: 50
-  max-same-issues: 10
-
+# 输出格式
 output:
   formats:
     - format: colored-line-number
+      path: stderr
+  # 排序方式
   sort-results: true
+
+# Linter 配置
+linters:
+  # 启用的 linter
+  enable:
+    - errcheck    # 检查未处理的错误返回值
+    - gosec       # 安全扫描，检测潜在安全漏洞
+    - gocritic    # 代码质量检查，检测常见错误和可改进的代码
+    - revive      # 替代 golint 的现代 linter，风格和规范检查
+    - govet       # 基本检查，检测可疑代码结构
+    - staticcheck # 静态分析，检测大量常见错误
+    - unused      # 检测未使用的代码（函数、变量、类型等）
+    - misspell     # 拼写检查，自动检测注释和字符串中的拼写错误
+
+  # 禁用的 linter（不必要的或与项目不兼容的）
+  disable:
+    - lll         # 行长度限制过于严格，项目已有较长行
+    - funlen      # 函数长度限制过于严格
+    - wsl         # 强制空行风格，过于主观
+
+  # 快速模式（仅启用上述 linter）
+  fast: false
+
+# 各 linter 的具体配置
+linters-settings:
+  # errcheck: 检查未处理的错误
+  errcheck:
+    # 检查类型断言
+    check-type-assertions: true
+    # 检查 blank identifier (返回值被 _ 忽略)
+    check-blank: true
+    # 排除的函数（忽略这些函数的错误返回值）
+    exclude-functions:
+      - (io.Closer).Close
+      - (net/http.ResponseWriter).Write
+
+  # gosec: 安全扫描
+  gosec:
+    # 安全严重级别配置
+    severity: medium
+    # 置信度
+    confidence: medium
+    # 全局排除的规则编号
+    excludes:
+      - G104  # 审计错误未处理（errcheck 已覆盖）
+    # 全局排除的配置
+    config:
+      # 最大允许的整数位宽
+      global:
+        max: "30"
+
+  # gocritic: 代码质量
+  gocritic:
+    # 启用的检查器标签
+    enabled-tags:
+      - diagnostic      # 诊断潜在错误
+      - performance      # 性能改进建议
+      - style           # 代码风格
+    # 禁用的检查器
+    disabled-checks:
+      - hugeParam        # 大参数检查过于严格
+      - rangeValCopy     # range 循环值复制检查过于严格
+      - ifElseChain      # if-else 链检查过于主观
+      - singleCaseSwitch # 单 case switch 检查过于主观
+
+  # revive: 替代 golint
+  revive:
+    # 规则配置
+    rules:
+      - name: blank-imports
+        severity: warning
+      - name: context-as-argument
+        severity: warning
+      - name: context-keys-type
+        severity: warning
+      - name: dot-imports
+        severity: warning
+      - name: error-return
+        severity: warning
+      - name: error-strings
+        severity: warning
+      - name: error-naming
+        severity: warning
+      - name: exported
+        severity: warning
+        arguments:
+          - "checkPrivateReceivers"
+          - "sayRepetitiveInsteadOfStutters"
+      - name: increment-decrement
+        severity: warning
+      - name: indent-error-flow
+        severity: warning
+      - name: range
+        severity: warning
+      - name: receiver-naming
+        severity: warning
+      - name: time-naming
+        severity: warning
+      - name: var-declaration
+        severity: warning
+      - name: var-naming
+        severity: warning
+      - name: unexported-return
+        severity: warning
+        disabled: true  # 项目有未导出类型的返回值，过于严格
+
+  # govet: 基本检查
+  govet:
+    # 启用所有检查
+    enable-all: true
+    # 禁用的检查
+    disable:
+      - fieldalignment  # 结构体字段对齐检查过于严格
+    # 影子变量检查
+    settings:
+      shadow:
+        strict: false
+
+  # staticcheck: 静态分析
+  staticcheck:
+    # Go 版本
+    go: "1.22"
+    # 检查配置
+    checks:
+      - all        # 启用所有检查
+      # 禁用的检查编号
+      - -ST1000    # 文件头部注释检查过于严格
+      - -ST1003    # 命名规范检查过于主观
+      - -SA1019    # 弃用 API 检查（项目有兼容性需求）
+      - -SA1029    # JSON 编码键检查过于严格
+
+  # unused: 未使用代码
+  unused:
+    # 检查未使用的函数
+    check-functions: true
+    # 检查未使用的常量
+    check-constants: true
+    # 检查未使用的类型
+    check-types: true
+    # 检查未使用的字段
+    check-fields: true
+
+  # misspell: 拼写检查
+  misspell:
+    # 默认语言（美式英语）
+    locale: US
+    # 忽略的单词（项目特定术语）
+    ignore-rules:
+      - taosdata    # TDengine 默认密码
+      - jtengine    # 项目名称
+      - jte         # 项目缩写
+      - zlmediakit  # 媒体服务名称
+
+# 问题排除规则
+issues:
+  # 最大问题数（0 = 无限制）
+  max-issues-per-linter: 0
+  # 最大相同问题数（0 = 无限制）
+  max-same-issues: 0
+  # 排除的规则
+  exclude-rules:
+    # 测试文件放宽检查
+    - path: _test\.go
+      linters:
+        - errcheck    # 测试中允许忽略错误
+        - gosec       # 测试中允许硬编码密码
+        - gocritic    # 测试中放宽代码质量
+        - revive      # 测试中放宽导出检查
+      # 测试文件中不检查魔法数字
+      text: "magic number"
+
+    # 测试辅助文件放宽检查
+    - path: testutil/
+      linters:
+        - errcheck
+        - gosec
+        - revive
+
+    # main 包放宽检查
+    - path: cmd/
+      linters:
+        - gosec       # 命令行工具允许一些安全宽松
+        - gocritic
+
+    # 模拟器文件放宽安全检查
+    - path: simulator/
+      linters:
+        - gosec
+
+    # 迁移文件放宽检查
+    - path: migration/
+      linters:
+        - gocritic
+        - revive
+
+    # nolint 注释处理
+    - linters:
+        - staticcheck
+      text: "SA1019"  # 弃用 API 警告（项目有兼容性需求）
+
+  # 修复建议
+  fix: false  # 不自动修复（安全考虑）
+  # 显示所有问题
+  exclude-use-default: false

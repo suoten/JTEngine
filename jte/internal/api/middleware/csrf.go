@@ -10,9 +10,9 @@ import (
 )
 
 const (
-	CSRFTokenHeader = "X-CSRF-Token"
-	CSRFTokenCookie = "csrf_token"
-	CSRFTokenLength = 32
+	CSRFTokenHeader  = "X-CSRF-Token"
+	CSRFTokenCookie  = "csrf_token"
+	CSRFTokenLength  = 32
 	CSRFCookieMaxAge = 86400 // 1 天
 )
 
@@ -27,13 +27,20 @@ func GenerateCSRFToken() (string, error) {
 
 // SetCSRFToken 下发 CSRF token：HttpOnly + SameSite=Strict Cookie
 // 同时通过 gin.Context 传递，供 handler 写入响应体
+// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: Secure 参数根据 TLS 动态设置，
+// HTTPS 下 Secure=true 防止 Cookie 通过 HTTP 明文传输。
+// 考虑反向代理场景：TLS 在代理层终止时 c.Request.TLS 为 nil，需检查 X-Forwarded-Proto。
 func SetCSRFToken(c *gin.Context) (string, error) {
 	token, err := GenerateCSRFToken()
 	if err != nil {
 		return "", err
 	}
+	secure := c.Request.TLS != nil || isHTTPSProxy(c)
 	c.SetSameSite(http.SameSiteStrictMode)
-	c.SetCookie(CSRFTokenCookie, token, CSRFCookieMaxAge, "/", "", false, true)
+	// FIXED: [CSRF] HttpOnly 必须为 false，否则前端 JavaScript 无法读取 cookie 值
+	// 来设置 X-CSRF-Token 请求头，导致所有写操作（POST/PUT/DELETE）被 CSRF 中间件拒绝（403）。
+	// 双提交 Cookie 模式要求前端能读取 cookie 值，因此 HttpOnly=false 是正确的设计。
+	c.SetCookie(CSRFTokenCookie, token, CSRFCookieMaxAge, "/", "", secure, false)
 	c.Set("csrf_token", token)
 	return token, nil
 }

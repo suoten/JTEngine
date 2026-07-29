@@ -1,9 +1,11 @@
+// FIXED: [P0] 0x0200位置解析：经纬度未按StatusFlag位2/3应用正负号，南纬/西经坐标变正值 [2026-07-17]
 package jt808
 
 import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -11,10 +13,10 @@ import (
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
-// jt808CoordScaleFactor JT/T 808 协议坐标缩放因子（AUTO-FIX-2026-07-07 [code_quality]：消除魔术数字）。
+// JT808CoordScaleFactor JT/T 808 协议坐标缩放因子（AUTO-FIX-2026-07-07 [code_quality]：消除魔术数字）。
 // 协议规定经纬度以 uint32 存储，精度 6 位小数（即度 × 10^6）。
 // 编码时 float64 → uint32 乘以该因子；解码时 uint32 → float64 除以该因子。
-const jt808CoordScaleFactor = 1000000.0
+const JT808CoordScaleFactor = 1000000.0
 
 type RawMessage struct {
 	ID   uint16
@@ -130,10 +132,23 @@ func (m *AuthMessage) Marshal() ([]byte, error) {
 	return buf, nil
 }
 
+// allowIMEIHeuristic 控制是否启用启发式 IMEI 检测。
+// FIXED-2026-07-22 [P0]: 启发式 IMEI 检测（末尾15字节全数字）会误截断以纯数字结尾的鉴权码。
+// 默认 false（关闭），标准 0x0102 body 全部作为鉴权码。
+// 仅当调用方明确知道终端使用厂商扩展（body = 鉴权码 + 15B IMEI）时，
+// 通过 SetIMEIHeuristic(true) 启用。
+var allowIMEIHeuristic = false
+
+// SetIMEIHeuristic 设置是否启用启发式 IMEI 检测（非线程安全，应在初始化阶段调用）。
+func SetIMEIHeuristic(enabled bool) {
+	allowIMEIHeuristic = enabled
+}
+
 func (m *AuthMessage) Unmarshal(data []byte) error {
 	// 标准 0x0102 body 仅鉴权码（向后兼容：IMEI/SoftwareVersion 为可选扩展）
-	// 启发式解析：若 body 末尾 15 字节全为 ASCII 数字，则判定为 IMEI 扩展字段
-	if len(data) > 15 && isAllDigits(data[len(data)-15:]) {
+	// FIXED-2026-07-22 [P0]: 默认关闭启发式 IMEI 检测，避免误截断纯数字结尾的鉴权码。
+	// 仅当 allowIMEIHeuristic=true 时，才尝试从 body 末尾剥离 15B IMEI 扩展。
+	if allowIMEIHeuristic && len(data) > 15 && isAllDigits(data[len(data)-15:]) {
 		m.IMEI = string(data[len(data)-15:])
 		remaining := data[:len(data)-15]
 		// SoftwareVersion 无法在没有长度前缀的情况下可靠区分，留空
@@ -182,8 +197,18 @@ type LocationMessage struct {
 	// AUTO-FIX-2026-06-26: 补充0x04+扩展附加信息项字段（按第一轮.txt要求）[2026-06-26]
 	OverspeedAlarmState uint32 // 0x04 超速报警附加状态
 	AnalogValue         uint16 // 0x06 模拟量
-	TirePressure        []byte // 0x05/0x11 胎压信息（原始字节）
-	ExtraItems          map[byte][]byte // 0x07+ 其他未识别附加项（原始数据保留）
+	TirePressure        []byte // 0x05 胎压信息（原始字节）
+	// FIXED: [P1] 0x11 从 TirePressure 分离，按 JT/T 808-2019 标准为路线行驶报警附加信息 [2026-07-17]
+	RouteAlarmID        uint32 // 0x11 路线ID
+	RouteAlarmTime      uint16 // 0x11 路线行驶时间（秒）
+	RouteAlarmResult    byte   // 0x11 路线行驶结果
+	SignalStrength      uint16 // 0x12 信号强度（GSM 模块）
+	IOState             uint16 // 0x13 IO 状态
+	ExtVehicleState     uint32 // 0x25 扩展车辆信号状态
+	IOStateBits         uint32 // 0x2A IO 状态位
+	CustomData0x30      []byte // 0x30 自定义数据（变长）
+	CustomData0x31      []byte // 0x31 自定义数据（变长）
+	ExtraItems          map[byte][]byte // 其他未识别附加项（原始数据保留）
 }
 
 func (m *LocationMessage) MsgID() uint16 { return MsgIDLocation }
@@ -205,7 +230,15 @@ func (m *LocationMessage) Marshal() ([]byte, error) {
 	statusFlag[3] = byte(m.StatusFlag)
 	buf = append(buf, statusFlag...)
 
-	lat := uint32(m.Latitude * jt808CoordScaleFactor)
+	// FIXED: [P0] 编码时取绝对值，N/S 由 StatusFlag bit2 指示 [2026-07-17]
+	absLat := m.Latitude
+	if absLat < 0 {
+		absLat = -absLat
+	}
+	if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
 	latBytes := make([]byte, 4)
 	latBytes[0] = byte(lat >> 24)
 	latBytes[1] = byte(lat >> 16)
@@ -213,7 +246,15 @@ func (m *LocationMessage) Marshal() ([]byte, error) {
 	latBytes[3] = byte(lat)
 	buf = append(buf, latBytes...)
 
-	lon := uint32(m.Longitude * jt808CoordScaleFactor)
+	// FIXED: [P0] 编码时取绝对值，E/W 由 StatusFlag bit3 指示 [2026-07-17]
+	absLon := m.Longitude
+	if absLon < 0 {
+		absLon = -absLon
+	}
+	if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
 	lonBytes := make([]byte, 4)
 	lonBytes[0] = byte(lon >> 24)
 	lonBytes[1] = byte(lon >> 16)
@@ -236,7 +277,10 @@ func (m *LocationMessage) Marshal() ([]byte, error) {
 	dirBytes[1] = byte(m.Direction)
 	buf = append(buf, dirBytes...)
 
-	timeBCD := StringToBCD(m.Time)
+	timeBCD, err := StringToBCD6(m.Time)
+	if err != nil {
+		return nil, err
+	}
 	buf = append(buf, timeBCD...)
 
 	// 附加信息项（TLV格式），按 JT/T 808-2019 标准
@@ -265,16 +309,62 @@ func (m *LocationMessage) Marshal() ([]byte, error) {
 		buf = append(buf, 0x06, 0x02)
 		buf = append(buf, byte(m.AnalogValue>>8), byte(m.AnalogValue))
 	}
-	// 0x05/0x11 胎压信息
+	// 0x05 胎压信息
 	if len(m.TirePressure) > 0 {
 		buf = append(buf, 0x05, byte(len(m.TirePressure)))
 		buf = append(buf, m.TirePressure...)
 	}
+	// FIXED: [P1] 0x11 路线行驶报警附加信息（7字节: 路线ID 4B + 行驶时间 2B + 结果 1B） [2026-07-17]
+	if m.RouteAlarmResult != 0 || m.RouteAlarmID != 0 {
+		buf = append(buf, 0x11, 0x07)
+		buf = append(buf, byte(m.RouteAlarmID>>24), byte(m.RouteAlarmID>>16), byte(m.RouteAlarmID>>8), byte(m.RouteAlarmID))
+		buf = append(buf, byte(m.RouteAlarmTime>>8), byte(m.RouteAlarmTime))
+		buf = append(buf, m.RouteAlarmResult)
+	}
+	// 0x12 信号强度
+	if m.SignalStrength > 0 {
+		buf = append(buf, 0x12, 0x02)
+		buf = append(buf, byte(m.SignalStrength>>8), byte(m.SignalStrength))
+	}
+	// 0x13 IO状态
+	if m.IOState > 0 {
+		buf = append(buf, 0x13, 0x02)
+		buf = append(buf, byte(m.IOState>>8), byte(m.IOState))
+	}
+	// 0x25 扩展车辆信号状态
+	if m.ExtVehicleState > 0 {
+		buf = append(buf, 0x25, 0x04)
+		buf = append(buf, byte(m.ExtVehicleState>>24), byte(m.ExtVehicleState>>16), byte(m.ExtVehicleState>>8), byte(m.ExtVehicleState))
+	}
+	// 0x2A IO状态位
+	if m.IOStateBits > 0 {
+		buf = append(buf, 0x2A, 0x04)
+		buf = append(buf, byte(m.IOStateBits>>24), byte(m.IOStateBits>>16), byte(m.IOStateBits>>8), byte(m.IOStateBits))
+	}
+	// 0x30 自定义数据
+	if len(m.CustomData0x30) > 0 {
+		buf = append(buf, 0x30, byte(len(m.CustomData0x30)))
+		buf = append(buf, m.CustomData0x30...)
+	}
+	// 0x31 自定义数据
+	if len(m.CustomData0x31) > 0 {
+		buf = append(buf, 0x31, byte(len(m.CustomData0x31)))
+		buf = append(buf, m.CustomData0x31...)
+	}
 	// 其他未识别附加项
-	for id, val := range m.ExtraItems {
-		if len(val) > 0 {
-			buf = append(buf, id, byte(len(val)))
-			buf = append(buf, val...)
+	// FIXED: [P0] map 迭代顺序随机，改为按 itemID 排序后遍历，确保编码确定性 [2026-07-22]
+	if len(m.ExtraItems) > 0 {
+		itemIDs := make([]byte, 0, len(m.ExtraItems))
+		for id := range m.ExtraItems {
+			itemIDs = append(itemIDs, id)
+		}
+		sort.Slice(itemIDs, func(i, j int) bool { return itemIDs[i] < itemIDs[j] })
+		for _, id := range itemIDs {
+			val := m.ExtraItems[id]
+			if len(val) > 0 {
+				buf = append(buf, id, byte(len(val)))
+				buf = append(buf, val...)
+			}
 		}
 	}
 
@@ -294,16 +384,24 @@ func (m *LocationMessage) Unmarshal(data []byte) error {
 	m.StatusFlag = uint32(data[4])<<24 | uint32(data[5])<<16 | uint32(data[6])<<8 | uint32(data[7])
 
 	latRaw := uint32(data[8])<<24 | uint32(data[9])<<16 | uint32(data[10])<<8 | uint32(data[11])
-	m.Latitude = float64(latRaw) / jt808CoordScaleFactor
+	m.Latitude = float64(latRaw) / JT808CoordScaleFactor
+	// FIXED: [P0] StatusFlag bit2=1 表示南纬，Latitude 取负 [2026-07-17]
+	if m.StatusFlag&0x04 != 0 {
+		m.Latitude = -m.Latitude
+	}
 
 	lonRaw := uint32(data[12])<<24 | uint32(data[13])<<16 | uint32(data[14])<<8 | uint32(data[15])
-	m.Longitude = float64(lonRaw) / jt808CoordScaleFactor
+	m.Longitude = float64(lonRaw) / JT808CoordScaleFactor
+	// FIXED: [P0] StatusFlag bit3=1 表示西经，Longitude 取负 [2026-07-17]
+	if m.StatusFlag&0x08 != 0 {
+		m.Longitude = -m.Longitude
+	}
 
 	m.Altitude = uint16(data[16])<<8 | uint16(data[17])
 	m.Speed = uint16(data[18])<<8 | uint16(data[19])
 	m.Direction = uint16(data[20])<<8 | uint16(data[21])
 
-	m.Time = BCDToStringFixed(data[22:28]) // AUTO-FIX-2026-06-26: 时间字段保留前导零
+	m.Time = BCDToStringSafe(data[22:28]) // AUTO-FIX-2026-06-26: 时间字段保留前导零
 
 	if len(data) > 28 {
 		m.ExtraData = make([]byte, len(data)-28)
@@ -314,12 +412,32 @@ func (m *LocationMessage) Unmarshal(data []byte) error {
 	return nil
 }
 
+// maxExtraItems 附加信息项最大数量上限。
+// FIXED-2026-07-22 [P1]: 防止恶意终端构造大量小附加项导致 CPU 耗尽。
+const maxExtraItems = 100
+
+// maxExtraItemLen 单个附加项最大长度。
+// JT/T 808-2019 标准附加项长度字段为 1 字节（最大 255），但实际附加项不会超过 256B。
+// 超过此值视为异常数据（可能是帧解析错位）。
+const maxExtraItemLen = 256
+
 func (m *LocationMessage) parseExtraItems(data []byte) {
 	offset := 0
+	itemCount := 0
 	for offset+2 <= len(data) {
+		// FIXED-2026-07-22 [P1]: 附加项数量上限检查
+		if itemCount >= maxExtraItems {
+			break
+		}
+
 		itemID := data[offset]
 		itemLen := int(data[offset+1])
 		offset += 2
+
+		// FIXED-2026-07-22 [P1]: itemLen 合理性检查
+		if itemLen > maxExtraItemLen {
+			break
+		}
 
 		if offset+itemLen > len(data) {
 			break
@@ -345,10 +463,54 @@ func (m *LocationMessage) parseExtraItems(data []byte) {
 			if len(itemData) >= 4 {
 				m.OverspeedAlarmState = uint32(itemData[0])<<24 | uint32(itemData[1])<<16 | uint32(itemData[2])<<8 | uint32(itemData[3])
 			}
-		case 0x05, 0x11:
-			// 胎压信息/胎压报警：保留原始字节（结构因车型而异）
+		case 0x05:
+			// 0x05 胎压信息：保留原始字节（结构因车型而异）
 			m.TirePressure = make([]byte, len(itemData))
 			copy(m.TirePressure, itemData)
+		// FIXED: [P1] 0x11 从 0x05 分离，按 JT/T 808-2019 标准为路线行驶报警附加信息 [2026-07-17]
+		// 格式：路线ID(4B) + 行驶时间(2B,秒) + 结果(1B)
+		case 0x11:
+			if len(itemData) >= 7 {
+				m.RouteAlarmID = uint32(itemData[0])<<24 | uint32(itemData[1])<<16 | uint32(itemData[2])<<8 | uint32(itemData[3])
+				m.RouteAlarmTime = uint16(itemData[4])<<8 | uint16(itemData[5])
+				m.RouteAlarmResult = itemData[6]
+			} else {
+				// 数据不足7字节，保留原始数据到 ExtraItems
+				if m.ExtraItems == nil {
+					m.ExtraItems = make(map[byte][]byte)
+				}
+				itemCopy := make([]byte, len(itemData))
+				copy(itemCopy, itemData)
+				m.ExtraItems[itemID] = itemCopy
+			}
+		// 0x12 信号强度（GSM 模块）
+		case 0x12:
+			if len(itemData) >= 2 {
+				m.SignalStrength = uint16(itemData[0])<<8 | uint16(itemData[1])
+			}
+		// 0x13 IO 状态
+		case 0x13:
+			if len(itemData) >= 2 {
+				m.IOState = uint16(itemData[0])<<8 | uint16(itemData[1])
+			}
+		// 0x25 扩展车辆信号状态
+		case 0x25:
+			if len(itemData) >= 4 {
+				m.ExtVehicleState = uint32(itemData[0])<<24 | uint32(itemData[1])<<16 | uint32(itemData[2])<<8 | uint32(itemData[3])
+			}
+		// 0x2A IO 状态位
+		case 0x2A:
+			if len(itemData) >= 4 {
+				m.IOStateBits = uint32(itemData[0])<<24 | uint32(itemData[1])<<16 | uint32(itemData[2])<<8 | uint32(itemData[3])
+			}
+		// 0x30 自定义数据（变长）
+		case 0x30:
+			m.CustomData0x30 = make([]byte, len(itemData))
+			copy(m.CustomData0x30, itemData)
+		// 0x31 自定义数据（变长）
+		case 0x31:
+			m.CustomData0x31 = make([]byte, len(itemData))
+			copy(m.CustomData0x31, itemData)
 		case 0x06:
 			if len(itemData) >= 2 {
 				m.AnalogValue = uint16(itemData[0])<<8 | uint16(itemData[1])
@@ -364,6 +526,7 @@ func (m *LocationMessage) parseExtraItems(data []byte) {
 		}
 
 		offset += itemLen
+		itemCount++
 	}
 }
 
@@ -434,7 +597,14 @@ func (m *CommandMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 100)
 	// AUTO-FIX-2026-06-26: 首部改为1B参数总数（标准0x8103），原2B SeqNum不符规范
 	buf = append(buf, byte(len(m.Params)))
-	for id, val := range m.Params {
+	// [P1-修复] 确定性编码：按 paramID 排序后遍历，确保同一消息多次编码产生相同字节序列
+	paramIDs := make([]uint32, 0, len(m.Params))
+	for id := range m.Params {
+		paramIDs = append(paramIDs, id)
+	}
+	sort.Slice(paramIDs, func(i, j int) bool { return paramIDs[i] < paramIDs[j] })
+	for _, id := range paramIDs {
+		val := m.Params[id]
 		idBytes := make([]byte, 4)
 		idBytes[0] = byte(id >> 24)
 		idBytes[1] = byte(id >> 16)
@@ -453,14 +623,20 @@ func (m *CommandMessage) Unmarshal(data []byte) error {
 		return ErrDataTooShort
 	}
 	count := int(data[0])
+	if count > protocol.MaxElementCount {
+		return fmt.Errorf("CommandMessage: param count %d exceeds max %d", count, protocol.MaxElementCount)
+	}
 	m.Params = make(map[uint32][]byte)
 	offset := 1
-	for i := 0; i < count && offset+5 <= len(data); i++ {
+	for i := 0; i < count; i++ {
+		if offset+5 > len(data) {
+			return fmt.Errorf("CommandMessage: expected %d params, got %d: %w", count, i, ErrDataTooShort)
+		}
 		paramID := uint32(data[offset])<<24 | uint32(data[offset+1])<<16 | uint32(data[offset+2])<<8 | uint32(data[offset+3])
 		paramLen := int(data[offset+4])
 		offset += 5
 		if offset+paramLen > len(data) {
-			break
+			return fmt.Errorf("CommandMessage param %d: data too short: %w", i, ErrDataTooShort)
 		}
 		val := make([]byte, paramLen)
 		copy(val, data[offset:offset+paramLen])
@@ -504,7 +680,14 @@ func (m *ParamRespMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(m.SeqNum>>8), byte(m.SeqNum))
 	// AUTO-FIX-2026-06-26: 追加1B参数总数（标准0x0104格式: SeqNum+参数总数+参数项）
 	buf = append(buf, byte(len(m.Params)))
-	for id, val := range m.Params {
+	// [P1-修复] 确定性编码：按 paramID 排序后遍历
+	paramIDs := make([]uint32, 0, len(m.Params))
+	for id := range m.Params {
+		paramIDs = append(paramIDs, id)
+	}
+	sort.Slice(paramIDs, func(i, j int) bool { return paramIDs[i] < paramIDs[j] })
+	for _, id := range paramIDs {
+		val := m.Params[id]
 		idBytes := make([]byte, 4)
 		idBytes[0] = byte(id >> 24)
 		idBytes[1] = byte(id >> 16)
@@ -524,14 +707,20 @@ func (m *ParamRespMessage) Unmarshal(data []byte) error {
 	}
 	m.SeqNum = uint16(data[0])<<8 | uint16(data[1])
 	count := int(data[2])
+	if count > protocol.MaxElementCount {
+		return fmt.Errorf("ParamResp: param count %d exceeds max %d", count, protocol.MaxElementCount)
+	}
 	m.Params = make(map[uint32][]byte)
 	offset := 3
-	for i := 0; i < count && offset+5 <= len(data); i++ {
+	for i := 0; i < count; i++ {
+		if offset+5 > len(data) {
+			return fmt.Errorf("ParamResp: expected %d params, got %d: %w", count, i, ErrDataTooShort)
+		}
 		paramID := uint32(data[offset])<<24 | uint32(data[offset+1])<<16 | uint32(data[offset+2])<<8 | uint32(data[offset+3])
 		paramLen := int(data[offset+4])
 		offset += 5
 		if offset+paramLen > len(data) {
-			break
+			return fmt.Errorf("ParamResp param %d: data too short: %w", i, ErrDataTooShort)
 		}
 		val := make([]byte, paramLen)
 		copy(val, data[offset:offset+paramLen])
@@ -628,13 +817,19 @@ func (m *LocationBatchMessage) Unmarshal(data []byte) error {
 	// AUTO-FIX-2026-06-26: 标准顺序为 Type(1字节) + Count(2字节)
 	m.LocationType = data[0]
 	m.Count = uint16(data[1])<<8 | uint16(data[2])
+	if int(m.Count) > protocol.MaxElementCount {
+		return fmt.Errorf("LocationBatch: count %d exceeds max %d", m.Count, protocol.MaxElementCount)
+	}
 	m.Locations = make([]*LocationMessage, 0, m.Count)
 	offset := 3
-	for i := 0; i < int(m.Count) && offset+2 < len(data); i++ {
+	for i := 0; i < int(m.Count); i++ {
+		if offset+2 > len(data) {
+			return fmt.Errorf("LocationBatch: expected %d locations, got %d: %w", m.Count, i, ErrDataTooShort)
+		}
 		locLen := int(uint16(data[offset])<<8 | uint16(data[offset+1]))
 		offset += 2
 		if offset+locLen > len(data) {
-			break
+			return fmt.Errorf("LocationBatch item %d: data too short: %w", i, ErrDataTooShort)
 		}
 		loc := &LocationMessage{}
 		if err := loc.Unmarshal(data[offset : offset+locLen]); err != nil {
@@ -707,11 +902,19 @@ func (m *MultimediaMessage) Unmarshal(data []byte) error {
 	m.MultimediaFmt = data[5]
 	m.EventItem = data[6]
 	m.ChannelID = data[7]
-	if err := m.Location.Unmarshal(data[8:36]); err != nil {
+	// FIXED-2026-07-22 [P1]: locEnd 与 MediaLen 读取位置统一。
+	// locEnd = len(data) - 4，Location 区域为 data[8:locEnd]，MediaLen 位于 data[locEnd:locEnd+4]。
+	// 当 body == 40B 时 locEnd=36，与原逻辑一致；
+	// 当 body > 40B 时 locEnd=len(data)-4，正确排除 MediaLen。
+	locEnd := len(data) - 4
+	if locEnd < 36 {
+		locEnd = 36 // 最小 28 字节位置信息
+	}
+	if err := m.Location.Unmarshal(data[8:locEnd]); err != nil {
 		return err
 	}
-	if len(data) >= 40 {
-		m.MediaLen = uint32(data[36])<<24 | uint32(data[37])<<16 | uint32(data[38])<<8 | uint32(data[39])
+	if len(data) >= locEnd+4 {
+		m.MediaLen = uint32(data[locEnd])<<24 | uint32(data[locEnd+1])<<16 | uint32(data[locEnd+2])<<8 | uint32(data[locEnd+3])
 	}
 	return nil
 }
@@ -775,8 +978,23 @@ func (m *CircularAreaSetMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(len(m.Areas)>>8), byte(len(m.Areas)))
 	for _, area := range m.Areas {
 		buf = append(buf, byte(area.AreaID>>24), byte(area.AreaID>>16), byte(area.AreaID>>8), byte(area.AreaID))
-		lat := uint32(area.CenterLat * jt808CoordScaleFactor)
-		lon := uint32(area.CenterLon * jt808CoordScaleFactor)
+		// [P0-修复] 负坐标处理：南纬/西经为负值，uint32 转换前取绝对值
+		absLat := area.CenterLat
+		if absLat < 0 {
+			absLat = -absLat
+		}
+		absLon := area.CenterLon
+		if absLon < 0 {
+			absLon = -absLon
+		}
+		if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
+		if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
 		buf = append(buf, byte(lat>>24), byte(lat>>16), byte(lat>>8), byte(lat))
 		buf = append(buf, byte(lon>>24), byte(lon>>16), byte(lon>>8), byte(lon))
 		buf = append(buf, byte(area.Radius>>24), byte(area.Radius>>16), byte(area.Radius>>8), byte(area.Radius))
@@ -794,15 +1012,21 @@ func (m *CircularAreaSetMessage) Unmarshal(data []byte) error {
 	}
 	m.SetType = data[0]
 	areaCount := int(uint16(data[1])<<8 | uint16(data[2]))
+	if areaCount > protocol.MaxElementCount {
+		return fmt.Errorf("CircularAreaSet: area count %d exceeds max %d", areaCount, protocol.MaxElementCount)
+	}
 	m.Areas = make([]CircularArea, 0, areaCount)
 	offset := 3
-	for i := 0; i < areaCount && offset+24 <= len(data); i++ {
+	for i := 0; i < areaCount; i++ {
+		if offset+24 > len(data) {
+			return fmt.Errorf("CircularAreaSet: expected %d areas, got %d: %w", areaCount, i, ErrDataTooShort)
+		}
 		var area CircularArea
 		area.AreaID = uint32(data[offset])<<24 | uint32(data[offset+1])<<16 | uint32(data[offset+2])<<8 | uint32(data[offset+3])
 		latRaw := uint32(data[offset+4])<<24 | uint32(data[offset+5])<<16 | uint32(data[offset+6])<<8 | uint32(data[offset+7])
-		area.CenterLat = float64(latRaw) / jt808CoordScaleFactor
+		area.CenterLat = float64(latRaw) / JT808CoordScaleFactor
 		lonRaw := uint32(data[offset+8])<<24 | uint32(data[offset+9])<<16 | uint32(data[offset+10])<<8 | uint32(data[offset+11])
-		area.CenterLon = float64(lonRaw) / jt808CoordScaleFactor
+		area.CenterLon = float64(lonRaw) / JT808CoordScaleFactor
 		area.Radius = uint32(data[offset+12])<<24 | uint32(data[offset+13])<<16 | uint32(data[offset+14])<<8 | uint32(data[offset+15])
 		area.SpeedLimit = uint16(data[offset+16])<<8 | uint16(data[offset+17])
 		area.Duration = uint16(data[offset+18])<<8 | uint16(data[offset+19])
@@ -869,10 +1093,39 @@ func (m *RectAreaSetMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(len(m.Areas)>>8), byte(len(m.Areas)))
 	for _, area := range m.Areas {
 		buf = append(buf, byte(area.AreaID>>24), byte(area.AreaID>>16), byte(area.AreaID>>8), byte(area.AreaID))
-		topLat := uint32(area.TopLat * jt808CoordScaleFactor)
-		topLon := uint32(area.TopLon * jt808CoordScaleFactor)
-		botLat := uint32(area.BottomLat * jt808CoordScaleFactor)
-		botLon := uint32(area.BottomLon * jt808CoordScaleFactor)
+		// [P0-修复] 负坐标处理：矩形区域四角坐标可能为南纬/西经负值
+		absTopLat := area.TopLat
+		if absTopLat < 0 {
+			absTopLat = -absTopLat
+		}
+		absTopLon := area.TopLon
+		if absTopLon < 0 {
+			absTopLon = -absTopLon
+		}
+		absBotLat := area.BottomLat
+		if absBotLat < 0 {
+			absBotLat = -absBotLat
+		}
+		absBotLon := area.BottomLon
+		if absBotLon < 0 {
+			absBotLon = -absBotLon
+		}
+		if absTopLat > 90.0 {
+		return nil, fmt.Errorf("top latitude %.6f exceeds ±90 range", absTopLat)
+	}
+	topLat := uint32(absTopLat * JT808CoordScaleFactor)
+	if absTopLon > 180.0 {
+		return nil, fmt.Errorf("top longitude %.6f exceeds ±180 range", absTopLon)
+	}
+	topLon := uint32(absTopLon * JT808CoordScaleFactor)
+	if absBotLat > 90.0 {
+		return nil, fmt.Errorf("bottom latitude %.6f exceeds ±90 range", absBotLat)
+	}
+	botLat := uint32(absBotLat * JT808CoordScaleFactor)
+	if absBotLon > 180.0 {
+		return nil, fmt.Errorf("bottom longitude %.6f exceeds ±180 range", absBotLon)
+	}
+	botLon := uint32(absBotLon * JT808CoordScaleFactor)
 		buf = append(buf, byte(topLat>>24), byte(topLat>>16), byte(topLat>>8), byte(topLat))
 		buf = append(buf, byte(topLon>>24), byte(topLon>>16), byte(topLon>>8), byte(topLon))
 		buf = append(buf, byte(botLat>>24), byte(botLat>>16), byte(botLat>>8), byte(botLat))
@@ -891,20 +1144,26 @@ func (m *RectAreaSetMessage) Unmarshal(data []byte) error {
 	}
 	m.SetType = data[0]
 	areaCount := int(uint16(data[1])<<8 | uint16(data[2]))
+	if areaCount > protocol.MaxElementCount {
+		return fmt.Errorf("RectAreaSet: area count %d exceeds max %d", areaCount, protocol.MaxElementCount)
+	}
 	m.Areas = make([]RectArea, 0, areaCount)
 	offset := 3
 	// AUTO-FIX-2026-06-26: 修正偏移错位，每区28B（与Marshal一致），原35导致越界与跳区
-	for i := 0; i < areaCount && offset+28 <= len(data); i++ {
+	for i := 0; i < areaCount; i++ {
+		if offset+28 > len(data) {
+			return fmt.Errorf("RectAreaSet: expected %d areas, got %d: %w", areaCount, i, ErrDataTooShort)
+		}
 		var area RectArea
 		area.AreaID = uint32(data[offset])<<24 | uint32(data[offset+1])<<16 | uint32(data[offset+2])<<8 | uint32(data[offset+3])
 		topLatRaw := uint32(data[offset+4])<<24 | uint32(data[offset+5])<<16 | uint32(data[offset+6])<<8 | uint32(data[offset+7])
-		area.TopLat = float64(topLatRaw) / jt808CoordScaleFactor
+		area.TopLat = float64(topLatRaw) / JT808CoordScaleFactor
 		topLonRaw := uint32(data[offset+8])<<24 | uint32(data[offset+9])<<16 | uint32(data[offset+10])<<8 | uint32(data[offset+11])
-		area.TopLon = float64(topLonRaw) / jt808CoordScaleFactor
+		area.TopLon = float64(topLonRaw) / JT808CoordScaleFactor
 		botLatRaw := uint32(data[offset+12])<<24 | uint32(data[offset+13])<<16 | uint32(data[offset+14])<<8 | uint32(data[offset+15])
-		area.BottomLat = float64(botLatRaw) / jt808CoordScaleFactor
+		area.BottomLat = float64(botLatRaw) / JT808CoordScaleFactor
 		botLonRaw := uint32(data[offset+16])<<24 | uint32(data[offset+17])<<16 | uint32(data[offset+18])<<8 | uint32(data[offset+19])
-		area.BottomLon = float64(botLonRaw) / jt808CoordScaleFactor
+		area.BottomLon = float64(botLonRaw) / JT808CoordScaleFactor
 		area.SpeedLimit = uint16(data[offset+20])<<8 | uint16(data[offset+21])
 		area.Duration = uint16(data[offset+22])<<8 | uint16(data[offset+23])
 		area.MaxSpeed = uint16(data[offset+24])<<8 | uint16(data[offset+25])
@@ -970,8 +1229,23 @@ func (m *PolygonAreaSetMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(m.NightMaxSpeed>>8), byte(m.NightMaxSpeed))
 	buf = append(buf, byte(len(m.Points)>>8), byte(len(m.Points)))
 	for _, pt := range m.Points {
-		lat := uint32(pt.Latitude * jt808CoordScaleFactor)
-		lon := uint32(pt.Longitude * jt808CoordScaleFactor)
+		// [P0-修复] 负坐标处理：多边形顶点可能为南纬/西经负值
+		absLat := pt.Latitude
+		if absLat < 0 {
+			absLat = -absLat
+		}
+		absLon := pt.Longitude
+		if absLon < 0 {
+			absLon = -absLon
+		}
+		if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
+		if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
 		buf = append(buf, byte(lat>>24), byte(lat>>16), byte(lat>>8), byte(lat))
 		buf = append(buf, byte(lon>>24), byte(lon>>16), byte(lon>>8), byte(lon))
 	}
@@ -988,14 +1262,20 @@ func (m *PolygonAreaSetMessage) Unmarshal(data []byte) error {
 	m.MaxSpeed = uint16(data[8])<<8 | uint16(data[9])
 	m.NightMaxSpeed = uint16(data[10])<<8 | uint16(data[11])
 	ptCount := int(uint16(data[12])<<8 | uint16(data[13]))
+	if ptCount > protocol.MaxElementCount {
+		return fmt.Errorf("PolygonAreaSet: point count %d exceeds max %d", ptCount, protocol.MaxElementCount)
+	}
 	m.Points = make([]PolygonPoint, 0, ptCount)
 	offset := 14
-	for i := 0; i < ptCount && offset+8 <= len(data); i++ {
+	for i := 0; i < ptCount; i++ {
+		if offset+8 > len(data) {
+			return fmt.Errorf("PolygonAreaSet: expected %d points, got %d: %w", ptCount, i, ErrDataTooShort)
+		}
 		var pt PolygonPoint
 		latRaw := uint32(data[offset])<<24 | uint32(data[offset+1])<<16 | uint32(data[offset+2])<<8 | uint32(data[offset+3])
-		pt.Latitude = float64(latRaw) / jt808CoordScaleFactor
+		pt.Latitude = float64(latRaw) / JT808CoordScaleFactor
 		lonRaw := uint32(data[offset+4])<<24 | uint32(data[offset+5])<<16 | uint32(data[offset+6])<<8 | uint32(data[offset+7])
-		pt.Longitude = float64(lonRaw) / jt808CoordScaleFactor
+		pt.Longitude = float64(lonRaw) / JT808CoordScaleFactor
 		m.Points = append(m.Points, pt)
 		offset += 8
 	}
@@ -1067,8 +1347,23 @@ func (m *RouteSetMessage) Marshal() ([]byte, error) {
 	for _, pt := range m.Points {
 		buf = append(buf, byte(pt.PointID>>24), byte(pt.PointID>>16), byte(pt.PointID>>8), byte(pt.PointID))
 		buf = append(buf, byte(pt.RouteID>>24), byte(pt.RouteID>>16), byte(pt.RouteID>>8), byte(pt.RouteID))
-		lat := uint32(pt.Latitude * jt808CoordScaleFactor)
-		lon := uint32(pt.Longitude * jt808CoordScaleFactor)
+		// [P0-修复] 负坐标处理
+		absLat := pt.Latitude
+		if absLat < 0 {
+			absLat = -absLat
+		}
+		absLon := pt.Longitude
+		if absLon < 0 {
+			absLon = -absLon
+		}
+		if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
+		if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
 		buf = append(buf, byte(lat>>24), byte(lat>>16), byte(lat>>8), byte(lat))
 		buf = append(buf, byte(lon>>24), byte(lon>>16), byte(lon>>8), byte(lon))
 		buf = append(buf, byte(pt.Width>>24), byte(pt.Width>>16), byte(pt.Width>>8), byte(pt.Width))
@@ -1103,17 +1398,23 @@ func (m *RouteSetMessage) Unmarshal(data []byte) error {
 		return ErrDataTooShort
 	}
 	ptCount := int(uint16(data[offset])<<8 | uint16(data[offset+1]))
+	if ptCount > protocol.MaxElementCount {
+		return fmt.Errorf("RouteSet: point count %d exceeds max %d", ptCount, protocol.MaxElementCount)
+	}
 	offset += 2
 	m.Points = make([]RoutePoint, 0, ptCount)
 	// AUTO-FIX-2026-06-26: 修正路段偏移off-by-one，每路段29B（与Marshal一致），原30导致跳段
-	for i := 0; i < ptCount && offset+29 <= len(data); i++ {
+	for i := 0; i < ptCount; i++ {
+		if offset+29 > len(data) {
+			return fmt.Errorf("RouteSet: expected %d points, got %d: %w", ptCount, i, ErrDataTooShort)
+		}
 		var pt RoutePoint
 		pt.PointID = uint32(data[offset])<<24 | uint32(data[offset+1])<<16 | uint32(data[offset+2])<<8 | uint32(data[offset+3])
 		pt.RouteID = uint32(data[offset+4])<<24 | uint32(data[offset+5])<<16 | uint32(data[offset+6])<<8 | uint32(data[offset+7])
 		latRaw := uint32(data[offset+8])<<24 | uint32(data[offset+9])<<16 | uint32(data[offset+10])<<8 | uint32(data[offset+11])
-		pt.Latitude = float64(latRaw) / jt808CoordScaleFactor
+		pt.Latitude = float64(latRaw) / JT808CoordScaleFactor
 		lonRaw := uint32(data[offset+12])<<24 | uint32(data[offset+13])<<16 | uint32(data[offset+14])<<8 | uint32(data[offset+15])
-		pt.Longitude = float64(lonRaw) / jt808CoordScaleFactor
+		pt.Longitude = float64(lonRaw) / JT808CoordScaleFactor
 		pt.Width = uint32(data[offset+16])<<24 | uint32(data[offset+17])<<16 | uint32(data[offset+18])<<8 | uint32(data[offset+19])
 		pt.Attr = data[offset+20]
 		pt.SpeedLimit = uint16(data[offset+21])<<8 | uint16(data[offset+22])
@@ -1168,7 +1469,10 @@ func (m *DriverIDMessage) MsgID() uint16 { return MsgIDDriverID }
 func (m *DriverIDMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 30)
 	buf = append(buf, m.Status)
-	timeBCD := StringToBCD(m.Time)
+	timeBCD, err := StringToBCD6(m.Time)
+	if err != nil {
+		return nil, err
+	}
 	buf = append(buf, timeBCD...)
 	buf = append(buf, []byte(m.DriverID)...)
 	return buf, nil
@@ -1179,7 +1483,7 @@ func (m *DriverIDMessage) Unmarshal(data []byte) error {
 		return ErrDataTooShort
 	}
 	m.Status = data[0]
-	m.Time = BCDToStringFixed(data[1:7]) // AUTO-FIX-2026-06-26: 时间字段保留前导零
+	m.Time = BCDToStringSafe(data[1:7]) // AUTO-FIX-2026-06-26: 时间字段保留前导零
 	if len(data) > 7 {
 		m.DriverID = string(data[7:])
 	}
@@ -1201,7 +1505,10 @@ func (m *CanDataMessage) MsgID() uint16 { return MsgIDCanData }
 
 func (m *CanDataMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 6+len(m.CanItems)*10)
-	timeBCD := StringToBCD(m.ReceiveTime)
+	timeBCD, err := StringToBCD6(m.ReceiveTime)
+	if err != nil {
+		return nil, err
+	}
 	buf = append(buf, timeBCD...)
 	buf = append(buf, m.CanCount)
 	for _, item := range m.CanItems {
@@ -1216,17 +1523,23 @@ func (m *CanDataMessage) Unmarshal(data []byte) error {
 	if len(data) < 7 {
 		return ErrDataTooShort
 	}
-	m.ReceiveTime = BCDToStringFixed(data[0:6]) // AUTO-FIX-2026-06-26: 时间字段保留前导零
+	m.ReceiveTime = BCDToStringSafe(data[0:6]) // AUTO-FIX-2026-06-26: 时间字段保留前导零
 	m.CanCount = data[6]
+	if int(m.CanCount) > protocol.MaxElementCount {
+		return fmt.Errorf("CanData: count %d exceeds max %d", m.CanCount, protocol.MaxElementCount)
+	}
 	m.CanItems = make([]CanItem, 0, m.CanCount)
 	offset := 7
-	for i := 0; i < int(m.CanCount) && offset+5 <= len(data); i++ {
+	for i := 0; i < int(m.CanCount); i++ {
+		if offset+5 > len(data) {
+			return fmt.Errorf("CanData: expected %d items, got %d: %w", m.CanCount, i, ErrDataTooShort)
+		}
 		var item CanItem
 		item.CANID = uint32(data[offset])<<24 | uint32(data[offset+1])<<16 | uint32(data[offset+2])<<8 | uint32(data[offset+3])
 		dataLen := int(data[offset+4])
 		offset += 5
 		if offset+dataLen > len(data) {
-			break
+			return fmt.Errorf("CanData item %d: data too short: %w", i, ErrDataTooShort)
 		}
 		item.Data = make([]byte, dataLen)
 		copy(item.Data, data[offset:offset+dataLen])
@@ -1402,6 +1715,10 @@ func (m *TerminalPropRespMessage) Unmarshal(data []byte) error {
 	}
 	m.PropType = data[0]
 	parts := splitNullFields(data[1:])
+	// FIXED-2026-07-23 [P2]: 验证字段数量不超过 8
+	if len(parts) > 8 {
+		return fmt.Errorf("TerminalPropResp: too many fields %d (max 8)", len(parts))
+	}
 	if len(parts) > 0 {
 		m.Manufacturer = parts[0]
 	}
@@ -1464,8 +1781,23 @@ func (m *OverspeedSetMessage) Marshal() ([]byte, error) {
 		ab := make([]byte, 27)
 		ab[0] = a.AreaType
 		binary.BigEndian.PutUint32(ab[1:5], a.ID)
-		lat := uint32(a.Lat * jt808CoordScaleFactor)
-		lon := uint32(a.Lon * jt808CoordScaleFactor)
+		// [P0-修复] 负坐标处理
+		absLat := a.Lat
+		if absLat < 0 {
+			absLat = -absLat
+		}
+		absLon := a.Lon
+		if absLon < 0 {
+			absLon = -absLon
+		}
+		if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
+		if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
 		binary.BigEndian.PutUint32(ab[5:9], lat)
 		binary.BigEndian.PutUint32(ab[9:13], lon)
 		binary.BigEndian.PutUint32(ab[13:17], a.Radius)
@@ -1493,8 +1825,8 @@ func (m *OverspeedSetMessage) Unmarshal(data []byte) error {
 		var a OverspeedArea
 		a.AreaType = data[offset]
 		a.ID = binary.BigEndian.Uint32(data[offset+1 : offset+5])
-		a.Lat = float64(binary.BigEndian.Uint32(data[offset+5:offset+9])) / jt808CoordScaleFactor
-		a.Lon = float64(binary.BigEndian.Uint32(data[offset+9:offset+13])) / jt808CoordScaleFactor
+		a.Lat = float64(binary.BigEndian.Uint32(data[offset+5:offset+9])) / JT808CoordScaleFactor
+		a.Lon = float64(binary.BigEndian.Uint32(data[offset+9:offset+13])) / JT808CoordScaleFactor
 		a.Radius = binary.BigEndian.Uint32(data[offset+13 : offset+17])
 		a.MaxSpeed = binary.BigEndian.Uint16(data[offset+17 : offset+19])
 		a.SpeedDur = binary.BigEndian.Uint16(data[offset+19 : offset+21])
@@ -1537,8 +1869,23 @@ func (m *FatigueDriveSetMessage) Marshal() ([]byte, error) {
 		ab := make([]byte, 21)
 		ab[0] = a.AreaType
 		binary.BigEndian.PutUint32(ab[1:5], a.ID)
-		lat := uint32(a.Lat * jt808CoordScaleFactor)
-		lon := uint32(a.Lon * jt808CoordScaleFactor)
+		// [P0-修复] 负坐标处理
+		absLat := a.Lat
+		if absLat < 0 {
+			absLat = -absLat
+		}
+		absLon := a.Lon
+		if absLon < 0 {
+			absLon = -absLon
+		}
+		if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
+		if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
 		binary.BigEndian.PutUint32(ab[5:9], lat)
 		binary.BigEndian.PutUint32(ab[9:13], lon)
 		binary.BigEndian.PutUint32(ab[13:17], a.Radius)
@@ -1563,8 +1910,8 @@ func (m *FatigueDriveSetMessage) Unmarshal(data []byte) error {
 		var a FatigueArea
 		a.AreaType = data[offset]
 		a.ID = binary.BigEndian.Uint32(data[offset+1 : offset+5])
-		a.Lat = float64(binary.BigEndian.Uint32(data[offset+5:offset+9])) / jt808CoordScaleFactor
-		a.Lon = float64(binary.BigEndian.Uint32(data[offset+9:offset+13])) / jt808CoordScaleFactor
+		a.Lat = float64(binary.BigEndian.Uint32(data[offset+5:offset+9])) / JT808CoordScaleFactor
+		a.Lon = float64(binary.BigEndian.Uint32(data[offset+9:offset+13])) / JT808CoordScaleFactor
 		a.Radius = binary.BigEndian.Uint32(data[offset+13 : offset+17])
 		a.MaxDrive = binary.BigEndian.Uint16(data[offset+17 : offset+19])
 		a.MinRest = binary.BigEndian.Uint16(data[offset+19 : offset+21])
@@ -1660,11 +2007,19 @@ type CommandRespMessage struct {
 func (m *CommandRespMessage) MsgID() uint16 { return MsgIDCommandResp }
 
 // AUTO-FIX-2026-06-27: 0x0103 标准体为 RespSeqNum(2B)+参数总数(1B)+参数项列表，删除原 RespMsgID(2B)
+// FIXED-2026-07-23 [P1]: 确定性编码——按 paramID 排序后遍历，确保同一消息多次编码产生相同字节序列
 func (m *CommandRespMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 3+100)
 	buf = append(buf, byte(m.RespSeqNum>>8), byte(m.RespSeqNum))
 	buf = append(buf, m.RespCount)
-	for id, val := range m.Params {
+	// [P1-修复] 确定性编码：按 paramID 排序后遍历
+	paramIDs := make([]uint32, 0, len(m.Params))
+	for id := range m.Params {
+		paramIDs = append(paramIDs, id)
+	}
+	sort.Slice(paramIDs, func(i, j int) bool { return paramIDs[i] < paramIDs[j] })
+	for _, id := range paramIDs {
+		val := m.Params[id]
 		buf = append(buf, byte(id>>24), byte(id>>16), byte(id>>8), byte(id))
 		buf = append(buf, byte(len(val)))
 		buf = append(buf, val...)
@@ -1681,12 +2036,15 @@ func (m *CommandRespMessage) Unmarshal(data []byte) error {
 	m.RespCount = data[2]
 	m.Params = make(map[uint32][]byte)
 	offset := 3
-	for offset+5 <= len(data) {
+	for i := 0; i < int(m.RespCount); i++ {
+		if offset+5 > len(data) {
+			return fmt.Errorf("CommandResp: expected %d params, got %d: %w", m.RespCount, i, ErrDataTooShort)
+		}
 		paramID := uint32(data[offset])<<24 | uint32(data[offset+1])<<16 | uint32(data[offset+2])<<8 | uint32(data[offset+3])
 		paramLen := int(data[offset+4])
 		offset += 5
 		if offset+paramLen > len(data) {
-			break
+			return fmt.Errorf("CommandResp param %d: data too short: %w", i, ErrDataTooShort)
 		}
 		val := make([]byte, paramLen)
 		copy(val, data[offset:offset+paramLen])
@@ -1895,8 +2253,9 @@ type FireAreaAlarmMessage struct {
 	AreaType byte
 	AreaID   uint32
 	Dir      byte
-	Lat      uint32
-	Lng      uint32
+	// FIXED-2026-07-23 [P2]: Lat/Lng 改为 float64，与其他区域消息一致
+	Lat      float64
+	Lng      float64
 }
 
 func (m *FireAreaAlarmMessage) MsgID() uint16 { return 0x0500 }
@@ -1906,8 +2265,25 @@ func (m *FireAreaAlarmMessage) Marshal() ([]byte, error) {
 	buf = append(buf, m.AreaType)
 	buf = append(buf, byte(m.AreaID>>24), byte(m.AreaID>>16), byte(m.AreaID>>8), byte(m.AreaID))
 	buf = append(buf, m.Dir)
-	buf = append(buf, byte(m.Lat>>24), byte(m.Lat>>16), byte(m.Lat>>8), byte(m.Lat))
-	buf = append(buf, byte(m.Lng>>24), byte(m.Lng>>16), byte(m.Lng>>8), byte(m.Lng))
+	// FIXED-2026-07-23 [P2]: 坐标转换为 uint32 编码，与 CircularAreaSetMessage 一致
+	absLat := m.Lat
+	if absLat < 0 {
+		absLat = -absLat
+	}
+	absLon := m.Lng
+	if absLon < 0 {
+		absLon = -absLon
+	}
+	if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
+	lon := uint32(absLon * JT808CoordScaleFactor)
+	buf = append(buf, byte(lat>>24), byte(lat>>16), byte(lat>>8), byte(lat))
+	buf = append(buf, byte(lon>>24), byte(lon>>16), byte(lon>>8), byte(lon))
 	return buf, nil
 }
 
@@ -1918,8 +2294,11 @@ func (m *FireAreaAlarmMessage) Unmarshal(data []byte) error {
 	m.AreaType = data[0]
 	m.AreaID = uint32(data[1])<<24 | uint32(data[2])<<16 | uint32(data[3])<<8 | uint32(data[4])
 	m.Dir = data[5]
-	m.Lat = uint32(data[6])<<24 | uint32(data[7])<<16 | uint32(data[8])<<8 | uint32(data[9])
-	m.Lng = uint32(data[10])<<24 | uint32(data[11])<<16 | uint32(data[12])<<8 | uint32(data[13])
+	// FIXED-2026-07-23 [P2]: 坐标除以缩放因子转为 float64
+	latRaw := uint32(data[6])<<24 | uint32(data[7])<<16 | uint32(data[8])<<8 | uint32(data[9])
+	lngRaw := uint32(data[10])<<24 | uint32(data[11])<<16 | uint32(data[12])<<8 | uint32(data[13])
+	m.Lat = float64(latRaw) / JT808CoordScaleFactor
+	m.Lng = float64(lngRaw) / JT808CoordScaleFactor
 	return nil
 }
 
@@ -2110,8 +2489,23 @@ func (m *FireAreaSetMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(len(m.Areas)>>8), byte(len(m.Areas)))
 	for _, area := range m.Areas {
 		buf = append(buf, byte(area.AreaID>>24), byte(area.AreaID>>16), byte(area.AreaID>>8), byte(area.AreaID))
-		lat := uint32(area.CenterLat * jt808CoordScaleFactor)
-		lon := uint32(area.CenterLon * jt808CoordScaleFactor)
+		// [P0-修复] 负坐标处理：南纬/西经为负值，uint32 转换前取绝对值
+		absLat := area.CenterLat
+		if absLat < 0 {
+			absLat = -absLat
+		}
+		absLon := area.CenterLon
+		if absLon < 0 {
+			absLon = -absLon
+		}
+		if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
+		if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
 		buf = append(buf, byte(lat>>24), byte(lat>>16), byte(lat>>8), byte(lat))
 		buf = append(buf, byte(lon>>24), byte(lon>>16), byte(lon>>8), byte(lon))
 		buf = append(buf, byte(area.Radius>>24), byte(area.Radius>>16), byte(area.Radius>>8), byte(area.Radius))
@@ -2136,9 +2530,9 @@ func (m *FireAreaSetMessage) Unmarshal(data []byte) error {
 		var area FireArea
 		area.AreaID = uint32(data[offset])<<24 | uint32(data[offset+1])<<16 | uint32(data[offset+2])<<8 | uint32(data[offset+3])
 		latRaw := uint32(data[offset+4])<<24 | uint32(data[offset+5])<<16 | uint32(data[offset+6])<<8 | uint32(data[offset+7])
-		area.CenterLat = float64(latRaw) / jt808CoordScaleFactor
+		area.CenterLat = float64(latRaw) / JT808CoordScaleFactor
 		lonRaw := uint32(data[offset+8])<<24 | uint32(data[offset+9])<<16 | uint32(data[offset+10])<<8 | uint32(data[offset+11])
-		area.CenterLon = float64(lonRaw) / jt808CoordScaleFactor
+		area.CenterLon = float64(lonRaw) / JT808CoordScaleFactor
 		area.Radius = uint32(data[offset+12])<<24 | uint32(data[offset+13])<<16 | uint32(data[offset+14])<<8 | uint32(data[offset+15])
 		area.SpeedLimit = uint16(data[offset+16])<<8 | uint16(data[offset+17])
 		area.Duration = uint16(data[offset+18])<<8 | uint16(data[offset+19])
@@ -2195,9 +2589,15 @@ func (m *StorageMediaSearchMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(m.MultimediaID>>24), byte(m.MultimediaID>>16), byte(m.MultimediaID>>8), byte(m.MultimediaID))
 	buf = append(buf, m.MultimediaType)
 	buf = append(buf, m.ChannelID)
-	startBCD := StringToBCD(m.StartTime)
+	startBCD, err := StringToBCD6(m.StartTime)
+	if err != nil {
+		return nil, err
+	}
 	buf = append(buf, startBCD...)
-	endBCD := StringToBCD(m.EndTime)
+	endBCD, err := StringToBCD6(m.EndTime)
+	if err != nil {
+		return nil, err
+	}
 	buf = append(buf, endBCD...)
 	return buf, nil
 }
@@ -2209,8 +2609,8 @@ func (m *StorageMediaSearchMessage) Unmarshal(data []byte) error {
 	m.MultimediaID = uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	m.MultimediaType = data[4]
 	m.ChannelID = data[5]
-	m.StartTime = BCDToStringFixed(data[6:12])  // AUTO-FIX-2026-06-26: 时间字段保留前导零
-	m.EndTime = BCDToStringFixed(data[12:18])   // AUTO-FIX-2026-06-26: 时间字段保留前导零
+	m.StartTime = BCDToStringSafe(data[6:12])  // AUTO-FIX-2026-06-26: 时间字段保留前导零
+	m.EndTime = BCDToStringSafe(data[12:18])   // AUTO-FIX-2026-06-26: 时间字段保留前导零
 	return nil
 }
 
@@ -2230,9 +2630,15 @@ func (m *StorageMediaUploadMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(m.MultimediaID>>24), byte(m.MultimediaID>>16), byte(m.MultimediaID>>8), byte(m.MultimediaID))
 	buf = append(buf, m.MultimediaType)
 	buf = append(buf, m.ChannelID)
-	startBCD := StringToBCD(m.StartTime)
+	startBCD, err := StringToBCD6(m.StartTime)
+	if err != nil {
+		return nil, err
+	}
 	buf = append(buf, startBCD...)
-	endBCD := StringToBCD(m.EndTime)
+	endBCD, err := StringToBCD6(m.EndTime)
+	if err != nil {
+		return nil, err
+	}
 	buf = append(buf, endBCD...)
 	buf = append(buf, m.DeleteFlag)
 	return buf, nil
@@ -2245,8 +2651,8 @@ func (m *StorageMediaUploadMessage) Unmarshal(data []byte) error {
 	m.MultimediaID = uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	m.MultimediaType = data[4]
 	m.ChannelID = data[5]
-	m.StartTime = BCDToStringFixed(data[6:12])  // AUTO-FIX-2026-06-26: 时间字段保留前导零
-	m.EndTime = BCDToStringFixed(data[12:18])   // AUTO-FIX-2026-06-26: 时间字段保留前导零
+	m.StartTime = BCDToStringSafe(data[6:12])  // AUTO-FIX-2026-06-26: 时间字段保留前导零
+	m.EndTime = BCDToStringSafe(data[12:18])   // AUTO-FIX-2026-06-26: 时间字段保留前导零
 	m.DeleteFlag = data[18]
 	return nil
 }
@@ -2326,16 +2732,22 @@ func (m *BillOperateMessage) Unmarshal(data []byte) error {
 	return nil
 }
 
+// splitNullFields 按空字节分割字段。
+// FIXED-2026-07-23 [P2]: 添加 maxFields=20 上限，防止恶意数据生成巨大切片。
 func splitNullFields(data []byte) []string {
+	const maxFields = 20
 	var fields []string
 	start := 0
 	for i, b := range data {
 		if b == 0x00 {
+			if len(fields) >= maxFields {
+				break
+			}
 			fields = append(fields, string(data[start:i]))
 			start = i + 1
 		}
 	}
-	if start < len(data) {
+	if start < len(data) && len(fields) < maxFields {
 		fields = append(fields, string(data[start:]))
 	}
 	return fields
@@ -2509,18 +2921,24 @@ func (m *AlarmAttachmentMessage) Unmarshal(data []byte) error {
 	if len(data) < 5 {
 		return ErrDataTooShort
 	}
+	// FIXED-2026-07-23 [P1]: 附件 Size 上限，防止恶意数据触发大内存分配
+	const maxAttachmentSize = 10 * 1024 * 1024 // 10MB
 	m.AlarmID = uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	attCount := int(data[4])
 	offset := 5
 	m.Attachments = make([]AlarmAttachmentItem, 0, attCount)
 	for i := 0; i < attCount; i++ {
 		if offset+5 > len(data) {
-			break
+			return fmt.Errorf("AlarmAttachment: expected %d attachments, got %d: %w", attCount, i, ErrDataTooShort)
 		}
 		var att AlarmAttachmentItem
 		att.Type = data[offset]
 		att.Size = uint32(data[offset+1])<<24 | uint32(data[offset+2])<<16 | uint32(data[offset+3])<<8 | uint32(data[offset+4])
 		offset += 5
+		// FIXED-2026-07-23 [P1]: 检查附件 Size 上限
+		if int(att.Size) > maxAttachmentSize {
+			return fmt.Errorf("attachment size %d exceeds max %d", att.Size, maxAttachmentSize)
+		}
 		if offset+int(att.Size) > len(data) {
 			// 数据不完整（可能是分包），取剩余数据
 			att.Data = make([]byte, len(data)-offset)
@@ -2679,8 +3097,16 @@ func (m *MultimediaUploadCmdMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(m.MultimediaID>>24), byte(m.MultimediaID>>16), byte(m.MultimediaID>>8), byte(m.MultimediaID))
 	buf = append(buf, m.ChannelID)
 	buf = append(buf, m.MediaType)
-	buf = append(buf, StringToBCD(m.StartTime)...)
-	buf = append(buf, StringToBCD(m.EndTime)...)
+	startBCD, err := StringToBCD6(m.StartTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, startBCD...)
+	endBCD, err := StringToBCD6(m.EndTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, endBCD...)
 	return buf, nil
 }
 
@@ -2692,8 +3118,8 @@ func (m *MultimediaUploadCmdMessage) Unmarshal(data []byte) error {
 	m.MultimediaID = uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	m.ChannelID = data[4]
 	m.MediaType = data[5]
-	m.StartTime = BCDToStringFixed(data[6:12])
-	m.EndTime = BCDToStringFixed(data[12:18])
+	m.StartTime = BCDToStringSafe(data[6:12])
+	m.EndTime = BCDToStringSafe(data[12:18])
 	return nil
 }
 
@@ -2753,8 +3179,16 @@ func (m *MultimediaSearchMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(len(m.Items)>>8), byte(len(m.Items)))
 	for _, it := range m.Items {
 		buf = append(buf, it.ChannelID, it.MediaType)
-		buf = append(buf, StringToBCD(it.StartTime)...)
-		buf = append(buf, StringToBCD(it.EndTime)...)
+itStartBCD, err := StringToBCD6(it.StartTime)
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, itStartBCD...)
+		itEndBCD, err := StringToBCD6(it.EndTime)
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, itEndBCD...)
 		buf = append(buf, byte(it.Size>>24), byte(it.Size>>16), byte(it.Size>>8), byte(it.Size))
 	}
 	return buf, nil
@@ -2772,8 +3206,8 @@ func (m *MultimediaSearchMessage) Unmarshal(data []byte) error {
 		var it MultimediaSearchItem
 		it.ChannelID = data[offset]
 		it.MediaType = data[offset+1]
-		it.StartTime = BCDToStringFixed(data[offset+2 : offset+8])  // AUTO-FIX-2026-06-26: 时间字段保留前导零
-		it.EndTime = BCDToStringFixed(data[offset+8 : offset+14])   // AUTO-FIX-2026-06-26: 时间字段保留前导零
+		it.StartTime = BCDToStringSafe(data[offset+2 : offset+8])  // AUTO-FIX-2026-06-26: 时间字段保留前导零
+		it.EndTime = BCDToStringSafe(data[offset+8 : offset+14])   // AUTO-FIX-2026-06-26: 时间字段保留前导零
 		it.Size = uint32(data[offset+14])<<24 | uint32(data[offset+15])<<16 | uint32(data[offset+16])<<8 | uint32(data[offset+17])
 		m.Items = append(m.Items, it)
 		offset += 18
@@ -3112,14 +3546,34 @@ func (m *OverspeedAlarmMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 28+len(m.AlarmAttach))
 	buf = append(buf, byte(m.AlarmFlag>>24), byte(m.AlarmFlag>>16), byte(m.AlarmFlag>>8), byte(m.AlarmFlag))
 	buf = append(buf, byte(m.StatusFlag>>24), byte(m.StatusFlag>>16), byte(m.StatusFlag>>8), byte(m.StatusFlag))
-	lat := uint32(m.Latitude * jt808CoordScaleFactor)
-	lon := uint32(m.Longitude * jt808CoordScaleFactor)
+	// FIXED: [P0] 编码时取绝对值，N/S 由 StatusFlag bit2 指示 [2026-07-17]
+	absLat := m.Latitude
+	if absLat < 0 {
+		absLat = -absLat
+	}
+	if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
+	// FIXED: [P0] 编码时取绝对值，E/W 由 StatusFlag bit3 指示 [2026-07-17]
+	absLon := m.Longitude
+	if absLon < 0 {
+		absLon = -absLon
+	}
+	if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
 	buf = append(buf, byte(lat>>24), byte(lat>>16), byte(lat>>8), byte(lat))
 	buf = append(buf, byte(lon>>24), byte(lon>>16), byte(lon>>8), byte(lon))
 	buf = append(buf, byte(m.Altitude>>8), byte(m.Altitude))
 	buf = append(buf, byte(m.Speed>>8), byte(m.Speed))
 	buf = append(buf, byte(m.Direction>>8), byte(m.Direction))
-	buf = append(buf, StringToBCD(m.Time)...)
+	timeBCD, err := StringToBCD6(m.Time)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, timeBCD...)
 	buf = append(buf, m.AlarmAttach...)
 	return buf, nil
 }
@@ -3131,13 +3585,13 @@ func (m *OverspeedAlarmMessage) Unmarshal(data []byte) error {
 	m.AlarmFlag = uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	m.StatusFlag = uint32(data[4])<<24 | uint32(data[5])<<16 | uint32(data[6])<<8 | uint32(data[7])
 	latRaw := uint32(data[8])<<24 | uint32(data[9])<<16 | uint32(data[10])<<8 | uint32(data[11])
-	m.Latitude = float64(latRaw) / jt808CoordScaleFactor
+	m.Latitude = float64(latRaw) / JT808CoordScaleFactor
 	lonRaw := uint32(data[12])<<24 | uint32(data[13])<<16 | uint32(data[14])<<8 | uint32(data[15])
-	m.Longitude = float64(lonRaw) / jt808CoordScaleFactor
+	m.Longitude = float64(lonRaw) / JT808CoordScaleFactor
 	m.Altitude = uint16(data[16])<<8 | uint16(data[17])
 	m.Speed = uint16(data[18])<<8 | uint16(data[19])
 	m.Direction = uint16(data[20])<<8 | uint16(data[21])
-	m.Time = BCDToStringFixed(data[22:28])
+	m.Time = BCDToStringSafe(data[22:28])
 	if len(data) > 28 {
 		m.AlarmAttach = make([]byte, len(data)-28)
 		copy(m.AlarmAttach, data[28:])
@@ -3165,14 +3619,34 @@ func (m *FatigueDriveAlarmMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 28+len(m.AlarmAttach))
 	buf = append(buf, byte(m.AlarmFlag>>24), byte(m.AlarmFlag>>16), byte(m.AlarmFlag>>8), byte(m.AlarmFlag))
 	buf = append(buf, byte(m.StatusFlag>>24), byte(m.StatusFlag>>16), byte(m.StatusFlag>>8), byte(m.StatusFlag))
-	lat := uint32(m.Latitude * jt808CoordScaleFactor)
-	lon := uint32(m.Longitude * jt808CoordScaleFactor)
+	// FIXED: [P0] 编码时取绝对值，N/S 由 StatusFlag bit2 指示 [2026-07-17]
+	absLat := m.Latitude
+	if absLat < 0 {
+		absLat = -absLat
+	}
+	if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
+	// FIXED: [P0] 编码时取绝对值，E/W 由 StatusFlag bit3 指示 [2026-07-17]
+	absLon := m.Longitude
+	if absLon < 0 {
+		absLon = -absLon
+	}
+	if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
 	buf = append(buf, byte(lat>>24), byte(lat>>16), byte(lat>>8), byte(lat))
 	buf = append(buf, byte(lon>>24), byte(lon>>16), byte(lon>>8), byte(lon))
 	buf = append(buf, byte(m.Altitude>>8), byte(m.Altitude))
 	buf = append(buf, byte(m.Speed>>8), byte(m.Speed))
 	buf = append(buf, byte(m.Direction>>8), byte(m.Direction))
-	buf = append(buf, StringToBCD(m.Time)...)
+	timeBCD, err := StringToBCD6(m.Time)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, timeBCD...)
 	buf = append(buf, m.AlarmAttach...)
 	return buf, nil
 }
@@ -3184,13 +3658,13 @@ func (m *FatigueDriveAlarmMessage) Unmarshal(data []byte) error {
 	m.AlarmFlag = uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	m.StatusFlag = uint32(data[4])<<24 | uint32(data[5])<<16 | uint32(data[6])<<8 | uint32(data[7])
 	latRaw := uint32(data[8])<<24 | uint32(data[9])<<16 | uint32(data[10])<<8 | uint32(data[11])
-	m.Latitude = float64(latRaw) / jt808CoordScaleFactor
+	m.Latitude = float64(latRaw) / JT808CoordScaleFactor
 	lonRaw := uint32(data[12])<<24 | uint32(data[13])<<16 | uint32(data[14])<<8 | uint32(data[15])
-	m.Longitude = float64(lonRaw) / jt808CoordScaleFactor
+	m.Longitude = float64(lonRaw) / JT808CoordScaleFactor
 	m.Altitude = uint16(data[16])<<8 | uint16(data[17])
 	m.Speed = uint16(data[18])<<8 | uint16(data[19])
 	m.Direction = uint16(data[20])<<8 | uint16(data[21])
-	m.Time = BCDToStringFixed(data[22:28])
+	m.Time = BCDToStringSafe(data[22:28])
 	if len(data) > 28 {
 		m.AlarmAttach = make([]byte, len(data)-28)
 		copy(m.AlarmAttach, data[28:])
@@ -3220,8 +3694,24 @@ func (m *InfoPushMessage) Marshal() ([]byte, error) {
 	buf = append(buf, byte(len(name)))
 	buf = append(buf, name...)
 	buf = append(buf, m.InfoType)
-	lon := uint32(m.Longitude * jt808CoordScaleFactor)
-	lat := uint32(m.Latitude * jt808CoordScaleFactor)
+	// FIXED: [P0] 编码时取绝对值，E/W 由 StatusFlag bit3 指示 [2026-07-17]
+	absLon := m.Longitude
+	if absLon < 0 {
+		absLon = -absLon
+	}
+	if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
+	// FIXED: [P0] 编码时取绝对值，N/S 由 StatusFlag bit2 指示 [2026-07-17]
+	absLat := m.Latitude
+	if absLat < 0 {
+		absLat = -absLat
+	}
+	if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
 	buf = append(buf, byte(lon>>24), byte(lon>>16), byte(lon>>8), byte(lon))
 	buf = append(buf, byte(lat>>24), byte(lat>>16), byte(lat>>8), byte(lat))
 	return buf, nil
@@ -3244,9 +3734,9 @@ func (m *InfoPushMessage) Unmarshal(data []byte) error {
 	}
 	m.InfoType = data[offset]
 	lonRaw := uint32(data[offset+1])<<24 | uint32(data[offset+2])<<16 | uint32(data[offset+3])<<8 | uint32(data[offset+4])
-	m.Longitude = float64(lonRaw) / jt808CoordScaleFactor
+	m.Longitude = float64(lonRaw) / JT808CoordScaleFactor
 	latRaw := uint32(data[offset+5])<<24 | uint32(data[offset+6])<<16 | uint32(data[offset+7])<<8 | uint32(data[offset+8])
-	m.Latitude = float64(latRaw) / jt808CoordScaleFactor
+	m.Latitude = float64(latRaw) / JT808CoordScaleFactor
 	return nil
 }
 
@@ -3414,11 +3904,34 @@ func (m *AreaRouteAlarmSetMessage) Marshal() ([]byte, error) {
 	buf := make([]byte, 0, 32)
 	buf = append(buf, byte(m.AreaID>>24), byte(m.AreaID>>16), byte(m.AreaID>>8), byte(m.AreaID))
 	buf = append(buf, byte(m.AreaAttr>>8), byte(m.AreaAttr))
-	buf = append(buf, StringToBCD(m.StartTime)...)
-	buf = append(buf, StringToBCD(m.EndTime)...)
+	startBCD, err := StringToBCD6(m.StartTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, startBCD...)
+	endBCD, err := StringToBCD6(m.EndTime)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, endBCD...)
 	buf = append(buf, byte(m.AlarmFlag>>8), byte(m.AlarmFlag))
-	lat := uint32(m.CenterLat * jt808CoordScaleFactor)
-	lon := uint32(m.CenterLon * jt808CoordScaleFactor)
+	// [P0-修复] 负坐标处理
+	absLat := m.CenterLat
+	if absLat < 0 {
+		absLat = -absLat
+	}
+	absLon := m.CenterLon
+	if absLon < 0 {
+		absLon = -absLon
+	}
+	if absLat > 90.0 {
+		return nil, fmt.Errorf("latitude %.6f exceeds ±90 range", absLat)
+	}
+	lat := uint32(absLat * JT808CoordScaleFactor)
+	if absLon > 180.0 {
+		return nil, fmt.Errorf("longitude %.6f exceeds ±180 range", absLon)
+	}
+	lon := uint32(absLon * JT808CoordScaleFactor)
 	buf = append(buf, byte(lat>>24), byte(lat>>16), byte(lat>>8), byte(lat))
 	buf = append(buf, byte(lon>>24), byte(lon>>16), byte(lon>>8), byte(lon))
 	buf = append(buf, byte(m.Radius>>24), byte(m.Radius>>16), byte(m.Radius>>8), byte(m.Radius))
@@ -3431,13 +3944,13 @@ func (m *AreaRouteAlarmSetMessage) Unmarshal(data []byte) error {
 	}
 	m.AreaID = uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	m.AreaAttr = uint16(data[4])<<8 | uint16(data[5])
-	m.StartTime = BCDToStringFixed(data[6:12])
-	m.EndTime = BCDToStringFixed(data[12:18])
+	m.StartTime = BCDToStringSafe(data[6:12])
+	m.EndTime = BCDToStringSafe(data[12:18])
 	m.AlarmFlag = uint16(data[18])<<8 | uint16(data[19])
 	latRaw := uint32(data[20])<<24 | uint32(data[21])<<16 | uint32(data[22])<<8 | uint32(data[23])
-	m.CenterLat = float64(latRaw) / jt808CoordScaleFactor
+	m.CenterLat = float64(latRaw) / JT808CoordScaleFactor
 	lonRaw := uint32(data[24])<<24 | uint32(data[25])<<16 | uint32(data[26])<<8 | uint32(data[27])
-	m.CenterLon = float64(lonRaw) / jt808CoordScaleFactor
+	m.CenterLon = float64(lonRaw) / JT808CoordScaleFactor
 	m.Radius = uint32(data[28])<<24 | uint32(data[29])<<16 | uint32(data[30])<<8 | uint32(data[31])
 	return nil
 }

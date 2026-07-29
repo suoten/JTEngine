@@ -18,7 +18,11 @@ func TestBCDToString(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := BCDToString(tt.input)
+		got, err := BCDToString(tt.input)
+		if err != nil {
+			t.Errorf("BCDToString(%v) error: %v", tt.input, err)
+			continue
+		}
 		if got != tt.expected {
 			t.Errorf("BCDToString(%v) = %s, want %s", tt.input, got, tt.expected)
 		}
@@ -35,7 +39,11 @@ func TestStringToBCD(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := StringToBCD(tt.input)
+		got, err := StringToBCD6(tt.input)
+		if err != nil {
+			t.Errorf("StringToBCD(%s) error: %v", tt.input, err)
+			continue
+		}
 		if len(got) != len(tt.expected) {
 			t.Errorf("StringToBCD(%s) length = %d, want %d", tt.input, len(got), len(tt.expected))
 			continue
@@ -58,7 +66,11 @@ func TestEscapeUnescape(t *testing.T) {
 
 	for _, original := range tests {
 		escaped := Escape(original)
-		unescaped := Unescape(escaped)
+		unescaped, err := Unescape(escaped)
+		if err != nil {
+			t.Errorf("Unescape error: %v", err)
+			continue
+		}
 		if len(unescaped) != len(original) {
 			t.Errorf("Unescape length mismatch: got %d, want %d", len(unescaped), len(original))
 			continue

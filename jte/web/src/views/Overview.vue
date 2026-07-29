@@ -145,6 +145,9 @@ const protocolStats = ref([
 let timer = null
 let ws = null
 let wsReconnectTimer = null
+let wsReconnectCount = 0 // FIXED: [WebSocket断连] 指数退避计数 [2026-07-17]
+let manuallyClosed = false // FIXED: [WebSocket断连] 手动关闭标志 [2026-07-17]
+let wsHeartbeatTimer = null // FIXED: [WebSocket心跳] 定时发送心跳保活 [2026-07-17]
 
 async function fetchData() {
   try {
@@ -156,19 +159,29 @@ async function fetchData() {
     }
 
     const sessions = await sessionApi.getList({ page: 1, page_size: 5 }).catch(() => ({ sessions: [] }))
-    recentSessions.value = sessions.sessions || sessions || []
+    // FIXED-2026-07-24: API 返回 {sessions:null} 时 sessions 是对象非数组，需 Array.isArray 兜底
+const _sessions = sessions.sessions || sessions
+recentSessions.value = Array.isArray(_sessions) ? _sessions : []
 
     const alarms = await alarmApi.getList({ page: 1, page_size: 5 }).catch(() => ({ alarms: [] }))
-    recentAlarms.value = alarms.alarms || alarms || []
+    // FIXED-2026-07-24: 同上，alarms 可能是 null 导致对象落入列表
+const _alarms = alarms.alarms || alarms
+recentAlarms.value = Array.isArray(_alarms) ? _alarms : []
   } catch (e) {
-    // silent
+    // silent - 概览页数据加载失败不弹窗，避免页面初始加载时连续弹窗
+    console.error('[Overview] fetchData error:', e)
   }
 }
 
+// FIXED: [WebSocket断连] 增加 token 鉴权 + 指数退避重连 + 手动关闭标志 [2026-07-17]
 // WebSocket 实时推送：订阅报警与系统事件，避免纯轮询的延迟
 function connectWebSocket() {
+  if (manuallyClosed) return
+
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const wsUrl = `${protocol}//${window.location.host}/ws/v1/stream`
+  const token = localStorage.getItem('jte_token') || ''
+  // FIXED: [P0] WebSocket 连接必须携带 JWT token，否则后端返回 401 [2026-07-17]
+  const wsUrl = `${protocol}//${window.location.host}/ws/v1/stream?token=${encodeURIComponent(token)}`
 
   try {
     ws = new WebSocket(wsUrl)
@@ -178,8 +191,15 @@ function connectWebSocket() {
   }
 
   ws.onopen = () => {
+    wsReconnectCount = 0
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ action: 'subscribe', topics: ['alarm_event', 'system_event'] }))
+      // FIXED: [WebSocket心跳] 每30秒发送心跳保活 [2026-07-17]
+      wsHeartbeatTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: 'ping' }))
+        }
+      }, 30000)
     }
   }
 
@@ -207,6 +227,8 @@ function connectWebSocket() {
   }
 
   ws.onclose = () => {
+    if (manuallyClosed) return
+    if (wsHeartbeatTimer) { clearInterval(wsHeartbeatTimer); wsHeartbeatTimer = null }
     scheduleReconnect()
   }
 
@@ -217,10 +239,13 @@ function connectWebSocket() {
 
 function scheduleReconnect() {
   if (wsReconnectTimer) return
+  // FIXED: [WebSocket断连] 指数退避重连（1s→2s→4s→...→30s） [2026-07-17]
+  const delay = Math.min(1000 * Math.pow(2, wsReconnectCount), 30000)
+  wsReconnectCount++
   wsReconnectTimer = setTimeout(() => {
     wsReconnectTimer = null
     connectWebSocket()
-  }, 5000)
+  }, delay)
 }
 
 let statsRefreshTimer = null
@@ -264,9 +289,11 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  manuallyClosed = true // FIXED: [WebSocket断连] 防止组件卸载后重连 [2026-07-17]
   if (timer) clearInterval(timer)
   if (statsRefreshTimer) clearTimeout(statsRefreshTimer)
   if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
+  if (wsHeartbeatTimer) clearInterval(wsHeartbeatTimer)
   if (ws) { ws.onclose = null; ws.close() }
 })
 </script>

@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"context"
 	"fmt"
 	"math"
 	"net/http"
@@ -43,7 +42,7 @@ func (h *DeviceHandler) List(c *gin.Context) {
 		opts.Online = &val
 	}
 
-	result, err := h.store.ListVehicles(context.Background(), opts)
+	result, err := h.store.ListVehicles(c.Request.Context(), opts)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
@@ -191,7 +190,7 @@ func (h *TrackHandler) GetTrack(c *gin.Context) {
 		}
 	}
 
-	locations, err := h.store.GetLocationTrack(context.Background(), phone, startTime, endTime)
+	locations, err := h.store.GetLocationTrack(c.Request.Context(), phone, startTime, endTime)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
@@ -205,13 +204,22 @@ func (h *TrackHandler) GetTrack(c *gin.Context) {
 }
 
 type ReportHandler struct {
-	store   storage.Interface
-	logger  *zap.Logger
-	reports map[string]interface{}
+	store      storage.Interface
+	logger     *zap.Logger
+	mu         sync.RWMutex
+	reports    map[string]interface{}
+	reportTime map[string]time.Time // AUTO-FIX-2026-07-15: 记录报表生成时间，用于淘汰
+	maxReports int                  // AUTO-FIX-2026-07-15: 最大报表数，防 OOM
 }
 
 func NewReportHandler(store storage.Interface, logger *zap.Logger) *ReportHandler {
-	return &ReportHandler{store: store, logger: logger, reports: make(map[string]interface{})}
+	return &ReportHandler{
+		store:      store,
+		logger:     logger,
+		reports:    make(map[string]interface{}),
+		reportTime: make(map[string]time.Time),
+		maxReports: 1000, // AUTO-FIX-2026-07-15: 上限 1000 条，防 OOM
+	}
 }
 
 func (h *ReportHandler) Generate(c *gin.Context) {
@@ -240,8 +248,14 @@ func (h *ReportHandler) Generate(c *gin.Context) {
 		}
 	}
 
-	if endTime.Sub(startTime) > 31*24*time.Hour {
+	if endTime.Sub(startTime) > time.Duration(maxReportTimeRangeDays)*24*time.Hour {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "time range must not exceed 31 days"})
+		return
+	}
+
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 校验 Type 防 reportID 注入
+	if !isValidIDField(req.Type) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid type: only [A-Za-z0-9_-] allowed, max 64 chars"})
 		return
 	}
 
@@ -255,7 +269,7 @@ func (h *ReportHandler) Generate(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "phone is required for mileage report"})
 			return
 		}
-		track, err := h.store.GetLocationTrack(context.Background(), phone, startTime, endTime)
+		track, err := h.store.GetLocationTrack(c.Request.Context(), phone, startTime, endTime)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 			return
@@ -264,7 +278,13 @@ func (h *ReportHandler) Generate(c *gin.Context) {
 		for i := 1; i < len(track); i++ {
 			dLat := track[i].Latitude - track[i-1].Latitude
 			dLng := track[i].Longitude - track[i-1].Longitude
-			dist := math.Sqrt(dLat*dLat+dLng*dLng) * 111.32
+			// AUTO-FIX-2026-07-14 [ConvergeLoop-严重]: 修复经度距离缺少余弦校正
+			// 原代码 math.Sqrt(dLat*dLat+dLng*dLng) * 111.32 将经度和纬度等同处理，
+			// 但 1° 经度距离 = 111.32 * cos(lat) km，在纬度 40°（北京）处仅 85.3 km。
+			// 原实现高估里程 ~31%（北京）/ ~41%（哈尔滨 45°N），直接影响计费和维保周期。
+			latRad := track[i].Latitude * math.Pi / 180
+			dLngCorrected := dLng * math.Cos(latRad)
+			dist := math.Sqrt(dLat*dLat+dLngCorrected*dLngCorrected) * 111.32
 			totalMileage += dist
 		}
 		reportData = gin.H{
@@ -277,7 +297,7 @@ func (h *ReportHandler) Generate(c *gin.Context) {
 		}
 
 	case "alarm":
-		alarmResult, err := h.store.ListAlarms(context.Background(), storage.ListOptions{
+		alarmResult, err := h.store.ListAlarms(c.Request.Context(), storage.ListOptions{
 			PageSize: 1000,
 			Start:    startTime.Format(time.RFC3339),
 			End:      endTime.Format(time.RFC3339),
@@ -305,8 +325,8 @@ func (h *ReportHandler) Generate(c *gin.Context) {
 		}
 
 	case "online_rate":
-		onlineCount, _ := h.store.GetOnlineCount(context.Background())
-		offlineCount, _ := h.store.GetOfflineCount(context.Background())
+		onlineCount, _ := h.store.GetOnlineCount(c.Request.Context())
+		offlineCount, _ := h.store.GetOfflineCount(c.Request.Context())
 		totalDevices := onlineCount + offlineCount
 		rate := 0.0
 		if totalDevices > 0 {
@@ -327,14 +347,14 @@ func (h *ReportHandler) Generate(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "phone is required for overspeed report"})
 			return
 		}
-		track, err := h.store.GetLocationTrack(context.Background(), phone, startTime, endTime)
+		track, err := h.store.GetLocationTrack(c.Request.Context(), phone, startTime, endTime)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 			return
 		}
 		var overspeedRecords []*storage.LocationData
 		for _, loc := range track {
-			if loc.Speed > 120 {
+			if loc.Speed > overspeedThresholdKMH {
 				overspeedRecords = append(overspeedRecords, loc)
 			}
 		}
@@ -351,7 +371,15 @@ func (h *ReportHandler) Generate(c *gin.Context) {
 		return
 	}
 
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P0]: 加写锁防止并发 map 读写 panic
+	// AUTO-FIX-2026-07-15 [ConvergeLoop-严重]: 超出容量时淘汰最旧报表，防 OOM
+	h.mu.Lock()
+	if len(h.reports) >= h.maxReports {
+		h.evictOldestLocked()
+	}
 	h.reports[reportID] = reportData
+	h.reportTime[reportID] = time.Now()
+	h.mu.Unlock()
 
 	c.JSON(http.StatusOK, gin.H{
 		"code": 0,
@@ -364,7 +392,30 @@ func (h *ReportHandler) Generate(c *gin.Context) {
 	})
 }
 
+// evictOldestLocked 淘汰最旧的报表（调用方必须持有写锁）
+// AUTO-FIX-2026-07-15 [ConvergeLoop-严重]: 防 OOM 淘汰机制
+func (h *ReportHandler) evictOldestLocked() {
+	if len(h.reportTime) == 0 {
+		return
+	}
+	var oldestID string
+	var oldestTime time.Time
+	first := true
+	for id, t := range h.reportTime {
+		if first || t.Before(oldestTime) {
+			oldestID = id
+			oldestTime = t
+			first = false
+		}
+	}
+	delete(h.reports, oldestID)
+	delete(h.reportTime, oldestID)
+}
+
 func (h *ReportHandler) List(c *gin.Context) {
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P0]: 加读锁防止并发 map 读写 panic
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	items := make([]interface{}, 0, len(h.reports))
 	for id, data := range h.reports {
 		items = append(items, gin.H{
@@ -468,6 +519,12 @@ func (h *CascadeHandler) CreatePlatform(c *gin.Context) {
 	}
 	if req.Role == "upstream" && (req.Host == "" || req.Port == 0) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "upstream platform requires host and port"})
+		return
+	}
+
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 校验 UserID 防 platformID 注入
+	if !isValidIDField(req.UserID) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid user_id: only [A-Za-z0-9_-] allowed, max 64 chars"})
 		return
 	}
 
@@ -694,7 +751,7 @@ func (h *AIHandler) AnalyzeAlarm(c *gin.Context) {
 		h.logger.Warn("AI module failed, falling back to rule engine", zap.Error(err))
 	}
 
-	alarms, err := h.store.ListAlarms(context.Background(), storage.ListOptions{PageSize: 100})
+	alarms, err := h.store.ListAlarms(c.Request.Context(), storage.ListOptions{PageSize: 100})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
@@ -754,7 +811,7 @@ func (h *AIHandler) CheckFatigue(c *gin.Context) {
 		return
 	}
 
-	track, err := h.store.GetLocationTrack(context.Background(), phone, time.Now().Add(-8*time.Hour), time.Now())
+	track, err := h.store.GetLocationTrack(c.Request.Context(), phone, time.Now().Add(-8*time.Hour), time.Now())
 	if err != nil || len(track) == 0 {
 		c.JSON(http.StatusOK, gin.H{
 			"code": 0,
@@ -836,7 +893,7 @@ func (h *AIHandler) GetRiskScore(c *gin.Context) {
 		return
 	}
 
-	alarmResult, _ := h.store.ListAlarms(context.Background(), storage.ListOptions{
+	alarmResult, _ := h.store.ListAlarms(c.Request.Context(), storage.ListOptions{
 		Phone:    phone,
 		PageSize: 100,
 		Start:    time.Now().Add(-24 * time.Hour).Format(time.RFC3339),
@@ -850,12 +907,12 @@ func (h *AIHandler) GetRiskScore(c *gin.Context) {
 		}
 	}
 
-	track, _ := h.store.GetLocationTrack(context.Background(), phone, time.Now().Add(-24*time.Hour), time.Now())
+	track, _ := h.store.GetLocationTrack(c.Request.Context(), phone, time.Now().Add(-24*time.Hour), time.Now())
 	var overspeedCount int
 	var maxSpeed float64
 	if track != nil {
 		for _, loc := range track {
-			if loc.Speed > 120 {
+			if loc.Speed > overspeedThresholdKMH {
 				overspeedCount++
 			}
 			if loc.Speed > maxSpeed {
@@ -875,7 +932,7 @@ func (h *AIHandler) GetRiskScore(c *gin.Context) {
 		riskScore += float64(overspeedCount) * 3
 		factors = append(factors, "overspeed")
 	}
-	if maxSpeed > 120 {
+	if maxSpeed > overspeedThresholdKMH {
 		riskScore += 10
 		factors = append(factors, "high_speed")
 	}
@@ -914,7 +971,7 @@ func (h *AIHandler) AnomalyDetect(c *gin.Context) {
 		return
 	}
 
-	track, _ := h.store.GetLocationTrack(context.Background(), req.Phone, time.Now().Add(-2*time.Hour), time.Now())
+	track, _ := h.store.GetLocationTrack(c.Request.Context(), req.Phone, time.Now().Add(-2*time.Hour), time.Now())
 
 	anomalyDetected := false
 	anomalyType := ""
@@ -938,7 +995,10 @@ func (h *AIHandler) AnomalyDetect(c *gin.Context) {
 			if gap > 0 && gap < 1 {
 				latDiff := track[i].Latitude - track[i-1].Latitude
 				lngDiff := track[i].Longitude - track[i-1].Longitude
-				if latDiff > 0.1 || lngDiff > 0.1 {
+				// AUTO-FIX-2026-07-14 [ConvergeLoop-严重]: 使用绝对值检测双向跳变
+				// 原代码 latDiff > 0.1 只检测北向/东向跳变，南向/西向跳变（负差值）不被检测。
+				// 0.1度 ≈ 11km，1秒内移动11km必然是GPS漂移。
+				if math.Abs(latDiff) > 0.1 || math.Abs(lngDiff) > 0.1 {
 					anomalyDetected = true
 					anomalyType = "position_jump"
 					confidence = 0.8
@@ -1040,7 +1100,7 @@ func (h *AIHandler) Chat(c *gin.Context) {
 			phone = resolvedPhone
 		}
 		if phone != "" {
-			count, err := h.store.GetAlarmCount(context.Background(), time.Now().Add(-24*time.Hour), time.Now())
+			count, err := h.store.GetAlarmCount(c.Request.Context(), time.Now().Add(-24*time.Hour), time.Now())
 			if err == nil {
 				response = fmt.Sprintf("设备 %s 最近24小时报警 %d 条", phone, count)
 			} else {
@@ -1048,7 +1108,7 @@ func (h *AIHandler) Chat(c *gin.Context) {
 			}
 			sessCtx.LastPhone = phone
 		} else {
-			count, err := h.store.GetAlarmCount(context.Background(), time.Now().Add(-24*time.Hour), time.Now())
+			count, err := h.store.GetAlarmCount(c.Request.Context(), time.Now().Add(-24*time.Hour), time.Now())
 			if err == nil {
 				response = fmt.Sprintf("最近24小时报警 %d 条", count)
 			} else {
@@ -1057,7 +1117,7 @@ func (h *AIHandler) Chat(c *gin.Context) {
 		}
 	} else if strings.Contains(query, "在线") && strings.Contains(query, "设备") {
 		intent = "online"
-		count, err := h.store.GetOnlineCount(context.Background())
+		count, err := h.store.GetOnlineCount(c.Request.Context())
 		if err == nil {
 			response = fmt.Sprintf("当前在线设备 %d 台", count)
 		} else {
@@ -1070,7 +1130,7 @@ func (h *AIHandler) Chat(c *gin.Context) {
 			phone = resolvedPhone
 		}
 		if phone != "" {
-			loc, err := h.store.GetLatestLocation(context.Background(), phone)
+			loc, err := h.store.GetLatestLocation(c.Request.Context(), phone)
 			if err == nil && loc != nil {
 				response = fmt.Sprintf("设备 %s 最新位置：纬度%.6f，经度%.6f，速度%.1f km/h", phone, loc.Latitude, loc.Longitude, loc.Speed)
 			} else {
@@ -1082,7 +1142,7 @@ func (h *AIHandler) Chat(c *gin.Context) {
 		}
 	} else if strings.Contains(query, "离线") {
 		intent = "offline"
-		count, err := h.store.GetOfflineCount(context.Background())
+		count, err := h.store.GetOfflineCount(c.Request.Context())
 		if err == nil {
 			response = fmt.Sprintf("当前离线设备 %d 台", count)
 		} else {
@@ -1095,7 +1155,7 @@ func (h *AIHandler) Chat(c *gin.Context) {
 			phone = resolvedPhone
 		}
 		if phone != "" {
-			loc, err := h.store.GetLatestLocation(context.Background(), phone)
+			loc, err := h.store.GetLatestLocation(c.Request.Context(), phone)
 			if err == nil && loc != nil {
 				response = fmt.Sprintf("设备 %s 当前速度 %.1f km/h", phone, loc.Speed)
 			} else {
@@ -1112,7 +1172,7 @@ func (h *AIHandler) Chat(c *gin.Context) {
 			phone = resolvedPhone
 		}
 		if phone != "" {
-			track, err := h.store.GetLocationTrack(context.Background(), phone, time.Now().Add(-1*time.Hour), time.Now())
+			track, err := h.store.GetLocationTrack(c.Request.Context(), phone, time.Now().Add(-1*time.Hour), time.Now())
 			if err == nil {
 				response = fmt.Sprintf("设备 %s 最近1小时有 %d 条轨迹记录", phone, len(track))
 			} else {

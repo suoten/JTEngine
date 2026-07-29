@@ -13,10 +13,10 @@
           <div style="display: flex; align-items: center; justify-content: space-between;">
             <span style="font-weight: 500; font-size: 14px;">报文记录</span>
             <div style="display: flex; gap: 8px;">
-              <el-input v-model="searchPhone" placeholder="{{ $t('common.btn.search') }}手机号" size="small" style="width: 180px;" clearable>
+              <el-input v-model="searchPhone" :placeholder="$t('common.btn.search') + '手机号'" size="small" style="width: 180px;" clearable>
                 <template #prefix><el-icon><Search /></el-icon></template>
               </el-input>
-              <el-select v-model="filterProtocol" placeholder="{{ $t('device.protocol_filter') }}" size="small" style="width: 130px;" clearable>
+              <el-select v-model="filterProtocol" :placeholder="$t('device.protocol_filter')" size="small" style="width: 130px;" clearable>
                 <el-option label="JT/T 808" value="jt808" />
                 <el-option label="JT/T 809" value="jt809" />
                 <el-option label="JT/T 1078" value="jt1078" />
@@ -178,10 +178,13 @@ async function fetchLogs() {
       page: currentPage.value,
       page_size: pageSize,
     })
-    logs.value = data.logs || data || []
+    // FIXED-2026-07-24: API 返回 {logs:null} 时 data 是对象非数组，需 Array.isArray 兜底
+const _raw = data.logs || data
+logs.value = Array.isArray(_raw) ? _raw : []
     totalLogs.value = data.total || logs.value.length
   } catch (e) {
     logs.value = []
+    ElMessage.error('加载协议日志失败，请检查网络或稍后重试')
   } finally {
     loading.value = false
   }

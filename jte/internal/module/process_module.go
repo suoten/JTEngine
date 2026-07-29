@@ -1,3 +1,4 @@
+// FIXED: [P1] process_module.go RPC 调用 goroutine 缺少 recover()，panic 会崩溃宿主进程 [2026-07-17]
 package module
 
 // ===================================================================
@@ -16,6 +17,7 @@ package module
 // ===================================================================
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/rpc"
@@ -23,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,6 +91,12 @@ func (pm *ProcessModule) Init(app interface{}) error {
 
 	if pm.cmd != nil {
 		return fmt.Errorf("module %s process already started", pm.name)
+	}
+
+	// [P1-54] 二进制路径安全校验：防止路径遍历攻击
+	// binaryPath 来自配置，必须校验其在允许的模块目录内、不含 ".." 且具有可执行权限
+	if err := validateBinaryPath(pm.binaryPath, pm.config.ModuleBinDir); err != nil {
+		return fmt.Errorf("module %s binary path validation: %w", pm.name, err)
 	}
 
 	// 检查二进制是否存在
@@ -202,8 +211,18 @@ func (pm *ProcessModule) Stop() error {
 	if stopTimeout == 0 {
 		stopTimeout = 5 * time.Second
 	}
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P2]: 使用 context 控制 goroutine 生命周期，
+	// 防止 RPC 调用永久阻塞导致 goroutine 泄漏（子进程 hang 住但未退出时）。
+	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
+	defer cancel()
 	done := make(chan error, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// FIXED: [P1] RPC Stop 调用 panic recovery [2026-07-17]
+				done <- fmt.Errorf("module RPC stop panic: %v", r)
+			}
+		}()
 		var result rpcModuleResult
 		err := pm.client.Call("ModuleRPC.Stop", rpcModuleArgs{}, &result)
 		if err == nil && result.Error != "" {
@@ -213,25 +232,53 @@ func (pm *ProcessModule) Stop() error {
 	}()
 
 	select {
-	case <-time.After(stopTimeout):
+	case <-ctx.Done():
 		// RPC 超时，强制杀死
-	case <-done:
+		if pm.logger != nil {
+			pm.logger.Warn("module RPC stop timeout, force killing",
+				zap.String("module", pm.name),
+				zap.Duration("timeout", stopTimeout))
+		}
+	case err := <-done:
 		// RPC 完成
+		if err != nil && pm.logger != nil {
+			pm.logger.Warn("module RPC stop returned error",
+				zap.String("module", pm.name),
+				zap.Error(err))
+		}
 	}
 
 	// 关闭 RPC client
-	_ = pm.client.Close()
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P2]: 记录关闭错误而非吞掉
+	if err := pm.client.Close(); err != nil && pm.logger != nil {
+		pm.logger.Debug("RPC client close error",
+			zap.String("module", pm.name),
+			zap.Error(err))
+	}
 	pm.client = nil
 
 	// 终止子进程
 	if pm.cmd != nil && pm.cmd.Process != nil {
-		_ = pm.cmd.Process.Kill()
-		_, _ = pm.cmd.Process.Wait()
+		if err := pm.cmd.Process.Kill(); err != nil && pm.logger != nil {
+			pm.logger.Warn("process kill error",
+				zap.String("module", pm.name),
+				zap.Error(err))
+		}
+		if _, err := pm.cmd.Process.Wait(); err != nil && pm.logger != nil {
+			pm.logger.Debug("process wait error",
+				zap.String("module", pm.name),
+				zap.Error(err))
+		}
 		pm.cmd = nil
 	}
 
 	// 清理 socket 文件
-	_ = os.Remove(pm.socketPath)
+	if err := os.Remove(pm.socketPath); err != nil && !os.IsNotExist(err) && pm.logger != nil {
+		pm.logger.Debug("socket file remove error",
+			zap.String("module", pm.name),
+			zap.String("path", pm.socketPath),
+			zap.Error(err))
+	}
 
 	if pm.logger != nil {
 		pm.logger.Info("module process stopped", zap.String("name", pm.name))
@@ -285,6 +332,51 @@ func (pm *ProcessModule) cleanup() {
 		pm.cmd = nil
 	}
 	_ = os.Remove(pm.socketPath)
+}
+
+// [P1-54] validateBinaryPath 校验二进制路径安全性。
+// 防止路径遍历攻击：路径必须在指定目录下，不包含 ".."，且具有可执行权限。
+// allowedDir 为允许的模块二进制目录（通常为 config.ModuleBinDir）；
+// 为空时跳过目录约束校验（仅校验路径遍历和可执行权限）。
+func validateBinaryPath(binaryPath, allowedDir string) error {
+	// 清理路径，去除冗余的 ./ ../ 等
+	cleanPath := filepath.Clean(binaryPath)
+
+	// 检查路径不包含 ".."（防止路径遍历）
+	if strings.Contains(cleanPath, "..") {
+		return fmt.Errorf("binary path contains path traversal ('..'): %s", binaryPath)
+	}
+
+	// 如果指定了允许目录，检查路径在目录内
+	if allowedDir != "" {
+		cleanAllowed := filepath.Clean(allowedDir)
+		rel, err := filepath.Rel(cleanAllowed, cleanPath)
+		if err != nil {
+			return fmt.Errorf("cannot resolve relative path from allowed dir: %w", err)
+		}
+		// rel 以 ".." 开头表示路径在允许目录之外
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("binary path outside allowed directory: %s (allowed: %s)", binaryPath, cleanAllowed)
+		}
+	}
+
+	// 检查文件存在且不是目录
+	info, err := os.Stat(cleanPath)
+	if err != nil {
+		return fmt.Errorf("binary not accessible: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("binary path is a directory: %s", binaryPath)
+	}
+
+	// Windows 不检查可执行权限位（NTFS 不支持 Unix 权限位）
+	if runtime.GOOS != "windows" {
+		if info.Mode()&0o111 == 0 {
+			return fmt.Errorf("binary not executable (no execute permission): %s", binaryPath)
+		}
+	}
+
+	return nil
 }
 
 // discoverModuleBinaries 在指定目录查找模块二进制文件。

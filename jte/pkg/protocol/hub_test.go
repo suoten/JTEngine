@@ -48,32 +48,46 @@ func TestFrameBuffer_808PartialFrame(t *testing.T) {
 func TestFrameBuffer_809Bracketed(t *testing.T) {
 	fb := NewFrameBuffer(ProtocolJT809)
 
-	// AUTO-FIX-2026-06-26: 结束符由0x5D修正为标准0x5E
-	data := []byte{0x5B, 0x01, 0x02, 0x03, 0x5E}
+	// AUTO-FIX-2026-07-17: 809标准结束符为0x5D
+	// FrameBuffer层只接受0x5D，0x5E在转义序列(0x5E 0x01/0x5E 0x02)中出现，
+	// 作为结束符会截断含转义数据的帧。0x5E兼容仅在Hub路由层(tryParse809)处理。
+	// FIXED-2026-07-23 [P2]: 帧长度需 >= minBracketedFrameLen(22B) 才不会被丢弃
+	data := make([]byte, 22)
+	data[0] = 0x5B
+	data[len(data)-1] = 0x5D
+	for i := 1; i < len(data)-1; i++ {
+		data[i] = byte(i)
+	}
 	frames := fb.Feed(data)
 	if len(frames) != 1 {
 		t.Fatalf("expected 1 frame, got %d", len(frames))
 	}
-	if frames[0][0] != 0x5B || frames[0][len(frames[0])-1] != 0x5E {
-		t.Error("frame not properly bracketed")
+	if frames[0][0] != 0x5B || frames[0][len(frames[0])-1] != 0x5D {
+		t.Error("frame not properly bracketed with 0x5D")
 	}
 }
 
 func TestFrameBuffer_32960LengthPrefixed(t *testing.T) {
 	fb := NewFrameBuffer(ProtocolGBT32960)
 
+	// GB/T 32960.3-2016: 头部24字节（含加密方式1B），数据长度在data[22:24]
+	// 帧结构: 起始符(2)+命令(1)+应答(1)+VIN(17)+加密方式(1)+数据长度(2)+数据体(5)+BCC(1) = 30
 	frame := make([]byte, 30)
 	frame[0] = 0x23
 	frame[1] = 0x23
-	for i := 2; i < 22; i++ {
+	for i := 2; i < 21; i++ {
 		frame[i] = 0x00
 	}
+	// 数据单元加密方式（byte 21）
+	frame[21] = 0x01 // 不加密
+	// 数据长度 = 5 (大端: 0x00 0x05)
 	frame[22] = 0x00
 	frame[23] = 0x05
+	// 数据体 5字节
 	for i := 24; i < 29; i++ {
 		frame[i] = byte(i)
 	}
-	frame[29] = 0x00
+	frame[29] = 0x00 // BCC
 
 	frames := fb.Feed(frame)
 	if len(frames) != 1 {
@@ -93,7 +107,11 @@ func TestUnescape808(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		result := unescape808(tt.input)
+		result, err := unescape808(tt.input)
+		if err != nil {
+			t.Errorf("unescape808 error: %v", err)
+			continue
+		}
 		if len(result) != len(tt.expected) {
 			t.Errorf("unescape808 length: got %d, want %d", len(result), len(tt.expected))
 			continue
@@ -119,7 +137,11 @@ func TestUnescape809(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		result := unescape809(tt.input)
+		result, err := unescape809(tt.input)
+		if err != nil {
+			t.Errorf("unescape809(%v) error: %v", tt.input, err)
+			continue
+		}
 		if len(result) != len(tt.expected) {
 			t.Errorf("unescape809 length: got %d, want %d", len(result), len(tt.expected))
 			continue

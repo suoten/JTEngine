@@ -1,6 +1,7 @@
 package security
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -191,4 +192,186 @@ func TestGetClientIP(t *testing.T) {
 	if ip != "192.168.1.1" {
 		t.Fatalf("RemoteAddr 应解析，got %s", ip)
 	}
+}
+
+// [P0-3] TestLoginGuard_CleanupDoesNotBlockLogins 验证 cleanupExpired 不会长时间阻塞登录请求。
+// 向 LoginGuard 填充大量数据后触发 cleanupExpired，同时并发执行 CheckLogin，
+// 确保每个 CheckLogin 响应时间不超过 10ms。
+func TestLoginGuard_CleanupDoesNotBlockLogins(t *testing.T) {
+	g := NewLoginGuard(LoginGuardConfig{
+		MaxFailures:     5,
+		LockoutDuration: 1 * time.Millisecond, // 极短，使条目快速变为可清理状态
+		HistoryLimit:    5,
+	}, zap.NewNop())
+	defer g.Stop()
+
+	// 填充大量登录失败记录（条目将在锁定过期后变为可清理）
+	for i := 0; i < 5000; i++ {
+		username := "user" + itoa(i)
+		g.RecordLoginFailure(username, "1.2.3.4")
+	}
+
+	// 等待锁定过期（lockoutDuration = 1ms）
+	time.Sleep(5 * time.Millisecond)
+
+	// 并发：一个 goroutine 调用 cleanupExpired，多个 goroutine 调用 CheckLogin
+	const numReaders = 50
+	const maxBlockThreshold = 10 * time.Millisecond
+
+	var wg sync.WaitGroup
+	wg.Add(numReaders + 1)
+
+	// 启动清理 goroutine
+	go func() {
+		defer wg.Done()
+		g.cleanupExpired()
+	}()
+
+	// 启动读 goroutine 测量 CheckLogin 延迟
+	maxLatency := time.Duration(0)
+	var latencyMu sync.Mutex
+
+	for i := 0; i < numReaders; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			username := "user" + itoa(idx)
+			start := time.Now()
+			g.CheckLogin(username, "1.2.3.4", "fp")
+			latency := time.Since(start)
+
+			latencyMu.Lock()
+			if latency > maxLatency {
+				maxLatency = latency
+			}
+			latencyMu.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+
+	if maxLatency > maxBlockThreshold {
+		t.Fatalf("CheckLogin blocked for %v, threshold %v", maxLatency, maxBlockThreshold)
+	}
+}
+
+// [P0-3] TestLoginGuard_CleanupExpired_RemovesExpiredEntries 验证 cleanupExpired 正确清理过期数据。
+func TestLoginGuard_CleanupExpired_RemovesExpiredEntries(t *testing.T) {
+	g := NewLoginGuard(LoginGuardConfig{
+		MaxFailures:     2,
+		LockoutDuration: 1 * time.Millisecond,
+		HistoryLimit:    10,
+	}, zap.NewNop())
+	defer g.Stop()
+
+	// 创建失败记录并锁定
+	g.RecordLoginFailure("expireduser", "1.2.3.4")
+	g.RecordLoginFailure("expireduser", "1.2.3.4") // 触发锁定
+
+	// 等待锁定过期 + lastFailure 超过 1 小时条件（手动调整 lastFailure）
+	g.mu.Lock()
+	if state, ok := g.loginFailures["expireduser"]; ok {
+		state.lockedUntil = time.Now().Add(-1 * time.Hour)  // 锁定已过期
+		state.lastFailure = time.Now().Add(-2 * time.Hour)   // 超过 1 小时无失败
+	}
+	g.mu.Unlock()
+
+	// 执行清理
+	g.cleanupExpired()
+
+	// 验证条目已被清理
+	g.mu.RLock()
+	_, exists := g.loginFailures["expireduser"]
+	g.mu.RUnlock()
+	if exists {
+		t.Fatal("cleanupExpired should remove expired login failure entry")
+	}
+}
+
+// [P0-3] TestLoginGuard_CleanupExpired_KeepsActiveEntries 验证 cleanupExpired 不清理活跃条目。
+func TestLoginGuard_CleanupExpired_KeepsActiveEntries(t *testing.T) {
+	g := NewLoginGuard(LoginGuardConfig{
+		MaxFailures:     5,
+		LockoutDuration: 1 * time.Hour, // 仍锁定中
+		HistoryLimit:    10,
+	}, zap.NewNop())
+	defer g.Stop()
+
+	// 创建活跃失败记录
+	for i := 0; i < 3; i++ {
+		g.RecordLoginFailure("activeuser", "1.2.3.4")
+	}
+
+	// 执行清理
+	g.cleanupExpired()
+
+	// 验证条目仍然存在（锁定未过期）
+	g.mu.RLock()
+	_, exists := g.loginFailures["activeuser"]
+	g.mu.RUnlock()
+	if !exists {
+		t.Fatal("cleanupExpired should keep active (still-locked) entry")
+	}
+}
+
+// [P0-3] TestLoginGuard_CleanupBatchSize 验证分批清理不超限。
+func TestLoginGuard_CleanupBatchSize(t *testing.T) {
+	g := NewLoginGuard(LoginGuardConfig{
+		MaxFailures:     1,
+		LockoutDuration: 1 * time.Millisecond,
+		HistoryLimit:    5,
+	}, zap.NewNop())
+	defer g.Stop()
+
+	// 填充超过 cleanupBatchSize 的可清理条目
+	total := cleanupBatchSize + 500
+	for i := 0; i < total; i++ {
+		username := "batchuser" + itoa(i)
+		g.RecordLoginFailure(username, "1.2.3.4")
+	}
+
+	// 使所有条目可清理
+	time.Sleep(5 * time.Millisecond)
+	g.mu.Lock()
+	for _, state := range g.loginFailures {
+		state.lockedUntil = time.Now().Add(-1 * time.Hour)
+		state.lastFailure = time.Now().Add(-2 * time.Hour)
+	}
+	g.mu.Unlock()
+
+	// 执行清理（应最多清理 cleanupBatchSize 条）
+	g.cleanupExpired()
+
+	g.mu.RLock()
+	remaining := len(g.loginFailures)
+	g.mu.RUnlock()
+
+	// 应剩余至少 total - cleanupBatchSize 条
+	expectedMin := total - cleanupBatchSize
+	if remaining < expectedMin {
+		t.Fatalf("remaining = %d, expected at least %d (batch limit not respected)", remaining, expectedMin)
+	}
+}
+
+// itoa 简单整数转字符串（避免引入 strconv 仅为测试）
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	neg := false
+	if i < 0 {
+		neg = true
+		i = -i
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	if neg {
+		pos--
+		buf[pos] = '-'
+	}
+	return string(buf[pos:])
 }

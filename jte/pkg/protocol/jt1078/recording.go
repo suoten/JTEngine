@@ -83,12 +83,14 @@ type FragmentAlertWriter interface {
 // RecordSegmentTracker 录制分片跟踪器（每设备每通道一个）。
 // AUTO-FIX-2026-06-30 [P2-7]: 跟踪录制分片，检测断片，写入告警。
 // AUTO-FIX-2026-07-02 [P1]: 增加 history 历史分片列表，支持按时间段查询与合并。
+// R47-FIX-2026-07-26 [P1]: 增加 maxHistorySize 限制，防止 7x24 运行时 history 切片无限增长导致 OOM。
 type RecordSegmentTracker struct {
-	mu          sync.Mutex
-	segments    map[string]*activeSegment // key: streamID（phone+channel+streamType）
-	history     []RecordSegment           // 已结束的分片历史（按时间顺序，供查询/合并）
-	alertWriter FragmentAlertWriter
-	logger      *zap.Logger
+	mu             sync.Mutex
+	segments       map[string]*activeSegment // key: streamID（phone+channel+streamType）
+	history        []RecordSegment           // 已结束的分片历史（按时间顺序，供查询/合并）
+	maxHistorySize int                       // history 最大条目数，0 表示不限
+	alertWriter    FragmentAlertWriter
+	logger         *zap.Logger
 }
 
 type activeSegment struct {
@@ -111,11 +113,15 @@ type activeSegment struct {
 }
 
 // NewRecordSegmentTracker 创建录制分片跟踪器。
+// maxHistorySizeDefault 默认 history 最大条目数（10000 条）
+const maxHistorySizeDefault = 10000
+
 func NewRecordSegmentTracker(logger *zap.Logger, alertWriter FragmentAlertWriter) *RecordSegmentTracker {
 	return &RecordSegmentTracker{
-		segments:    make(map[string]*activeSegment),
-		alertWriter: alertWriter,
-		logger:      logger,
+		segments:       make(map[string]*activeSegment),
+		alertWriter:    alertWriter,
+		logger:         logger,
+		maxHistorySize: maxHistorySizeDefault,
 	}
 }
 
@@ -123,6 +129,17 @@ func NewRecordSegmentTracker(logger *zap.Logger, alertWriter FragmentAlertWriter
 func (t *RecordSegmentTracker) SetAlertWriter(w FragmentAlertWriter) {
 	t.mu.Lock()
 	t.alertWriter = w
+	t.mu.Unlock()
+}
+
+// SetMaxHistorySize 设置 history 最大条目数（0=不限）。
+// R47-FIX-2026-07-26 [P1]: 防止 7x24 运行时 history 无限增长导致 OOM。
+func (t *RecordSegmentTracker) SetMaxHistorySize(max int) {
+	t.mu.Lock()
+	t.maxHistorySize = max
+	if max > 0 && len(t.history) > max {
+		t.history = t.history[len(t.history)-max:]
+	}
 	t.mu.Unlock()
 }
 
@@ -358,6 +375,10 @@ func (t *RecordSegmentTracker) finalizeLocked(seg *activeSegment, endTime time.T
 		FilePath:     seg.filePath,
 		FileSize:     seg.fileSize,
 	})
+	// R47-FIX-2026-07-26 [P1]: 裁剪 history，防止无限增长导致 OOM
+	if t.maxHistorySize > 0 && len(t.history) > t.maxHistorySize {
+		t.history = t.history[len(t.history)-t.maxHistorySize:]
+	}
 }
 
 // QuerySegments 按时间段查询已结束的录制分片列表。

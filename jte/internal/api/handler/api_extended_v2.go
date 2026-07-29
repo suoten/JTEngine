@@ -13,6 +13,7 @@ package handler
 // ===================================================================
 
 import (
+	cryptoRand "crypto/rand"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -44,25 +45,41 @@ const (
 // 1. 设备管理模块扩展
 // ===================================================================
 
+// RegisterDeviceRequest 终端注册请求体（JT/T 808 0x0100 业务注册）
+// AUTO-FIX-2026-07-15 [ConvergeLoop-语义一致性]: 提取为命名结构体
+// 原先直接在 handler 中匿名结构体，Swagger 注解使用 map[string]interface{} 无法生成客户端 SDK
+type RegisterDeviceRequest struct {
+	Phone        string `json:"phone" binding:"required" example:"13800138000"`        // 手机号（必填，JT/T 808 终端手机号）
+	VehicleID    string `json:"vehicle_id" binding:"required" example:"vehicle_001"`   // 车辆ID（必填，平台唯一标识）
+	PlateNo      string `json:"plate_no" example:"京A12345"`                            // 车牌号（可选）
+	TerminalType string `json:"terminal_type" example:"JT808-V3"`                      // 终端型号（可选）
+	Manufacturer string `json:"manufacturer" example:"硕腾科技"`                          // 厂商（可选）
+	ProvinceID   int    `json:"province_id" example:"110"`                              // 省份ID（可选，JT/T 808 行政区划代码）
+	CityID       int    `json:"city_id" example:"110100"`                              // 城市ID（可选，JT/T 808 行政区划代码）
+}
+
+// RegisterDeviceResponse 终端注册响应体
+type RegisterDeviceResponse struct {
+	Code      int    `json:"code" example:"0"`                 // 业务码：0=成功
+	Message   string `json:"message" example:"registered"`     // 描述
+	AuthCode  string `json:"auth_code" example:"a1b2c3d4e5f6"` // 鉴权码（终端 0x0102 鉴权时使用）
+	VehicleID string `json:"vehicle_id" example:"vehicle_001"` // 车辆ID（回显请求中的 vehicle_id）
+}
+
 // RegisterDevice godoc
 // @Summary 终端注册（JT/T 808 0x0100）
 // @Description 平台侧主动登记终端信息（业务注册，区别于设备自发 0x0100）。生成鉴权码返回。
 // @Tags 设备
 // @Accept json
 // @Produce json
-// @Param body body object true "注册信息" {phone=手机号, vehicle_id=车辆ID, plate_no=车牌号, terminal_type=终端型号, manufacturer=厂商}
-// @Success 200 {object} map[string]interface{}
+// @Param body body RegisterDeviceRequest true "注册信息"
+// @Success 200 {object} RegisterDeviceResponse
+// @Failure 400 {object} map[string]interface{} "参数错误（phone/vehicle_id 必填）"
+// @Failure 409 {object} map[string]interface{} "手机号已注册"
+// @Failure 500 {object} map[string]interface{} "服务器内部错误"
 // @Router /api/v1/devices/register [post]
 func (h *DeviceHandler) RegisterDevice(c *gin.Context) {
-	var req struct {
-		Phone        string `json:"phone" binding:"required"`
-		VehicleID    string `json:"vehicle_id" binding:"required"`
-		PlateNo      string `json:"plate_no"`
-		TerminalType string `json:"terminal_type"`
-		Manufacturer string `json:"manufacturer"`
-		ProvinceID   int    `json:"province_id"`
-		CityID       int    `json:"city_id"`
-	}
+	var req RegisterDeviceRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
@@ -232,14 +249,14 @@ func (h *DeviceHandler) SetTerminalParams(c *gin.Context) {
 
 	if err := h.commandSender.SendParamSet(req.Phone, paramIDs); err != nil {
 		h.logger.Error("set terminal params failed", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to send terminal params command"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"code":       0,
-		"message":    "params set",
-		"param_ids":  paramIDs,
+		"code":        0,
+		"message":     "params set",
+		"param_ids":   paramIDs,
 		"param_count": len(paramIDs),
 	})
 }
@@ -281,7 +298,8 @@ func (h *DeviceHandler) GetTerminalParams(c *gin.Context) {
 	}
 
 	if err := h.commandSender.SendParamQuery(phone, paramIDs); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		h.logger.Error("query terminal params failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to send terminal params query"})
 		return
 	}
 
@@ -331,7 +349,8 @@ func (h *DeviceHandler) TerminalControl(c *gin.Context) {
 	params := map[uint32][]byte{req.CommandType: []byte(req.Param)}
 	msg := h.commandSender.BuildCommandMessage(1, params)
 	if err := h.commandSender.SendToDevice(req.Phone, jt808MsgIDCommand, msg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		h.logger.Error("terminal control failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to send terminal control command"})
 		return
 	}
 
@@ -344,10 +363,35 @@ func (h *DeviceHandler) TerminalControl(c *gin.Context) {
 }
 
 // generateAuthCode 生成终端鉴权码
-// 规则：md5(phone + timestamp + jte-secret)
+// 规则：md5(phone + timestamp + secret)
+// AUTO-FIX-2026-07-17: 原使用硬编码密钥 "jte-secret"，可被攻击者枚举猜出。
+// 改为优先从环境变量 JTE_AUTH_SECRET 读取密钥，未设置时生成随机密钥并缓存。
+// 这样即使攻击者知道 phone 和日期，也无法伪造鉴权码。
+var (
+	authSecretOnce sync.Once
+	authSecret     string
+)
+
+func getAuthSecret() string {
+	authSecretOnce.Do(func() {
+		if s := os.Getenv("JTE_AUTH_SECRET"); s != "" {
+			authSecret = s
+			return
+		}
+		// 未配置环境变量时生成随机密钥（进程级唯一，重启后失效——所有旧鉴权码失效）
+		b := make([]byte, 32)
+		if _, err := cryptoRand.Read(b); err != nil {
+			authSecret = fmt.Sprintf("fallback_%d", time.Now().UnixNano())
+			return
+		}
+		authSecret = hex.EncodeToString(b)
+	})
+	return authSecret
+}
+
 func generateAuthCode(phone string) string {
 	h := md5.New()
-	h.Write([]byte(phone + time.Now().Format("20060102") + "jte-secret"))
+	h.Write([]byte(phone + time.Now().Format("20060102") + getAuthSecret()))
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
@@ -481,10 +525,10 @@ func (h *TrackHandler) ReceiveLocation(c *gin.Context) {
 	globalLocationCache.Set(loc.VehicleID, &loc)
 
 	c.JSON(http.StatusOK, gin.H{
-		"code":    0,
-		"message": "received",
+		"code":       0,
+		"message":    "received",
 		"vehicle_id": loc.VehicleID,
-		"time":    loc.Time.Format(time.RFC3339),
+		"time":       loc.Time.Format(time.RFC3339),
 	})
 }
 
@@ -515,9 +559,9 @@ func (h *TrackHandler) MapMatch(c *gin.Context) {
 	corrected := mapMatchLocations(locations)
 
 	c.JSON(http.StatusOK, gin.H{
-		"code":           0,
-		"original_count": len(locations),
-		"corrected":      corrected,
+		"code":            0,
+		"original_count":  len(locations),
+		"corrected":       corrected,
 		"corrected_count": len(corrected),
 	})
 }
@@ -603,9 +647,9 @@ func (n *defaultNotifier) NotifyDingTalk(webhook, content string) error {
 
 // AlarmLinkage 报警联动配置
 type AlarmLinkage struct {
-	mu         sync.RWMutex
-	rules      map[string]*LinkageRule
-	notifier   AlarmNotifier
+	mu       sync.RWMutex
+	rules    map[string]*LinkageRule
+	notifier AlarmNotifier
 }
 
 type LinkageRule struct {
@@ -697,10 +741,10 @@ func (h *AlarmHandler) AlarmLinkageNotify(c *gin.Context) {
 	globalAlarmLinkage.Trigger(req.AlarmType, req.Level, req.Content)
 
 	c.JSON(http.StatusOK, gin.H{
-		"code":        0,
-		"message":     "notification triggered",
-		"alarm_type":  req.AlarmType,
-		"level":       req.Level,
+		"code":         0,
+		"message":      "notification triggered",
+		"alarm_type":   req.AlarmType,
+		"level":        req.Level,
 		"triggered_at": time.Now().Format(time.RFC3339),
 	})
 }
@@ -762,8 +806,9 @@ func (h *AlarmHandler) AIFalseAlarmCheck(c *gin.Context) {
 	}
 
 	// 查询报警
+	// FIXED-2026-07-17 [P0]: 原代码用 Phone: alarmID 过滤，将报警 ID 当做手机号查询，永远查不到报警。
 	result, err := h.store.ListAlarms(c.Request.Context(), storage.ListOptions{
-		Page: 1, PageSize: 1, Phone: alarmID,
+		Page: 1, PageSize: 1, AlarmID: alarmID,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})
@@ -826,12 +871,12 @@ func (h *AlarmHandler) AIFalseAlarmCheck(c *gin.Context) {
 	_ = h.store.UpdateAlarm(c.Request.Context(), alarm)
 
 	c.JSON(http.StatusOK, gin.H{
-		"code":          0,
-		"alarm_id":      alarmID,
+		"code":           0,
+		"alarm_id":       alarmID,
 		"is_false_alarm": isFalse,
-		"confidence":    confidence,
-		"reason":        reason,
-		"checked_at":    time.Now().Format(time.RFC3339),
+		"confidence":     confidence,
+		"reason":         reason,
+		"checked_at":     time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -862,6 +907,11 @@ func (h *MediaHandler) Screenshot(c *gin.Context) {
 	if req.ChannelID == 0 {
 		req.ChannelID = 1
 	}
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 校验 VehicleID 防 objectKey 路径注入
+	if !isValidIDField(req.VehicleID) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid vehicle_id: only [A-Za-z0-9_-] allowed, max 64 chars"})
+		return
+	}
 
 	// 构造截图对象 key
 	// 格式: screenshots/{vehicleID}/{channelID}/{yyyy}{MM}{dd}/{HHmmss}.jpg
@@ -878,25 +928,25 @@ func (h *MediaHandler) Screenshot(c *gin.Context) {
 
 	// 记录多媒体事件
 	media := &storage.MultimediaData{
-		ID:         fmt.Sprintf("shot_%s_%d_%d", req.VehicleID, req.ChannelID, now.Unix()),
-		VehicleID:  req.VehicleID,
-		MediaType:  2, // 2=图片
+		ID:          fmt.Sprintf("shot_%s_%d_%d", req.VehicleID, req.ChannelID, now.Unix()),
+		VehicleID:   req.VehicleID,
+		MediaType:   2, // 2=图片
 		MediaFormat: 0,
-		EventItem:  0x0125, // 平台截图
-		ChannelID:  req.ChannelID,
-		ReceivedAt: now,
-		Source:     "screenshot",
+		EventItem:   0x0125, // 平台截图
+		ChannelID:   req.ChannelID,
+		ReceivedAt:  now,
+		Source:      "screenshot",
 	}
 	_ = h.store.SaveMultimedia(c.Request.Context(), media)
 
 	c.JSON(http.StatusOK, gin.H{
-		"code":          0,
-		"message":       "screenshot captured",
-		"vehicle_id":    req.VehicleID,
-		"channel_id":    req.ChannelID,
-		"object_key":    objectKey,
+		"code":           0,
+		"message":        "screenshot captured",
+		"vehicle_id":     req.VehicleID,
+		"channel_id":     req.ChannelID,
+		"object_key":     objectKey,
 		"screenshot_url": screenshotURL,
-		"captured_at":   now.Format(time.RFC3339),
+		"captured_at":    now.Format(time.RFC3339),
 	})
 }
 
@@ -1117,11 +1167,21 @@ func isPointInGeofence(geofenceType int, params map[string]interface{}, lat, lng
 		}
 		coords := make([][2]float64, 0, len(points))
 		for _, p := range points {
-			if pt, ok := p.(map[string]interface{}); ok {
-				ptLat, _ := pt["lat"].(float64)
-				ptLng, _ := pt["lng"].(float64)
-				coords = append(coords, [2]float64{ptLat, ptLng})
+			pt, ok := p.(map[string]interface{})
+			if !ok {
+				// AUTO-FIX-2026-07-14 [ConvergeLoop-严重]: 格式错误的点导致返回 false 而非静默丢弃
+				// 原代码静默跳过格式错误的点，导致4边形变3边形，检测结果错误。
+				return false
 			}
+			ptLat, okLat := pt["lat"].(float64)
+			ptLng, okLng := pt["lng"].(float64)
+			if !okLat || !okLng {
+				return false
+			}
+			coords = append(coords, [2]float64{ptLat, ptLng})
+		}
+		if len(coords) < 3 {
+			return false
 		}
 		return pointInPolygon(lat, lng, coords)
 
@@ -1136,11 +1196,24 @@ func isPointInGeofence(geofenceType int, params map[string]interface{}, lat, lng
 		}
 		coords := make([][2]float64, 0, len(points))
 		for _, p := range points {
-			if pt, ok := p.(map[string]interface{}); ok {
-				ptLat, _ := pt["lat"].(float64)
-				ptLng, _ := pt["lng"].(float64)
-				coords = append(coords, [2]float64{ptLat, ptLng})
+			pt, ok := p.(map[string]interface{})
+			if !ok {
+				// AUTO-FIX-2026-07-14 [ConvergeLoop-严重]: 格式错误的点导致返回 false 而非静默丢弃
+				// 原代码静默跳过格式错误的点，导致路线段数量减少，距离检测遗漏。
+				return false
 			}
+			ptLat, okLat := pt["lat"].(float64)
+			ptLng, okLng := pt["lng"].(float64)
+			if !okLat || !okLng {
+				// AUTO-FIX-2026-07-14 [ConvergeLoop-严重]: 原代码用 _ 忽略断言失败，
+				// ptLat/ptLng 默认 0.0，会将 (0,0)（赤道+本初子午线，几内亚湾）加入 coords，
+				// 制造横跨全球的幽灵路线段，导致围栏距离检测彻底错误。
+				return false
+			}
+			coords = append(coords, [2]float64{ptLat, ptLng})
+		}
+		if len(coords) < 2 {
+			return false
 		}
 		for i := 1; i < len(coords); i++ {
 			dist := pointToSegmentDistance(lat, lng, coords[i-1][0], coords[i-1][1], coords[i][0], coords[i][1])
@@ -1172,14 +1245,25 @@ func pointInPolygon(lat, lng float64, polygon [][2]float64) bool {
 }
 
 // pointToSegmentDistance 点到线段距离（米）
+// 参数约定（与调用方 pointToSegmentDistance(lat, lng, coords[i-1][0], coords[i-1][1], coords[i][0], coords[i][1]) 对齐）：
+//
+//	px, ax, bx = 纬度（latitude）；py, ay, by = 经度（longitude）
+//
+// AUTO-FIX-2026-07-14 [ConvergeLoop-严重]: 修复经纬度参数混淆
+//
+//	原实现将 ay/by（经度）当作纬度计算 midLat 的余弦，将 bx-ax（纬度差）乘以经度米/度，
+//	将 by-ay（经度差）乘以纬度米/度，导致路线型电子围栏距离计算全部错误（误差可达 2 倍以上）。
+//	修复：midLat 使用 ax+bx（纬度），dx 使用 by-ay（经度差）×经度因子，dy 使用 bx-ax（纬度差）×纬度因子。
 func pointToSegmentDistance(px, py, ax, ay, bx, by float64) float64 {
-	// 转换为米制坐标（简化）
-	midLat := (ay + by) / 2 * math.Pi / 180
+	// 转换为米制坐标（以点 A 为原点的局部平面坐标系）
+	midLat := (ax + bx) / 2 * math.Pi / 180
 	cosMidLat := math.Cos(midLat)
-	dx := (bx - ax) * metersPerDegLongitude * cosMidLat
-	dy := (by - ay) * metersPerDegLatitude
-	px2 := (px - ax) * metersPerDegLongitude * cosMidLat
-	py2 := (py - ay) * metersPerDegLatitude
+	// dx/dy 为线段在米制坐标系下的向量分量
+	dx := (by - ay) * metersPerDegLongitude * cosMidLat // 经度差 × 经度米/度
+	dy := (bx - ax) * metersPerDegLatitude              // 纬度差 × 纬度米/度
+	// px2/py2 为点 P 在米制坐标系下的坐标
+	px2 := (py - ay) * metersPerDegLongitude * cosMidLat
+	py2 := (px - ax) * metersPerDegLatitude
 
 	if dx == 0 && dy == 0 {
 		return haversine(px, py, ax, ay)
@@ -1192,8 +1276,9 @@ func pointToSegmentDistance(px, py, ax, ay, bx, by float64) float64 {
 		t = 1
 	}
 
-	closestX := ax + t*dx/metersPerDegLongitude/cosMidLat
-	closestY := ay + t*dy/metersPerDegLatitude
+	// 将米制偏移转回经纬度
+	closestX := ax + t*dy/metersPerDegLatitude              // 纬度
+	closestY := ay + t*dx/(metersPerDegLongitude*cosMidLat) // 经度
 	return haversine(px, py, closestX, closestY)
 }
 
@@ -1229,6 +1314,15 @@ func (h *GeofenceHandler) AlarmPush(c *gin.Context) {
 
 	if req.Event != "enter" && req.Event != "exit" {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "event must be enter or exit"})
+		return
+	}
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 校验 VehicleID/GeofenceID 防通知文本注入
+	if !isValidIDField(req.VehicleID) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid vehicle_id: only [A-Za-z0-9_-] allowed, max 64 chars"})
+		return
+	}
+	if !isValidIDField(req.GeofenceID) {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid geofence_id: only [A-Za-z0-9_-] allowed, max 64 chars"})
 		return
 	}
 
@@ -1360,7 +1454,7 @@ func (h *GeofenceHandler) CreateRouteGeofence(c *gin.Context) {
 	}
 
 	if err := h.store.SaveGeofence(c.Request.Context(), g); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		respondInternalError(c, h.logger, err, "CreateRouteGeofence.SaveGeofence")
 		return
 	}
 
@@ -1644,9 +1738,9 @@ func (h *AdminHandler) ListAuditLogs(c *gin.Context) {
 
 	if auditLoggerRef == nil {
 		c.JSON(http.StatusOK, gin.H{
-			"code":  0,
-			"data":  []interface{}{},
-			"total": 0,
+			"code":    0,
+			"data":    []interface{}{},
+			"total":   0,
 			"message": "audit logger not initialized",
 		})
 		return
@@ -1729,14 +1823,14 @@ func (h *AdminHandler) BackupData(c *gin.Context) {
 
 	// 简化实现：记录备份元信息，实际数据导出可异步执行
 	backupMeta := map[string]interface{}{
-		"backup_id":   backupID,
-		"type":        req.Type,
-		"start_time":  req.StartTime,
-		"end_time":    req.EndTime,
-		"file_path":   backupFile,
-		"created_at":  time.Now().Format(time.RFC3339),
-		"status":      "pending",
-		"created_by":  c.GetString("operator"),
+		"backup_id":  backupID,
+		"type":       req.Type,
+		"start_time": req.StartTime,
+		"end_time":   req.EndTime,
+		"file_path":  backupFile,
+		"created_at": time.Now().Format(time.RFC3339),
+		"status":     "pending",
+		"created_by": c.GetString("operator"),
 	}
 
 	// 写入备份元信息文件
@@ -1782,7 +1876,15 @@ func (h *AdminHandler) RestoreData(c *gin.Context) {
 		return
 	}
 
-	backupFile := filepath.Join(os.TempDir(), "jte", "backups", req.BackupID+".json")
+	// AUTO-FIX-2026-07-14 [ConvergeLoop-P0]: 防止路径遍历攻击。
+	// BackupID 只允许字母/数字/下划线/连字符，禁止任何路径分隔符和 ".."。
+	safeName := filepath.Base(req.BackupID)
+	if safeName != req.BackupID || safeName == "." || safeName == ".." || strings.ContainsAny(safeName, "/\\") {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid backup_id: path separators are not allowed"})
+		return
+	}
+
+	backupFile := filepath.Join(os.TempDir(), "jte", "backups", safeName+".json")
 	data, err := os.ReadFile(backupFile)
 	if err != nil {
 		if os.IsNotExist(err) {

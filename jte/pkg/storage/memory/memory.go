@@ -87,6 +87,8 @@ func (m *MemoryStore) cleanupExpiredLocations() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
+
+	// 1. 清理过期数据
 	totalCount := 0
 	for id, locs := range m.locations {
 		var kept []*storage.LocationData
@@ -98,19 +100,56 @@ func (m *MemoryStore) cleanupExpiredLocations() {
 		m.locations[id] = kept
 		totalCount += len(kept)
 	}
+
+	// FIXED: [P1-3] 超限时按全局最旧优先驱逐，而非随机 map 遍历
+	// 原实现遍历 map（顺序随机），随机丢弃不同车辆的数据，可能导致关键车辆轨迹丢失
 	if totalCount > m.maxLocationCount {
-		excess := totalCount - m.maxLocationCount
+		// 收集所有位置点并按时间排序，从最旧的开始驱逐
+		type locEntry struct {
+			vehicleID string
+			idx       int
+			loc       *storage.LocationData
+		}
+		var allEntries []locEntry
 		for id, locs := range m.locations {
-			if excess <= 0 {
-				break
+			for i, loc := range locs {
+				allEntries = append(allEntries, locEntry{id, i, loc})
 			}
-			if len(locs) > 0 {
-				remove := excess
-				if remove > len(locs) {
-					remove = len(locs)
+		}
+		// 按接收时间从旧到新排序
+		sort.Slice(allEntries, func(i, j int) bool {
+			return allEntries[i].loc.ReceivedAt.Before(allEntries[j].loc.ReceivedAt)
+		})
+
+		excess := totalCount - m.maxLocationCount
+		if excess > len(allEntries) {
+			excess = len(allEntries)
+		}
+
+		// 标记需要删除的条目（按时间最旧优先）
+		// 由于逐个删除会影响后续 idx，改为重建各车辆的切片
+		toDelete := make(map[string]map[int]bool) // vehicleID -> set of idx to delete
+		for i := 0; i < excess; i++ {
+			e := allEntries[i]
+			if toDelete[e.vehicleID] == nil {
+				toDelete[e.vehicleID] = make(map[int]bool)
+			}
+			toDelete[e.vehicleID][e.idx] = true
+		}
+
+		// 重建被影响的车辆的位置切片
+		for id, idxs := range toDelete {
+			locs := m.locations[id]
+			var kept []*storage.LocationData
+			for i, loc := range locs {
+				if !idxs[i] {
+					kept = append(kept, loc)
 				}
-				m.locations[id] = locs[remove:]
-				excess -= remove
+			}
+			if len(kept) == 0 {
+				delete(m.locations, id)
+			} else {
+				m.locations[id] = kept
 			}
 		}
 	}
@@ -325,6 +364,10 @@ func (m *MemoryStore) ListAlarms(ctx context.Context, opts storage.ListOptions) 
 	var items []*storage.AlarmData
 	for _, a := range m.alarms {
 		if opts.Phone != "" && a.Phone != opts.Phone {
+			continue
+		}
+		// FIXED-2026-07-17 [P0]: 支持按报警 ID 精确查询
+		if opts.AlarmID != "" && a.ID != opts.AlarmID {
 			continue
 		}
 		items = append(items, a)

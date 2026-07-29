@@ -268,6 +268,8 @@ type ListOptions struct {
 	End      string `json:"end,omitempty"`
 	// OrgID 组织过滤（电子围栏按组织隔离使用）
 	OrgID string `json:"org_id,omitempty"`
+	// AlarmID 按报警 ID 精确查询（用于 GetAlarm / AIFalseAlarmCheck 等按 ID 查报警场景）
+	AlarmID string `json:"alarm_id,omitempty"`
 }
 
 // Geofence 电子围栏（圆形/矩形/多边形）

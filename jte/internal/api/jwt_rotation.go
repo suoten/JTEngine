@@ -182,12 +182,22 @@ func (m *JWTRotationManager) SetAuditFn(fn func(action, detail string)) {
 
 // Start 启动后台轮换调度 goroutine。
 // 每天检查一次：active kid 创建时间超过 RotateDays 则自动轮换。
+// FIXED: [P1] loop goroutine 缺少 recover()，panic 会扩散至整个进程 [2026-07-17]
 func (m *JWTRotationManager) Start() {
 	if m.jwt == nil {
 		m.logger.Warn("JWT 轮换管理器未启用：JWTConfig 为 nil")
 		return
 	}
-	go m.loop()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.logger.Error("JWT rotation loop panic recovered",
+					zap.Any("panic", r),
+					zap.Stack("stack"))
+			}
+		}()
+		m.loop()
+	}()
 	m.logger.Info("JWT 密钥轮换管理器已启动",
 		zap.Int("rotate_days", m.jwt.RotateDays),
 		zap.String("active_kid", m.jwt.ActiveKid))
@@ -210,15 +220,38 @@ func (m *JWTRotationManager) loop() {
 		case <-m.stopCh:
 			return
 		case <-ticker.C:
-			m.checkAndRotate()
+			// R62-FIX [P2]: 将 recover 移到循环内部，确保单次 checkAndRotate panic
+			// 不会导致轮换协程退出。原实现 recover 在 goroutine 级别，
+			// panic 后协程退出，JWT 密钥永不被轮换，旧密钥泄漏风险。
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						if m.logger != nil {
+							m.logger.Error("JWT rotation checkAndRotate panic recovered",
+								zap.Any("panic", r))
+						}
+					}
+				}()
+				m.checkAndRotate()
+			}()
 		case <-blacklistTicker.C:
-			if m.blacklist != nil {
-				m.blacklist.Cleanup()
-			}
-			// 顺带清理过期 kid（7 天保留期）
-			if m.jwt != nil {
-				m.jwt.CleanupExpiredKids()
-			}
+			// R62-FIX [P2]: 同上，确保黑名单清理 panic 不杀协程
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						if m.logger != nil {
+							m.logger.Error("JWT blacklist cleanup panic recovered",
+								zap.Any("panic", r))
+						}
+					}
+				}()
+				if m.blacklist != nil {
+					m.blacklist.Cleanup()
+				}
+				if m.jwt != nil {
+					m.jwt.CleanupExpiredKids()
+				}
+			}()
 		}
 	}
 }

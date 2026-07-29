@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/base64"
 	"fmt"
 	"os"
 	"strings"
@@ -11,6 +10,7 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 type ServerConfig struct {
@@ -27,6 +27,15 @@ type GatewayConfig struct {
 	HeartbeatTimeout  int `mapstructure:"heartbeat_timeout"`
 	MaxConnections    int `mapstructure:"max_connections"`
 	MaxDevices        int `mapstructure:"max_devices"`
+	// FIXED-2026-07-22 [P0]: 初始认证超时（秒），连接建立后在此时间内必须完成注册+鉴权。
+	// 默认 30s，超时未认证的连接主动关闭并记录日志。
+	InitialAuthTimeout int `mapstructure:"initial_auth_timeout"`
+	// FIXED-2026-07-22 [P0]: 单 IP 最大并发连接数，默认 100。
+	MaxConnsPerIP int `mapstructure:"max_conns_per_ip"`
+	// FIXED-2026-07-22 [P0]: 单 IP 连接速率限制（每秒新建连接数），默认 50。
+	MaxConnRatePerIP int `mapstructure:"max_conn_rate_per_ip"`
+	// FIXED-2026-07-23 [P2]: JT/T 协议是否启用 TLS（非标准，部分客户要求时开启）
+	TLSEnabled bool `mapstructure:"tls_enabled"`
 	// OOM 内存防护配置（按文档第9章存储/稳定性要求）
 	OOMProtect OOMProtectConfig `mapstructure:"oom_protect"`
 }
@@ -58,17 +67,15 @@ type APIConfig struct {
 	TLS *TLSConfig `mapstructure:"tls"`
 	// AUTO-FIX-2026-07-02 [等保2.0 传输安全]: 强制 HTTPS，true 时 HTTP 请求返回 426
 	RequireTLS bool `mapstructure:"require_tls"`
-	// AUTO-FIX-2026-07-10 [生产加固]: HTTP API 层 Slowloris/资源耗尽防护配置。
-	// 网关（808 协议层）的阶段性 deadline（connect 5s/auth 10s/read 30s）在
-	// gateway.go 代码层实现，不读此处配置；此处仅管控 HTTP API 层。
-	Security APISecurityConfig `mapstructure:"security"`
+	// Security API 安全配置（连接限制/请求体大小限制）
+	Security *APISecurityConfig `mapstructure:"security"`
 }
 
-// APISecurityConfig HTTP API 层安全防护配置（防 Slowloris / 资源耗尽）
+// APISecurityConfig API 安全配置（连接限制/请求体大小限制）
 type APISecurityConfig struct {
-	// ConnLimitPerIP 单 IP 最大并发连接数，超过返回 429（默认 100）
+	// ConnLimitPerIP 每 IP 并发连接限制（默认 100）
 	ConnLimitPerIP int `mapstructure:"conn_limit_per_ip"`
-	// BodyLimitBytes 请求体最大字节数（默认 10MB，防大请求体 OOM）
+	// BodyLimitBytes 请求体最大字节数（默认 10MB）
 	BodyLimitBytes int `mapstructure:"body_limit_bytes"`
 }
 
@@ -500,6 +507,11 @@ type LoggingConfig struct {
 	Format   string `mapstructure:"format"`
 	Output   string `mapstructure:"output"`
 	FilePath string `mapstructure:"file_path"`
+	// 日志切割配置（lumberjack），output 为 file/both 时生效
+	MaxSize    int  `mapstructure:"max_size"`    // 单文件最大体积（MB），默认 100
+	MaxBackups int  `mapstructure:"max_backups"` // 保留的旧日志文件数量，默认 7
+	MaxAge     int  `mapstructure:"max_age"`     // 旧日志文件保留天数，默认 30
+	Compress   bool `mapstructure:"compress"`    // 是否压缩旧日志文件，默认 true
 }
 
 type ModulesConfig struct {
@@ -565,6 +577,23 @@ type JT809Config struct {
 	ServerPort int                   `mapstructure:"server_port"`
 	// AUTO-FIX-2026-06-26: 下级平台接入鉴权账号配置（按第一轮.txt要求）[2026-06-26]
 	DownstreamPlatforms []DownstreamPlatformConfig `mapstructure:"downstream_platforms"`
+	// FIXED-2026-07-23 [P2]: 809 客户端熔断器配置
+	CircuitBreaker JT809CircuitBreakerConfig `mapstructure:"circuit_breaker"`
+	// FIXED-2026-07-23 [P2]: 缓冲区溢出告警开关
+	PendingBufferOverflowAlert bool `mapstructure:"pending_buffer_overflow_alert"`
+}
+
+// JT809CircuitBreakerConfig 809 客户端熔断器配置
+// 连续重连失败达到 FailThreshold 次后进入熔断状态，
+// 停止重连 ResetTimeout 秒，期间数据缓冲到 pendingBuffer。
+// 熔断恢复后自动尝试重连，成功则 flush 缓冲数据。
+type JT809CircuitBreakerConfig struct {
+	// Enabled 是否启用熔断器（默认 true）
+	Enabled bool `mapstructure:"enabled"`
+	// FailThreshold 连续失败触发熔断的次数（默认 10）
+	FailThreshold int `mapstructure:"fail_threshold"`
+	// ResetTimeout 熔断恢复时间（秒，默认 300 = 5 分钟）
+	ResetTimeout int `mapstructure:"reset_timeout"`
 }
 
 // DownstreamPlatformConfig 下级平台接入账号配置（用于JT809Server登录鉴权）
@@ -637,8 +666,15 @@ type AINLPConfig struct {
 
 // CryptoConfig 国密配置（SM2/SM3/SM4），按文档第9章存储安全要求
 type CryptoConfig struct {
-	// 是否启用国密
+	// 是否启用国密（主开关，true 时所有算法默认启用）
 	Enabled bool `mapstructure:"enabled"`
+	// FIXED: [国密调用必须加开关] 新增 SM2/SM3/SM4 独立开关 [2026-07-17]
+	// EnableSM2 启用 SM2（签名/验签/加密/解密），独立于 Enabled 主开关
+	EnableSM2 bool `mapstructure:"enable_sm2"`
+	// EnableSM3 启用 SM3（摘要/HMAC），独立于 Enabled 主开关
+	EnableSM3 bool `mapstructure:"enable_sm3"`
+	// EnableSM4 启用 SM4（对称加密 GCM/CBC），独立于 Enabled 主开关
+	EnableSM4 bool `mapstructure:"enable_sm4"`
 	// SM2 证书路径
 	SM2CertPath string `mapstructure:"sm2_cert_path"`
 	// SM2 私钥路径
@@ -647,6 +683,24 @@ type CryptoConfig struct {
 	SM4Key string `mapstructure:"sm4_key"`
 	// 哈希算法：sm3 | sha256
 	HashAlgorithm string `mapstructure:"hash_algorithm"`
+}
+
+// IsSM2Enabled 返回 SM2 是否启用。
+// 主开关 Enabled=true 时默认启用；或 EnableSM2=true 独立启用。
+func (c CryptoConfig) IsSM2Enabled() bool {
+	return c.Enabled || c.EnableSM2
+}
+
+// IsSM3Enabled 返回 SM3 是否启用。
+// 主开关 Enabled=true 时默认启用；或 EnableSM3=true 独立启用。
+func (c CryptoConfig) IsSM3Enabled() bool {
+	return c.Enabled || c.EnableSM3
+}
+
+// IsSM4Enabled 返回 SM4 是否启用。
+// 主开关 Enabled=true 时默认启用；或 EnableSM4=true 独立启用。
+func (c CryptoConfig) IsSM4Enabled() bool {
+	return c.Enabled || c.EnableSM4
 }
 
 // MonitorConfig 监控告警配置
@@ -960,6 +1014,18 @@ func Load(configPath string) (*Config, error) {
 		}
 	}
 
+	// 多环境配置覆盖：根据 JTE_ENV 环境变量加载 jte-{env}.yaml 覆盖主配置
+	// 支持 dev/test/staging/prod 等环境，配置文件不存在时静默跳过
+	if env := os.Getenv("JTE_ENV"); env != "" {
+		envConfigName := "jte-" + env
+		v.SetConfigName(envConfigName)
+		if err := v.MergeInConfig(); err != nil {
+			if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+				return nil, fmt.Errorf("merge env config %q: %w", envConfigName, err)
+			}
+		}
+	}
+
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
@@ -979,6 +1045,18 @@ func Load(configPath string) (*Config, error) {
 	if cfg.Gateway.HeartbeatTimeout == 0 {
 		cfg.Gateway.HeartbeatTimeout = 180
 	}
+	// FIXED-2026-07-22 [P0]: 初始认证超时默认 30s
+	if cfg.Gateway.InitialAuthTimeout == 0 {
+		cfg.Gateway.InitialAuthTimeout = 30
+	}
+	// FIXED-2026-07-22 [P0]: 单 IP 最大并发连接数默认 100
+	if cfg.Gateway.MaxConnsPerIP == 0 {
+		cfg.Gateway.MaxConnsPerIP = 100
+	}
+	// FIXED-2026-07-22 [P0]: 单 IP 连接速率限制默认 50/s
+	if cfg.Gateway.MaxConnRatePerIP == 0 {
+		cfg.Gateway.MaxConnRatePerIP = 50
+	}
 	if cfg.API.RateLimit == 0 {
 		cfg.API.RateLimit = 100
 	}
@@ -992,6 +1070,16 @@ func Load(configPath string) (*Config, error) {
 	if cfg.API.JWT.RotateDays == 0 {
 		cfg.API.JWT.RotateDays = 90
 	}
+	// Security 默认值
+	if cfg.API.Security == nil {
+		cfg.API.Security = &APISecurityConfig{}
+	}
+	if cfg.API.Security.ConnLimitPerIP == 0 {
+		cfg.API.Security.ConnLimitPerIP = 100
+	}
+	if cfg.API.Security.BodyLimitBytes == 0 {
+		cfg.API.Security.BodyLimitBytes = 10 * 1024 * 1024 // 10MB
+	}
 	// 初始化 kidCreatedAt，记录配置文件中已有 kid 的创建时间
 	if cfg.API.JWT.Secrets != nil && cfg.API.JWT.kidCreatedAt == nil {
 		cfg.API.JWT.kidCreatedAt = make(map[string]time.Time)
@@ -1003,7 +1091,10 @@ func Load(configPath string) (*Config, error) {
 		cfg.Modules.Dir = "./modules"
 	}
 	if cfg.Storage.Type == "" {
-		cfg.Storage.Type = "memory"
+		// AUTO-FIX-2026-07-15 [ConvergeLoop-语义一致性]: 默认值对齐 jte.yaml/storage.type=sqlite
+		// 原先 fallback 为 memory，与 jte.yaml 默认值 sqlite 不一致；
+		// 用户删除 yaml 中 type 字段时会静默降级到 memory 导致数据丢失。
+		cfg.Storage.Type = "sqlite"
 	}
 	// v2.0 存储层默认值（时序/缓存/对象存储）
 	if cfg.Storage.TimeSeries.Driver != "" {
@@ -1017,19 +1108,20 @@ func Load(configPath string) (*Config, error) {
 			cfg.Storage.TimeSeries.User = "root"
 		}
 		if cfg.Storage.TimeSeries.Password == "" {
-			// [安全] 商业版：密码必须通过环境变量或配置文件注入，不再硬编码默认值
-			cfg.Storage.TimeSeries.Password = os.Getenv("JTE_TS_DEFAULT_PASSWORD")
+			// [P0-安全] 密码必须通过环境变量或配置文件注入，不再硬编码默认值
+			// 优先使用 JTE_TDENGINE_PASSWORD（与 docker-compose-prod.yml 对齐）
+			cfg.Storage.TimeSeries.Password = os.Getenv("JTE_TDENGINE_PASSWORD")
+			if cfg.Storage.TimeSeries.Password == "" {
+				// 兼容旧变量名
+				cfg.Storage.TimeSeries.Password = os.Getenv("JTE_TS_DEFAULT_PASSWORD")
+			}
 			if cfg.Storage.TimeSeries.Password == "" {
 				if os.Getenv("JTE_ENV") == "production" {
-					return nil, fmt.Errorf("JTE_TS_DEFAULT_PASSWORD environment variable is required in production mode")
+					return nil, fmt.Errorf("JTE_TDENGINE_PASSWORD environment variable is required in production mode (TDengine password must be set explicitly)")
 				}
-				// 仅开发/测试环境使用 TDengine 官方默认密码
-				cfg.Storage.TimeSeries.Password = os.Getenv("JTE_TDENGINE_PASSWORD")
-				if cfg.Storage.TimeSeries.Password == "" {
-					// 使用 base64 编码避免明文密码触发安全扫描
-					defaultPwd, _ := base64.StdEncoding.DecodeString("dGFvc2RhdGE=") //nolint:gosec // TDengine official default, dev/test only
-					cfg.Storage.TimeSeries.Password = string(defaultPwd)
-				}
+				// 仅开发/测试环境使用 TDengine 官方默认密码 taosdata
+				// 不使用 base64 编码绕过安全扫描，直接标注 nolint
+				cfg.Storage.TimeSeries.Password = "taosdata" //nolint:gosec // TDengine official default password, dev/test only
 			}
 		}
 		if cfg.Storage.TimeSeries.Database == "" {
@@ -1149,13 +1241,32 @@ func Load(configPath string) (*Config, error) {
 	if cfg.Video.SRTP.Enabled && cfg.Video.SRTP.KeyRotateHours == 0 {
 		cfg.Video.SRTP.KeyRotateHours = 24
 	}
+	// 日志切割默认值
+	if cfg.Logging.MaxSize == 0 {
+		cfg.Logging.MaxSize = 100 // 100MB
+	}
+	if cfg.Logging.MaxBackups == 0 {
+		cfg.Logging.MaxBackups = 7
+	}
+	if cfg.Logging.MaxAge == 0 {
+		cfg.Logging.MaxAge = 30 // 30 天
+	}
 	// OOM 防护检查间隔默认值
 	if cfg.Gateway.OOMProtect.Enabled && cfg.Gateway.OOMProtect.CheckIntervalSeconds == 0 {
 		cfg.Gateway.OOMProtect.CheckIntervalSeconds = 5
 	}
 	// 国密哈希算法默认值
-	if cfg.Crypto.Enabled && cfg.Crypto.HashAlgorithm == "" {
+	// FIXED: [国密开关] 使用 IsSM3Enabled() 替代 Enabled，支持独立 SM3 开关 [2026-07-17]
+	if cfg.Crypto.IsSM3Enabled() && cfg.Crypto.HashAlgorithm == "" {
 		cfg.Crypto.HashAlgorithm = "sm3"
+	}
+
+	// FIXED-2026-07-23 [P2]: 809 熔断器配置默认值
+	if cfg.JT809.CircuitBreaker.FailThreshold == 0 {
+		cfg.JT809.CircuitBreaker.FailThreshold = 10
+	}
+	if cfg.JT809.CircuitBreaker.ResetTimeout == 0 {
+		cfg.JT809.CircuitBreaker.ResetTimeout = 300
 	}
 
 	// AUTO-FIX-2026-06-29 [P0]: JWT secret 安全校验——禁止使用空值、占位符或弱密钥。
@@ -1163,20 +1274,25 @@ func Load(configPath string) (*Config, error) {
 	// 开发/测试环境可通过环境变量 JTE_ALLOW_INSECURE_JWT=1 跳过校验。
 	// AUTO-FIX-2026-06-30 [P1-6]: 当 KMS 来源（env/file）或 JWT.Secrets 已配置时，
 	// 跳过 JWTSecret 校验（密钥从 KMS 加载，不在主配置明文存储）。
+	// [P2-2] 空值防护：kms_source != "env" && jwt_secret == "" 时启动失败。
+	// JTE_ALLOW_INSECURE_JWT 为空（未设置）时不跳过此校验，仅当显式设为 "1" 时才跳过。
 	if os.Getenv("JTE_ALLOW_INSECURE_JWT") != "1" {
-		jwtSecretPlaceholders := map[string]bool{
-			"":                                            true,
-			"PLEASE-CHANGE-THIS-SECRET-BEFORE-PRODUCTION": true,
-			"your-secret-key":                             true,
-			"jwt-secret":                                  true,
-			"change-me":                                   true,
-			"secret":                                      true,
-		}
 		kmsActive := cfg.API.JWT != nil &&
 			(cfg.API.JWT.KMSSource == "env" || cfg.API.JWT.KMSSource == "file" || len(cfg.API.JWT.Secrets) > 0)
 		if !kmsActive {
+			// [P2-2] 空值单独报错，消息明确指出 kms_source 不为 env 时 jwt_secret 不能为空
+			if cfg.API.JWTSecret == "" {
+				return nil, fmt.Errorf("jwt_secret must not be empty when kms_source is not env (current kms_source=%q); set api.jwt_secret or configure jwt.kms_source=env/file for KMS-managed keys, or set JTE_ALLOW_INSECURE_JWT=1 for dev/test", kmsSourceStr(cfg.API.JWT))
+			}
+			jwtSecretPlaceholders := map[string]bool{
+				"PLEASE-CHANGE-THIS-SECRET-BEFORE-PRODUCTION": true,
+				"your-secret-key":                             true,
+				"jwt-secret":                                  true,
+				"change-me":                                   true,
+				"secret":                                      true,
+			}
 			if jwtSecretPlaceholders[cfg.API.JWTSecret] {
-				return nil, fmt.Errorf("config api.jwt_secret must be set to a secure random value (current is empty or placeholder); generate one with `openssl rand -base64 48`, configure jwt.kms_source=env/file, or set JTE_ALLOW_INSECURE_JWT=1 for dev/test")
+				return nil, fmt.Errorf("config api.jwt_secret must be set to a secure random value (current is placeholder); generate one with `openssl rand -base64 48`, configure jwt.kms_source=env/file, or set JTE_ALLOW_INSECURE_JWT=1 for dev/test")
 			}
 			if len(cfg.API.JWTSecret) < 32 {
 				return nil, fmt.Errorf("config api.jwt_secret must be at least 32 bytes for HS256 security (current length: %d), configure jwt.kms_source=env/file, or set JTE_ALLOW_INSECURE_JWT=1 for dev/test", len(cfg.API.JWTSecret))
@@ -1204,32 +1320,35 @@ func Load(configPath string) (*Config, error) {
 		}
 	}
 
-	// AUTO-FIX-2026-07-10 [生产加固]: HTTP API 层安全防护默认值（防 Slowloris / 资源耗尽）
-	if cfg.API.Security.ConnLimitPerIP == 0 {
-		cfg.API.Security.ConnLimitPerIP = 100
-	}
-	if cfg.API.Security.BodyLimitBytes == 0 {
-		cfg.API.Security.BodyLimitBytes = 10 * 1024 * 1024 // 10MB
-	}
-
-	// AUTO-FIX-2026-07-10 [生产加固]: 网关超时配置校验——防止配置漂移导致防护失效。
+	globalConfig = &cfg
+	// 验证网关超时配置
 	if err := validateGatewayTimeouts(&cfg); err != nil {
 		return nil, err
 	}
 
-	globalConfig = &cfg
 	return &cfg, nil
 }
 
-// validateGatewayTimeouts 校验网关超时配置的合理性，防止配置漂移导致心跳防护失效。
-// HeartbeatInterval 必须 >= 10 秒；HeartbeatTimeout 必须 > HeartbeatInterval*3（容忍 2 次丢失）。
+// kmsSourceStr 返回 JWT 配置的 kms_source 字符串，用于错误消息。
+// [P2-2] 辅助函数，nil 安全。
+func kmsSourceStr(j *JWTConfig) string {
+	if j == nil {
+		return ""
+	}
+	return j.KMSSource
+}
+
+// validateGatewayTimeouts 验证网关心跳超时配置
+// 心跳间隔必须 >= 10 秒；心跳超时必须 > 心跳间隔 × 3
 func validateGatewayTimeouts(cfg *Config) error {
 	if cfg.Gateway.HeartbeatInterval > 0 && cfg.Gateway.HeartbeatInterval < 10 {
-		return fmt.Errorf("config gateway.heartbeat_interval must be >= 10 seconds (current: %d), too small will overload terminals and server", cfg.Gateway.HeartbeatInterval)
+		return fmt.Errorf("heartbeat_interval must be >= 10 seconds")
 	}
-	if cfg.Gateway.HeartbeatTimeout > 0 && cfg.Gateway.HeartbeatInterval > 0 &&
-		cfg.Gateway.HeartbeatTimeout <= cfg.Gateway.HeartbeatInterval*3 {
-		return fmt.Errorf("config gateway.heartbeat_timeout (%d) must be > heartbeat_interval*3 (%d) to tolerate 2 missed heartbeats", cfg.Gateway.HeartbeatTimeout, cfg.Gateway.HeartbeatInterval*3)
+	if cfg.Gateway.HeartbeatInterval > 0 && cfg.Gateway.HeartbeatTimeout > 0 {
+		if cfg.Gateway.HeartbeatTimeout <= cfg.Gateway.HeartbeatInterval*3 {
+			return fmt.Errorf("heartbeat_timeout must be > heartbeat_interval * 3 (got %d <= %d)",
+				cfg.Gateway.HeartbeatTimeout, cfg.Gateway.HeartbeatInterval*3)
+		}
 	}
 	return nil
 }
@@ -1295,22 +1414,27 @@ func InitLogger(cfg *LoggingConfig) (*zap.Logger, error) {
 		if cfg.FilePath == "" {
 			cfg.FilePath = "jte.log"
 		}
-		file, err := os.OpenFile(cfg.FilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			return nil, fmt.Errorf("open log file: %w", err)
+		// 使用 lumberjack 实现按大小切割 + 按天数保留
+		lj := &lumberjack.Logger{
+			Filename:   cfg.FilePath,
+			MaxSize:    cfg.MaxSize,
+			MaxBackups: cfg.MaxBackups,
+			MaxAge:     cfg.MaxAge,
+			Compress:   cfg.Compress,
 		}
-		registerLoggerFile(file)
-		writeSyncer = zapcore.NewMultiWriteSyncer(zapcore.AddSync(file))
+		writeSyncer = zapcore.AddSync(lj)
 	case "both":
 		if cfg.FilePath == "" {
 			cfg.FilePath = "jte.log"
 		}
-		file, err := os.OpenFile(cfg.FilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			return nil, fmt.Errorf("open log file: %w", err)
+		lj := &lumberjack.Logger{
+			Filename:   cfg.FilePath,
+			MaxSize:    cfg.MaxSize,
+			MaxBackups: cfg.MaxBackups,
+			MaxAge:     cfg.MaxAge,
+			Compress:   cfg.Compress,
 		}
-		registerLoggerFile(file)
-		writeSyncer = zapcore.NewMultiWriteSyncer(zapcore.AddSync(os.Stdout), zapcore.AddSync(file))
+		writeSyncer = zapcore.NewMultiWriteSyncer(zapcore.AddSync(os.Stdout), zapcore.AddSync(lj))
 	default:
 		writeSyncer = zapcore.AddSync(os.Stdout)
 	}
@@ -1319,4 +1443,102 @@ func InitLogger(cfg *LoggingConfig) (*zap.Logger, error) {
 	logger := zap.New(core, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
 
 	return logger, nil
+}
+
+// ValidateForProduction 生产环境强制安全校验。
+// 当 JTE_ENV=production 时，main.go 在启动时调用此方法，任一校验失败则拒绝启动。
+//
+// [P1-可靠性] 生产环境必须满足以下安全基线：
+//   - 时序数据库（TDengine）密码不为空且 ≥16 字符
+//   - Redis 缓存密码不为空（当缓存层启用时）
+//   - JWT 密钥 ≥32 字节（防止暴力破解）
+//   - TLS 启用时证书路径不为空或 ACME 域名已配置
+//   - CORS 不包含通配符 "*"（防止跨域攻击）
+//   - 离线解绑密钥 ≥32 字节（防伪造凭证）
+func (c *Config) ValidateForProduction() error {
+	var errs []string
+
+	// 1. 时序数据库密码校验
+	if c.Storage.TimeSeries.Driver != "" {
+		if c.Storage.TimeSeries.Password == "" {
+			errs = append(errs, "storage.time_series.password must not be empty in production (driver enabled)")
+		} else if len(c.Storage.TimeSeries.Password) < 16 {
+			errs = append(errs, fmt.Sprintf("storage.time_series.password must be at least 16 characters in production (current: %d)", len(c.Storage.TimeSeries.Password)))
+		}
+	}
+
+	// 2. Redis 缓存密码校验（当缓存层启用时）
+	if c.Storage.Cache.Driver != "" {
+		if c.Storage.Cache.Password == "" {
+			errs = append(errs, "storage.cache.password must not be empty in production (redis driver enabled)")
+		}
+	}
+
+	// 3. JWT 密钥强度校验
+	jwtSecret := c.API.JWTSecret
+	if c.API.JWT != nil {
+		if kid, secret, ok := c.API.JWT.GetActiveSecret(); ok && secret != "" {
+			jwtSecret = secret
+			_ = kid
+		}
+	}
+	if len(jwtSecret) < 32 {
+		if jwtSecret == "" {
+			errs = append(errs, "api.jwt_secret must not be empty in production (minimum 32 bytes required)")
+		} else {
+			errs = append(errs, fmt.Sprintf("api.jwt_secret must be at least 32 bytes in production (current: %d bytes)", len(jwtSecret)))
+		}
+	}
+
+	// 4. TLS 配置校验（启用 TLS 时）
+	if c.API.TLS != nil && c.API.TLS.Enabled {
+		if !c.API.TLS.ACME {
+			// 非 ACME 模式必须提供证书和私钥路径
+			if c.API.TLS.CertFile == "" {
+				errs = append(errs, "api.tls.cert_file must not be empty when TLS is enabled (or enable ACME)")
+			}
+			if c.API.TLS.KeyFile == "" {
+				errs = append(errs, "api.tls.key_file must not be empty when TLS is enabled (or enable ACME)")
+			}
+		} else {
+			// ACME 模式必须配置域名
+			if len(c.API.TLS.ACMEDomains) == 0 {
+				errs = append(errs, "api.tls.acme_domains must not be empty when ACME is enabled")
+			}
+		}
+	}
+
+	// 5. CORS 配置校验（禁止通配符）
+	for _, origin := range c.API.CORSOrigins {
+		if origin == "*" {
+			errs = append(errs, "api.cors_origins must not contain wildcard \"*\" in production (specify explicit origins)")
+			break
+		}
+	}
+
+	// 6. 离线解绑密钥强度校验
+	if len(c.Auth.OfflineUnbindSecret) < 32 {
+		if c.Auth.OfflineUnbindSecret == "" {
+			errs = append(errs, "auth.offline_unbind_secret must not be empty in production (minimum 32 bytes required)")
+		} else {
+			errs = append(errs, fmt.Sprintf("auth.offline_unbind_secret must be at least 32 bytes in production (current: %d bytes)", len(c.Auth.OfflineUnbindSecret)))
+		}
+	}
+
+	// FIXED-2026-07-23 [P2]: 生产环境禁止使用 SQLite 作为关系库
+	// SQLite 无法支持并发写入，生产环境会导致性能瓶颈和数据竞争
+	if c.Storage.Type == "sqlite" || c.Storage.Type == "sqlite3" {
+		errs = append(errs, "storage.type must not be 'sqlite' in production (use 'postgres' or 'mysql'; SQLite is for dev/test only)")
+	}
+
+	// FIXED-2026-07-23 [P2]: 生产环境必须配置时序库
+	// 高频轨迹/报警数据走关系库会导致写入性能瓶颈
+	if c.Storage.TimeSeries.Driver == "" {
+		errs = append(errs, "storage.time_series.driver must not be empty in production (use 'tdengine'; SQLite alone cannot handle high-frequency time-series writes)")
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("production config validation failed:\n  - %s", strings.Join(errs, "\n  - "))
+	}
+	return nil
 }

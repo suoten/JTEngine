@@ -197,11 +197,28 @@ func (e *Engine) isDuplicate(existing, incoming *storage.LocationData) bool {
 	return latDiff < 0.00001 && lonDiff < 0.00001
 }
 
+// AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: resolveConflict 补全所有协议源分支
+// 优先级：jt808（终端直连，精度最高）> jt905 > jt809 > 其他
+var sourcePriority = map[string]int{
+	"jt808": 4, // 终端直连，GPS 精度最高
+	"jt905": 3, // 出租车专网
+	"jt809": 2, // 上级平台转发，可能有精度损失
+}
+
 func (e *Engine) resolveConflict(existing, incoming *storage.LocationData) {
-	if incoming.Source == "jt808" {
-		incoming.Latitude = resolveField(existing.Latitude, incoming.Latitude, existing.Source, incoming.Source, "jt808")
-		incoming.Longitude = resolveField(existing.Longitude, incoming.Longitude, existing.Source, incoming.Source, "jt808")
-		incoming.Speed = resolveFieldFloat(existing.Speed, incoming.Speed, existing.Source, incoming.Source, "jt808")
+	incPri, ok := sourcePriority[incoming.Source]
+	if !ok {
+		incPri = 1 // 未知源最低优先级
+	}
+	existPri, ok := sourcePriority[existing.Source]
+	if !ok {
+		existPri = 1
+	}
+	// 仅当 incoming 优先级 >= existing 时才覆盖
+	if incPri >= existPri {
+		incoming.Latitude = resolveField(existing.Latitude, incoming.Latitude, existing.Source, incoming.Source, incoming.Source)
+		incoming.Longitude = resolveField(existing.Longitude, incoming.Longitude, existing.Source, incoming.Source, incoming.Source)
+		incoming.Speed = resolveFieldFloat(existing.Speed, incoming.Speed, existing.Source, incoming.Source, incoming.Source)
 	}
 }
 
@@ -248,7 +265,14 @@ func (e *Engine) GetEventBus() *EventBus {
 	return e.eventBus
 }
 
+// SetDedupWindow 设置去重时间窗口（线程安全）。
+// INDUSTRIAL-FIX-2026-07-25 [P2-R33]: 原实现无锁写入 dedupWindow，
+// 而 Merge 在 e.mu.Lock() 下读取该字段，构成数据竞争。
+// 配置热重载调用此方法时可能与正在执行的 Merge 并发访问，
+// 导致 dedupWindow 值被撕裂（32 位平台上 int64 非原子写）。
 func (e *Engine) SetDedupWindow(d time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.dedupWindow = d
 }
 

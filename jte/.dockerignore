@@ -79,3 +79,10 @@ keys/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# === 付费模块与官网源码（商业安全：禁止进入镜像） ===
+# AUTO-FIX-2026-07-14 [ConvergeLoop-P1]: 防止付费模块源码泄露到 Docker 镜像
+jte-modules/
+jte-website/
+jte-opensource/
+*.so

@@ -482,7 +482,7 @@ func TestFix_Checksum_EmptyData(t *testing.T) {
 
 func TestFix_BCDToString_NoLeadingZeroLoss(t *testing.T) {
 	bcd := []byte{0x01, 0x38, 0x00, 0x00, 0x00, 0x00}
-	result := BCDToString(bcd)
+	result, _ := BCDToString(bcd)
 	if result != "013800000000" {
 		t.Errorf("BCDToString: got %q, want %q", result, "013800000000")
 	}

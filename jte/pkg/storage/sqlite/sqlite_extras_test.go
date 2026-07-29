@@ -15,7 +15,7 @@ func TestGeofence_CRUD(t *testing.T) {
 	// Save
 	g := &storage.Geofence{
 		ID:        "gf-1",
-		Name:      "园区围栏",
+		Name:      "԰Χ",
 		Type:      1,
 		OrgID:     "org-1",
 		Params:    `{"radius":500}`,
@@ -31,8 +31,8 @@ func TestGeofence_CRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGeofence: %v", err)
 	}
-	if got.Name != "园区围栏" {
-		t.Errorf("Name = %q, want 园区围栏", got.Name)
+	if got.Name != "԰Χ" {
+		t.Errorf("Name = %q, want ԰Χ", got.Name)
 	}
 	if got.OrgID != "org-1" {
 		t.Errorf("OrgID = %q, want org-1", got.OrgID)
@@ -47,8 +47,8 @@ func TestGeofence_CRUD(t *testing.T) {
 		t.Errorf("Total = %d, want 1", result.Total)
 	}
 
-	// Update（INSERT OR REPLACE）
-	g.Name = "园区围栏-更新"
+	// UpdateINSERT OR REPLACE
+	g.Name = "԰Χ-"
 	if err := s.SaveGeofence(ctx, g); err != nil {
 		t.Fatalf("SaveGeofence update: %v", err)
 	}
@@ -56,8 +56,8 @@ func TestGeofence_CRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGeofence after update: %v", err)
 	}
-	if got2.Name != "园区围栏-更新" {
-		t.Errorf("Name after update = %q, want 园区围栏-更新", got2.Name)
+	if got2.Name != "԰Χ-" {
+		t.Errorf("Name after update = %q, want ԰Χ-", got2.Name)
 	}
 
 	// Delete
@@ -177,7 +177,7 @@ func TestPlatform_CRUD(t *testing.T) {
 
 	p := &storage.Platform{
 		ID:         "pf-1",
-		Name:       "下级平台A",
+		Name:       "¼ƽ̨A",
 		UserID:     "user-a",
 		Password:   "pass-a",
 		Role:       "downstream",
@@ -195,8 +195,8 @@ func TestPlatform_CRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPlatform: %v", err)
 	}
-	if got.Name != "下级平台A" {
-		t.Errorf("Name = %q, want 下级平台A", got.Name)
+	if got.Name != "¼ƽ̨A" {
+		t.Errorf("Name = %q, want ¼ƽ̨A", got.Name)
 	}
 	if got.Role != "downstream" {
 		t.Errorf("Role = %q, want downstream", got.Role)

@@ -1,3 +1,4 @@
+// FIXED: [P2] ParseRTPPacket 未处理RTP padding：padding位=1时末尾字节指示填充长度，需从payload中剔除 [2026-07-17]
 package jt1078
 
 import (
@@ -11,8 +12,56 @@ const (
 	PayloadTypeH264    = 96
 	PayloadTypeH265    = 97
 	PayloadTypeAAC     = 98
-	PayloadTypeG711    = 99
+	PayloadTypeG711    = 99  // G.711 泛型（向后兼容）
+	// FIXED [P2]: 补充 JT/T 1078-2016 标准中缺失的音频负载类型常量
+	// 动态负载类型 (96-127) 按 JTE 内部约定分配，与 ZLMediaKit 侧 PT 映射对齐
+	PayloadTypeG726    = 100 // G.726
+	PayloadTypeG722    = 101 // G.722.1
+	PayloadTypeG723    = 102 // G.723
+	PayloadTypeG729    = 103 // G.729
+	PayloadTypeMP3     = 104 // MP3
+	PayloadTypeG711A   = 105 // G.711A (PCMA)
+	PayloadTypeG711U   = 106 // G.711U (PCMU)
 )
+
+// JT/T 1078-2016 音频编码类型常量（用于 AVAudioParam.AudioType 字段）
+const (
+	AudioEncodeTypeG711A  = 0 // G.711A (PCMA)
+	AudioEncodeTypeG711U  = 1 // G.711U (PCMU)
+	AudioEncodeTypeG726   = 2 // G.726
+	AudioEncodeTypeG722   = 3 // G.722.1
+	AudioEncodeTypeG723   = 4 // G.723
+	AudioEncodeTypeG729   = 5 // G.729
+	AudioEncodeTypeAAC    = 6 // AAC
+	AudioEncodeTypeMP3    = 7 // MP3
+)
+
+// AudioEncodeTypeToPayloadType 将 JT/T 1078 音频编码类型映射为 RTP 动态负载类型。
+// FIXED [P2]: 补全 G.726/G.722/G.723/G.729/MP3/G.711A/G.711U 的 PT 映射，
+// 原 PayloadTypeG711=99 保留为 G.711 泛型（向后兼容），G.711A/G.711U 使用独立 PT。
+// 未知类型返回 PayloadTypeG711（99）作为安全兜底。
+func AudioEncodeTypeToPayloadType(audioType byte) byte {
+	switch audioType {
+	case AudioEncodeTypeG711A:
+		return PayloadTypeG711A
+	case AudioEncodeTypeG711U:
+		return PayloadTypeG711U
+	case AudioEncodeTypeG726:
+		return PayloadTypeG726
+	case AudioEncodeTypeG722:
+		return PayloadTypeG722
+	case AudioEncodeTypeG723:
+		return PayloadTypeG723
+	case AudioEncodeTypeG729:
+		return PayloadTypeG729
+	case AudioEncodeTypeAAC:
+		return PayloadTypeAAC
+	case AudioEncodeTypeMP3:
+		return PayloadTypeMP3
+	default:
+		return PayloadTypeG711
+	}
+}
 
 type RTPHeader struct {
 	Version        byte
@@ -93,8 +142,18 @@ func ParseRTPPacket(data []byte) (*RTPPacket, error) {
 		return nil, fmt.Errorf("rtp payload offset out of bounds")
 	}
 
-	pkt.Payload = make([]byte, len(data)-offset)
-	copy(pkt.Payload, data[offset:])
+	payloadEnd := len(data)
+	// FIXED: [P2] RTP padding处理：padding位=1时，最后一个字节指示填充字节数（含自身）
+	if h.Padding && payloadEnd > offset {
+		padLen := int(data[payloadEnd-1])
+		if padLen > payloadEnd-offset {
+			return nil, fmt.Errorf("rtp padding length %d exceeds payload %d", padLen, payloadEnd-offset)
+		}
+		payloadEnd -= padLen
+	}
+
+	pkt.Payload = make([]byte, payloadEnd-offset)
+	copy(pkt.Payload, data[offset:payloadEnd])
 
 	return pkt, nil
 }
@@ -258,7 +317,7 @@ func ParseJT1078Packet(data []byte) (*JT1078Packet, int, error) {
 	offset := 1
 
 	// SIM (6B BCD)
-	pkt.SIM = bcdToString(data[offset : offset+6])
+	pkt.SIM = bcdToStringSafe(data[offset : offset+6])
 	offset += 6
 
 	// 逻辑通道号
@@ -333,7 +392,11 @@ func BuildJT1078Packet(pkt *JT1078Packet) ([]byte, error) {
 	buf = append(buf, JT1078StartByte)
 
 	// SIM (6B BCD)
-	buf = append(buf, stringToBCD(pkt.SIM)...)
+	simBCD, err := stringToBCD6(pkt.SIM)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, simBCD...)
 
 	// 逻辑通道号
 	buf = append(buf, pkt.LogicChannel)

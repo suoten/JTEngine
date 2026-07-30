@@ -166,8 +166,12 @@ func NewRBACManager(configDir string, logger *zap.Logger) *RBACManager {
 }
 
 func (m *RBACManager) createDefaultAdmin() {
-	// 生成随机默认密码，避免使用固定的弱密码。密码仅在此日志中输出一次。
-	defaultPassword := generateRandomPassword(16)
+	// 开源版默认密码 admin123，方便用户首次登录体验
+	// 生产环境请通过 JTE_ADMIN_PASSWORD 环境变量覆盖
+	defaultPassword := os.Getenv("JTE_ADMIN_PASSWORD")
+	if defaultPassword == "" {
+		defaultPassword = "admin123"
+	}
 	m.users["default-admin"] = &User{
 		ID:           "default-admin",
 		Username:     "admin",

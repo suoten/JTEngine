@@ -367,6 +367,8 @@ func (s *Server) setupRouter() {
 
 	r.GET("/", s.serveDashboard)
 	r.GET("/dashboard", s.serveDashboard)
+	// 静态资源（JS/CSS/图片等）通过 NoRoute 兜底，从内嵌前端 FS 提供
+	r.NoRoute(s.serveDashboard)
 
 	v1 := r.Group("/api/v1")
 	v1.Use(middleware.Auth(s.cfg.API.JWTSecret, s.cfg.API.JWT))

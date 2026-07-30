@@ -14,17 +14,17 @@ import (
 	"sync"
 )
 
-// rsaPublicKeyPEM 是 JTE 官方用于签发模块授权码的 RSA-2048 公钥。
-// 对应的私钥由官网保管，用于签发 license 和模块签名。
-// 此公钥嵌入代码用于验证模块签名和 license 签名。
+// rsaPublicKeyPEM 是 JTE 开源版用于签发模块授权码的 RSA-2048 公钥。
+// 对应的私钥位于 modules/local_keys.pem，用于本地签名模块和 license。
+// 生产环境请替换为自有密钥对。
 const rsaPublicKeyPEM = `-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5ev7Kln98iMblV70lVf5
-Xu0qkLg6QHiNeIm3f0Zm7okPHWKS0tl2zPlPBy1E5CdQpJBhLLDDtUEOLw5piQKh
-vnZ9JcN5i/qAF1qxq21GzAe/gxn554HyY5zXQIDIxvl+jEea/0A2EtYIBtHqYbt0
-OxxUn6buu76VoDmfGpkw1kNjLrzkDXRzE6xDgA8Abu5firaJt8Vg9ZcFWXfbcY+E
-iEJOIKIAhJICEuecsIA9c/ac8vTgd4Y+oUElzYGs+9Bc95QvzMy6ZF5VPBrFcSbE
-b9mX16c9P0IMrtfpanSt9JJ9ANoFunUquhXGbsMHyp+tvjxh3G3d1vcCsS17y3mf
-vwIDAQAB
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzUUm4OaZXTJd3TYWN5hY
+ci/vIQ1FxYOgymfDGv3VSc6Fj3TbXaiw41Sd8Fuf68vG2BbTiibatF7jog2llKPI
+avn+kn1yieoaSlV3p+zLtaeK96UMz1+VCVHoQ1P0QC+8bOXXAxlElku5Prl1O0ES
+Aca9dJCtO9u5AhwC37XAnDJwFwidaGE8YMFr4t39Hf8KyhClSZbt/ZNxmDUskX9S
+6pJyKCSROZ9/I+hYXDA/VhjLgFhdFieWc2VJbASLaZUVy5xD1ekaBmzcpQD4pxYd
+KSTqeA3t4nG7OpJMv7+NXtipIyoPRK9t549mGHsnBZfZfcFeP1Hvhq1TmYWlr8Dx
+SQIDAQAB
 -----END PUBLIC KEY-----`
 
 var (

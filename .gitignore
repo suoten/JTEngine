@@ -13,12 +13,12 @@ jte/loadtest.exe
 *.test
 *.out
 *.prof
+# modules/bin/ 下的预编译模块二进制和签名文件允许提交
+!jte/modules/bin/
+!jte/modules/bin/**
 
 # 运行时数据（永不提交）
 jte/data/
-jte/modules/*.so
-jte/modules/*.sig
-jte/modules/*.dll
 jte/modules/*.json
 jte/spool/
 jte/logs/
@@ -26,6 +26,10 @@ jte/logs/
 # 前端构建产物
 jte/web/node_modules/
 jte/web/dist/
+# internal/api/embed/ 是旧版前端构建产物，不再入库
+jte/internal/api/embed/
+# cmd/jte/web/dist/ 是 go:embed 需要的前端产物，允许提交
+!jte/cmd/jte/web/dist/
 
 # 覆盖率
 jte/coverage.out

@@ -7,6 +7,9 @@ jte.exe
 *.test
 *.out
 *.prof
+# modules/bin/ 下的预编译模块二进制和签名文件允许提交
+!modules/bin/
+!modules/bin/**
 
 vendor/
 
@@ -16,6 +19,8 @@ web/node_modules/
 modules/*.so
 modules/*.sig
 modules/*.dll
+# modules/bin/ 子目录下的文件不匹配上面的通配规则
+# （上面 *.so 等只匹配 modules/ 直接子文件，不影响 modules/bin/）
 
 .env
 *.log

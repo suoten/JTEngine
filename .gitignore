@@ -29,10 +29,18 @@ jte/logs/
 
 # 测试文件（不进开源仓库）
 *_test.go
+*.test.js
+*.spec.js
+*.test.ts
+*.spec.ts
 jte/coverage.out
 jte/coverage.html
 jte/coverage/
 jte/coverage
+
+# 临时脚本（不进开源仓库）
+jte/web/_batch.js
+scripts/acceptance_e2e.ps1
 
 # 前端构建产物
 jte/web/node_modules/

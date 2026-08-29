@@ -620,6 +620,11 @@ type ZLMediaKitConfig struct {
 
 type ClusterConfig struct {
 	NodeID string `mapstructure:"node_id"`
+	// AUTO-FIX-2026-08-29 [P0-1]: 集群种子节点列表（host:port，gossip UDP）。
+	// 为空时本节点以 standalone 模式运行；多节点部署必须配置至少一个其他节点的地址。
+	Seeds []string `mapstructure:"seeds"`
+	// AUTO-FIX-2026-08-29 [P0-1]: 本节点 gossip 监听地址，默认 0.0.0.0:7946。
+	BindAddr string `mapstructure:"bind_addr"`
 }
 
 type AIConfig struct {

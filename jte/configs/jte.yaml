@@ -294,6 +294,17 @@ auth:
   # 校验规则见 config.go Load()，开发环境可设 JTE_ALLOW_INSECURE_JWT=1 跳过。
   offline_unbind_secret: ""
 
+# 集群配置（AUTO-FIX-2026-08-29 [P0-1]）：多节点部署时配置 seeds，
+# 单节点部署保持默认即可（standalone 模式）。
+cluster:
+  # 节点唯一标识，留空时默认 "node-1"（多节点部署每台必须不同）
+  node_id: ""
+  # 种子节点列表（host:port，gossip UDP）。留空 = standalone 模式。
+  # 多节点部署示例：["10.0.0.2:7946", "10.0.0.3:7946"]
+  seeds: []
+  # 本节点 gossip 监听地址
+  bind_addr: "0.0.0.0:7946"
+
 jt809:
   platforms: []
   server_port: 0

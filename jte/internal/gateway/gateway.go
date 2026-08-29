@@ -519,6 +519,49 @@ func (sm *SessionManager) Remove(id string) {
 	sm.deviceLogger(phone).Info("session removed", zap.String("id", id))
 }
 
+// RemoveIfStale 条件清理指定手机号的会话登记（AUTO-FIX-2026-08-29 [P0-2]）。
+// 供故障转移会话迁移钩子使用：故障节点失效后，本节点可能残留该终端的
+// 未清理登记。仅清理"非活跃"会话（状态非 authenticated）；
+// 终端已在本节点重连（authenticated）时不动，避免误杀健康连接。
+// 返回是否发生删除以及遇到的会话状态（无登记时 status 为空）。
+func (sm *SessionManager) RemoveIfStale(phone string) (removed bool, status string) {
+	var sessionToClose *Session
+	var id string
+
+	sm.mu.Lock()
+	session, ok := sm.byPhone[phone]
+	if !ok {
+		sm.mu.Unlock()
+		return false, ""
+	}
+	status = session.GetStatus()
+	if status == "authenticated" {
+		// 终端在本节点活跃：重连先于故障通知到达，跳过
+		sm.mu.Unlock()
+		return false, status
+	}
+	// 复用 Remove 的删除语义（按 phone 定位，按 id 删除）
+	id = session.ID
+	delete(sm.sessions, id)
+	if session.Conn != nil {
+		delete(sm.byConn, session.Conn)
+	}
+	delete(sm.byPhone, phone)
+	if session.Conn != nil {
+		sessionToClose = session
+	}
+	metrics.OnlineDevices.Set(float64(len(sm.sessions)))
+	sm.mu.Unlock()
+
+	if sessionToClose != nil {
+		sessionToClose.Close()
+	}
+	sm.deviceLogger(phone).Info("stale session removed (failover migration)",
+		zap.String("id", id),
+		zap.String("last_status", status))
+	return true, status
+}
+
 func (sm *SessionManager) List() []*Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()

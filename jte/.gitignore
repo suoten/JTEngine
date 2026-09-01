@@ -1,4 +1,4 @@
-jte
+/jte
 jte.exe
 *.exe
 *.dll
@@ -20,10 +20,14 @@ modules/*.exe
 
 vendor/
 
-web/dist/
-web/node_modules/
+/web/dist/
+/web/node_modules/
 
 modules/*.json
+modules/*.invalid-*
+
+# 付费模块接线（builtin 编译入口，仅本地保留，不进开源仓库）
+cmd/jte/builtin_modules.go
 
 .env
 *.log

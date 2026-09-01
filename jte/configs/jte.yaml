@@ -36,10 +36,11 @@ api:
   # AUTO-FIX-2026-06-29 [P1]: cors_origins 禁止配置 ["*"]（与 Allow-Credentials: true
   # 构成危险组合，任意网站可携带凭证跨域访问）。生产环境必须配置具体域名白名单。
   cors_origins:
-    - "http://localhost:5173"   # Vite 开发服务器
-    - "http://localhost:3000"   # Vite 开发服务器 (jte-dashboard)
-    - "http://localhost:8090"   # 本地访问
-    # - "https://jte.example.com"  # 生产环境前端域名
+  - "http://localhost:5173"   # Vite 开发服务器
+  - "http://localhost:3000"   # Vite 开发服务器 (jte-dashboard)
+  - "http://localhost:8090"   # 本地访问
+  - "http://127.0.0.1:8090"   # AUTO-FIX-2026-08-31 [P1]: 本机 IP 形式访问（原缺失导致同源 WS 被 403）
+  # - "https://jte.example.com"  # 生产环境前端域名
   rate_limit: 100
   jwt:
     # AUTO-FIX-2026-06-29 [P0]: 生产环境必须替换为 ≥32 字节强随机密钥！
@@ -275,6 +276,12 @@ telemetry:
     path: "/metrics"               # 指标端点路径
 
 modules:
+  # AUTO-FIX-2026-08-31 [P0]: 模块加载模式。
+  #   builtin  - 付费模块编译期链接进宿主二进制（go build -tags builtin），全平台可用
+  #   process  - 独立进程 RPC 模式（注意：子进程 RPC 监听端未实现，当前不可用）
+  #   plugin   - Linux .so 插件模式
+  #   auto     - 自动选择（Linux 开发→plugin，其余→process）
+  load_mode: "builtin"
   dir: "./modules"
   signature_verify: true
 

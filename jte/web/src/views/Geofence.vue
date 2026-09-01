@@ -219,11 +219,19 @@ async function fetchList() {
 
 // 后端字段兼容
 function normalizeFence(f) {
+  // BROWSER-TEST-FIX-2026-09-01 [P1]: 后端 Geofence.Type 是 int(1/2/3)，params 是 JSON 字符串；
+  // 原映射按字符串 'circle' 和对象处理，导致列表类型/参数列显示错误，且创建/编辑时 400。
+  const typeMap = { 1: 'circle', 2: 'rectangle', 3: 'polygon' }
+  let params = f.params || {}
+  if (typeof params === 'string') {
+    try { params = JSON.parse(params) } catch { params = {} }
+  }
   return {
     id: f.id ?? f.fence_id,
     name: f.name || '',
-    type: f.type || 'circle',
-    params: f.params || parseLegacyParams(f),
+    type: typeMap[f.type] || (typeof f.type === 'string' ? f.type : 'circle'),
+    typeId: typeof f.type === 'number' ? f.type : ({ circle: 1, rectangle: 2, polygon: 3 }[f.type] || 1),
+    params,
     effective_from: f.effective_from || f.start_time,
     effective_to: f.effective_to || f.end_time,
     enabled: f.enabled ?? true,
@@ -261,7 +269,10 @@ function fmtNum(n) {
 
 function formatTime(t) {
   if (!t) return '-'
-  return new Date(t).toLocaleString('zh-CN')
+  // BROWSER-TEST-FIX-2026-09-01 [P3]: 后端零值时间 (0001-01-01) 显示为 "1/1/1"，改为 "长期"
+  const d = new Date(t)
+  if (isNaN(d.getTime()) || d.getFullYear() <= 1970) return '-'
+  return d.toLocaleString('zh-CN')
 }
 
 function openAdd() {
@@ -306,8 +317,9 @@ async function submit() {
   try {
     const payload = {
       name: form.value.name.trim(),
-      type: form.value.type,
-      params: form.value.params,
+      // BROWSER-TEST-FIX-2026-09-01 [P1]: 后端要求 int 类型与 JSON 字符串 params
+      type: typeof form.value.type === 'number' ? form.value.type : ({ circle: 1, rectangle: 2, polygon: 3 }[form.value.type] || 1),
+      params: typeof form.value.params === 'string' ? form.value.params : JSON.stringify(form.value.params || {}),
       effective_from: form.value.effectiveRange?.[0] || null,
       effective_to: form.value.effectiveRange?.[1] || null,
       enabled: form.value.enabled,

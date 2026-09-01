@@ -1053,7 +1053,10 @@ func (h *MediaHandler) Streams(c *gin.Context) {
 	}
 	streams, err := h.media.ListStreams()
 	if err != nil {
-		respondInternalError(c, h.logger, err, "MediaHandler.Streams.ListStreams")
+		// BROWSER-TEST-FIX-2026-09-01 [P2]: ZLMediaKit 不可达时列表端点降级为空列表，
+		// 避免视频监控页直接 500；加 degraded 标记供前端提示。
+		h.logger.Warn("list streams failed, degrading to empty list", zap.Error(err))
+		c.JSON(http.StatusOK, gin.H{"code": 0, "data": []interface{}{}, "degraded": true, "message": "media server unavailable"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": streams})

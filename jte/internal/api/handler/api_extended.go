@@ -379,14 +379,18 @@ func (h *AlarmHandler) AckAlarm(c *gin.Context) {
 		Operator string `json:"operator"`
 		Remark   string `json:"remark"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
-		return
+	// BROWSER-TEST-FIX-2026-09-01 [P2]: 空 body 容忍（ContentLength==0 时跳过绑定，避免 400 EOF）
+	if c.Request.Body != nil && c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+			return
+		}
 	}
 
-	// 查询报警
+	// BROWSER-TEST-FIX-2026-09-01 [P1]: 原代码用 Phone: id 过滤（同 GetAlarm 的历史 P0），
+	// 将报警 ID 当手机号查询导致确认操作永远 404。改用 AlarmID 精确查询。
 	result, err := h.store.ListAlarms(c.Request.Context(), storage.ListOptions{
-		Page: 1, PageSize: 1, Phone: id,
+		Page: 1, PageSize: 1, AlarmID: id,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})
@@ -432,13 +436,17 @@ func (h *AlarmHandler) ProcessAlarm(c *gin.Context) {
 		Action      string `json:"action"`
 		Description string `json:"description"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
-		return
+	// BROWSER-TEST-FIX-2026-09-01 [P2]: 空 body 容忍
+	if c.Request.Body != nil && c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+			return
+		}
 	}
 
+	// BROWSER-TEST-FIX-2026-09-01 [P1]: 同 AckAlarm，Phone: id 改为 AlarmID: id
 	result, err := h.store.ListAlarms(c.Request.Context(), storage.ListOptions{
-		Page: 1, PageSize: 1, Phone: id,
+		Page: 1, PageSize: 1, AlarmID: id,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})
@@ -483,13 +491,17 @@ func (h *AlarmHandler) CloseAlarm(c *gin.Context) {
 		Operator string `json:"operator"`
 		Reason   string `json:"reason"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
-		return
+	// BROWSER-TEST-FIX-2026-09-01 [P2]: 空 body 容忍
+	if c.Request.Body != nil && c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
+			return
+		}
 	}
 
+	// BROWSER-TEST-FIX-2026-09-01 [P1]: 同 AckAlarm，Phone: id 改为 AlarmID: id
 	result, err := h.store.ListAlarms(c.Request.Context(), storage.ListOptions{
-		Page: 1, PageSize: 1, Phone: id,
+		Page: 1, PageSize: 1, AlarmID: id,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "internal error"})

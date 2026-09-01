@@ -120,8 +120,13 @@ func (h *AdminHandler) SendCommand(c *gin.Context) {
 
 	vehicle, err := h.store.GetVehicle(c.Request.Context(), id)
 	if err != nil || vehicle == nil {
-		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "vehicle not found"})
-		return
+		// BROWSER-TEST-FIX-2026-09-01 [P2]: 路由为 /terminals/:id/command，调用方传的是终端手机号，
+		// 而 GetVehicle 仅按内部 ID 查询，导致按手机号下发指令永远 404。增加按手机号回退查询。
+		vehicle, err = h.store.GetVehicleByPhone(c.Request.Context(), id)
+		if err != nil || vehicle == nil {
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "vehicle not found"})
+			return
+		}
 	}
 
 	phone := vehicle.Phone
@@ -192,22 +197,41 @@ func (h *AdminHandler) HandleAlarm(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "alarm handled", "id": id})
 }
 
+// BROWSER-TEST-FIX-2026-09-01 [P1]: 原实现为假成功（仅打日志即返回 201，不持久化），
+// 导致第三方客户端被欺骗。现改为真持久化，语义对齐 CascadeHandler.CreatePlatform
+// （storage.Platform：username→user_id，角色固定 upstream）。
 func (h *AdminHandler) CreatePlatform(c *gin.Context) {
 	var req struct {
-		Name     string `json:"name"`
-		Host     string `json:"host"`
-		Port     int    `json:"port"`
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Name     string `json:"name" binding:"required"`
+		Host     string `json:"host" binding:"required"`
+		Port     int    `json:"port" binding:"required"`
+		Username string `json:"username" binding:"required"`
+		Password string `json:"password" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
+	platform := &storage.Platform{
+		ID:       fmt.Sprintf("plat_%s_%d", req.Username, time.Now().UnixNano()),
+		Name:     req.Name,
+		UserID:   req.Username,
+		Password: req.Password,
+		Role:     "upstream",
+		Host:     req.Host,
+		Port:     req.Port,
+		Enabled:  true,
+	}
+	if err := h.store.SavePlatform(c.Request.Context(), platform); err != nil {
+		h.logger.Error("admin save platform failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to save platform"})
+		return
+	}
 	h.logger.Info("admin create platform",
+		zap.String("id", platform.ID),
 		zap.String("name", req.Name),
 		zap.String("host", req.Host))
-	c.JSON(http.StatusCreated, gin.H{"code": 0, "message": "created"})
+	c.JSON(http.StatusCreated, gin.H{"code": 0, "message": "created", "data": platform})
 }
 
 // R43-FIX [P2]: 使用结构化请求替代 map[string]interface{}，确保字段白名单校验。
@@ -226,15 +250,43 @@ func (h *AdminHandler) UpdatePlatform(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
-	h.logger.Info("admin update platform",
-		zap.String("id", id),
-		zap.String("name", req.Name),
-		zap.String("host", req.Host))
-	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "updated"})
+	// BROWSER-TEST-FIX-2026-09-01 [P1]: 原实现为假成功，现改为读改写真持久化
+	existing, err := h.store.GetPlatform(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "platform not found"})
+		return
+	}
+	if req.Name != "" {
+		existing.Name = req.Name
+	}
+	if req.Host != "" {
+		existing.Host = req.Host
+	}
+	if req.Port != 0 {
+		existing.Port = req.Port
+	}
+	if req.Username != "" {
+		existing.UserID = req.Username
+	}
+	if req.Password != "" {
+		existing.Password = req.Password
+	}
+	if err := h.store.SavePlatform(c.Request.Context(), existing); err != nil {
+		h.logger.Error("admin update platform failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "failed to update platform"})
+		return
+	}
+	h.logger.Info("admin update platform", zap.String("id", id))
+	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "updated", "data": existing})
 }
 
 func (h *AdminHandler) DeletePlatform(c *gin.Context) {
 	id := c.Param("id")
+	// BROWSER-TEST-FIX-2026-09-01 [P1]: 原实现为假成功，现改为真删除
+	if err := h.store.DeletePlatform(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "platform not found"})
+		return
+	}
 	h.logger.Info("admin delete platform", zap.String("id", id))
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "deleted"})
 }

@@ -1417,23 +1417,39 @@ func (m *LicenseManager) checkTrialStateFile(moduleName string) error {
 		return nil
 	}
 
-	var state trialStateFile
-	if err := json.Unmarshal(data, &state); err != nil {
-		// INDUSTRIAL-FIX-2026-07-24 [P0-红线]: 损坏的试用状态文件视为已使用，阻止重置
-		m.logger.Warn("trial state file corrupted, treating as previously used",
-			zap.String("module", moduleName), zap.Error(err))
-		return fmt.Errorf("trial for %s has a corrupted state file (possible tampering), contact support", moduleName)
+	// AUTO-FIX-2026-08-31 [P1]: 损坏/跨机的试用状态文件改为"隔离 + 重新开始"。
+	// 原实现（INDUSTRIAL-FIX-2026-07-24）直接永久阻塞试用——但该文件本身就在
+	// 用户磁盘上，删除即重置，原防护对真实滥用无效；却把"服务器迁移/备份恢复"
+	// 这类完全合法的场景（文件来自旧机器、签名/指纹不匹配）变成了死局，
+	// 用户永远无法开始试用。现改为：将无效文件改名隔离（.invalid-<ts>），
+	// 视为不存在，允许重新试用。真正的防滥用裁决必须由服务端完成。
+	quarantine := func(reason string) {
+		quarantinePath := fmt.Sprintf("%s.invalid-%d", path, time.Now().Unix())
+		if err := os.Rename(path, quarantinePath); err != nil {
+			m.logger.Warn("failed to quarantine invalid trial state file",
+				zap.String("module", moduleName), zap.String("path", path), zap.Error(err))
+		}
+		m.logger.Warn("invalid trial state file quarantined, fresh trial allowed",
+			zap.String("module", moduleName), zap.String("reason", reason),
+			zap.String("quarantined_to", quarantinePath))
 	}
 
-	// INDUSTRIAL-FIX-2026-07-24 [P0-红线]: 校验签名，防止篡改试用状态文件
+	var state trialStateFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		// INDUSTRIAL-FIX-2026-07-24 [P0-红线]: 校验签名，防止篡改试用状态文件；
+		// AUTO-FIX-2026-08-31: 无效文件隔离而非永久阻塞（迁移场景合法性优先）
+		quarantine("corrupted json")
+		return nil
+	}
+
 	if !m.verifyTrialStateSignature(&state) {
-		m.logger.Warn("trial state file signature verification failed, possible tampering",
-			zap.String("module", moduleName))
-		return fmt.Errorf("trial for %s has an invalid state file signature (possible tampering), contact support", moduleName)
+		quarantine("signature verification failed (other machine or tampered)")
+		return nil
 	}
 
 	if state.MachineFingerprint != "" && state.MachineFingerprint != m.fingerprint {
-		return fmt.Errorf("trial for %s was previously started on a different machine", moduleName)
+		quarantine("machine fingerprint mismatch (migrated server)")
+		return nil
 	}
 
 	if state.TrialCount > 0 {

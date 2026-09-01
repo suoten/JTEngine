@@ -116,6 +116,13 @@ func (l *Loader) LoadAll() error {
 		return l.loadProcessModulesLocked()
 	}
 
+	// AUTO-FIX-2026-08-31 [P0]: 内置（编译期链接）模式
+	if mode == LoadModeBuiltin {
+		l.logger.Info("loading modules in builtin (in-process) mode",
+			zap.String("mode", mode.String()))
+		return l.loadBuiltinModulesLocked()
+	}
+
 	// plugin 模式（仅 Linux）
 	if !IsPluginSupported() {
 		l.logger.Warn("plugin mode not supported on this OS, skipping",
@@ -222,6 +229,41 @@ func (l *Loader) loadProcessModulesLocked() error {
 			zap.String("binary", binPath))
 	}
 
+	return nil
+}
+
+// loadBuiltinModulesLocked 内置（编译期链接）模式加载（持有写锁）。
+// AUTO-FIX-2026-08-31 [P0]: 进程模式在 Windows 上不可用（宿主硬编码 rpc.Dial("unix",...)），
+// 且模块二进制从不实现 RPC 监听端——进程模式实际从未工作过。builtin 模式通过
+// `go build -tags builtin` 将付费模块链接进宿主二进制：模块 init() 在进程启动时
+// 注册到 PluginRegistry，此处按注册表取出实例，复用与 plugin 模式完全相同的
+// 生命周期管理（版本校验/拓扑排序/Init/Start/Stop/Supervisor）。
+// 安全性：内置模块随宿主一起编译发布，无需独立 .sig 签名（签名校验仅针对外部二进制）。
+func (l *Loader) loadBuiltinModulesLocked() error {
+	keys := registry.ListPluginModules()
+	if len(keys) == 0 {
+		l.logger.Warn("no builtin modules registered",
+			zap.String("hint", "rebuild the binary with: go build -tags builtin ./cmd/jte"))
+		return nil
+	}
+	for _, key := range keys {
+		raw, ok := registry.GetPluginModule(key)
+		if !ok {
+			continue
+		}
+		mod, ok := raw.(Module)
+		if !ok {
+			l.logger.Error("builtin module does not implement Module interface, skipping",
+				zap.String("key", key))
+			continue
+		}
+		if err := l.registerLoadedModule(mod, "builtin://"+key); err != nil {
+			l.logger.Error("register builtin module failed",
+				zap.String("key", key),
+				zap.Error(err))
+			continue
+		}
+	}
 	return nil
 }
 

@@ -1030,10 +1030,19 @@ func (s *Server) SetDataCipher(c *secret.DataCipher) {
 
 func (s *Server) SetAIModule(m interface{ AnalyzeAlarm(alarmID, alarmType string, data map[string]interface{}) (isFalseAlarm bool, confidence float64, reason string, err error) }) {
 	s.aiModule = m
+	// BROWSER-TEST-FIX-2026-09-01 [P1]: 模块注入发生在路由注册之后（InitAll 晚于 NewServer），
+	// 需同步转发给已绑到路由的 aiHandler，否则商业版端点永远走降级分支。
+	if s.aiHandler != nil {
+		s.aiHandler.SetAIModule(m)
+	}
 }
 
 func (s *Server) SetAINLPModule(m interface{ Chat(query, sessionID string) (response string, err error) }) {
 	s.aiNLPModule = m
+	// BROWSER-TEST-FIX-2026-09-01 [P1]: 同 SetAIModule，晚到注入需转发给 aiHandler
+	if s.aiHandler != nil {
+		s.aiHandler.SetAINLPModule(m)
+	}
 }
 
 func (s *Server) SetLogger(l *zap.Logger) {
@@ -1043,6 +1052,14 @@ func (s *Server) SetLogger(l *zap.Logger) {
 func (s *Server) serveDashboard(c *gin.Context) {
 	if s.webFS != nil {
 		path := c.Request.URL.Path
+		// AUTO-FIX-2026-08-31 [P2]: API/WS 前缀路径不回退到 SPA——原实现把
+		// 打错的 API 路径（如 /api/v1/stats/overveiw）也返回 200 HTML，
+		// 掩盖前端集成错误且污染缓存。改为标准 JSON 404。
+		if strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/ws/") ||
+			strings.HasPrefix(path, "/debug/") || strings.HasPrefix(path, "/metrics") {
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "endpoint not found"})
+			return
+		}
 		if path == "/" || path == "/dashboard" {
 			path = "index.html"
 		} else {
@@ -1050,8 +1067,13 @@ func (s *Server) serveDashboard(c *gin.Context) {
 		}
 
 		data, err := fs.ReadFile(s.webFS, path)
+		// AUTO-FIX-2026-08-31 [P2]: SPA 路由回退到 index.html 时 Content-Type
+		// 必须是 text/html（原实现按请求路径推断，/vehicles 等路由返回
+		// application/octet-stream，依赖浏览器 MIME 嗅探才能渲染）。
+		servedHTML := false
 		if err != nil {
 			data, err = fs.ReadFile(s.webFS, "index.html")
+			servedHTML = true
 			if err != nil {
 				c.Header("Content-Type", "text/html; charset=utf-8")
 				c.String(http.StatusOK, `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>JTE Dashboard</title></head><body style="background:#0a0e17;color:#f1f5f9;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif"><div style="text-align:center"><h1>JTE Dashboard</h1><p style="color:#94a3b8">Dashboard file not found. Please build the web assets.</p></div></body></html>`)
@@ -1060,6 +1082,9 @@ func (s *Server) serveDashboard(c *gin.Context) {
 		}
 
 		contentType := "application/octet-stream"
+		if servedHTML {
+			contentType = "text/html; charset=utf-8"
+		}
 		switch {
 		case len(path) > 5 && path[len(path)-5:] == ".html":
 			contentType = "text/html; charset=utf-8"

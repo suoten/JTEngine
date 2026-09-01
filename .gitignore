@@ -46,7 +46,8 @@ scripts/acceptance_e2e.ps1
 jte/web/node_modules/
 jte/web/dist/
 jte/internal/api/embed/
-jte/cmd/jte/web/dist/
+# cmd/jte/web/dist 为 go:embed all:web 所需，必须入库（AUTO-FIX-2026-09-01：
+# 原排除行导致开源克隆缺少内嵌前端，go build 直接失败）
 
 # IDE / 编辑器
 .idea/

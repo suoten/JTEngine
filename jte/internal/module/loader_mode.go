@@ -37,6 +37,10 @@ const (
 	LoadModePlugin
 	// LoadModeProcess 独立进程模式（RPC，所有平台支持，生产推荐）
 	LoadModeProcess
+	// LoadModeBuiltin 内置模式：付费模块在编译期用 -tags builtin 链接进宿主二进制
+	// （AUTO-FIX-2026-08-31 [P0]：进程模式在 Windows 上不可用——宿主硬编码 dial unix，
+	// 且模块子进程从不实现 RPC 监听端，进程模式实际从未工作过）
+	LoadModeBuiltin
 )
 
 // String 返回加载模式名称
@@ -46,6 +50,8 @@ func (m ModuleLoadMode) String() string {
 		return "plugin"
 	case LoadModeProcess:
 		return "process"
+	case LoadModeBuiltin:
+		return "builtin"
 	default:
 		return "auto"
 	}
@@ -58,6 +64,8 @@ func ParseLoadMode(s string) ModuleLoadMode {
 		return LoadModePlugin
 	case "process", "rpc", "grpc":
 		return LoadModeProcess
+	case "builtin", "embedded":
+		return LoadModeBuiltin
 	default:
 		return LoadModeAuto
 	}

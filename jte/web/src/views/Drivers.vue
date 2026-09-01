@@ -166,16 +166,18 @@ async function fetchList() {
 }
 
 // 后端字段兼容
+// BROWSER-TEST-FIX-2026-09-01 [P2]: 后端 DriverInfoData 返回 driver_name/license_id/received_at，
+// 原映射只读 name/license_no/created_at，导致姓名、驾驶证号、创建时间列永远显示空。
 function normalize(d) {
   return {
     id: d.id ?? d.driver_id,
-    name: d.name || '',
+    name: d.driver_name || d.name || '',
     id_card: d.id_card || d.id_number || '',
     phone: d.phone || d.mobile || '',
-    license_no: d.license_no || d.license_number || '',
+    license_no: d.license_id || d.license_no || d.license_number || '',
     vehicle_plate: d.vehicle_plate || d.plate || '',
     status: d.status || 'active',
-    created_at: d.created_at,
+    created_at: d.received_at || d.created_at,
   }
 }
 
@@ -222,9 +224,12 @@ async function submit() {
   submitting.value = true
   try {
     const payload = {
+      // BROWSER-TEST-FIX-2026-09-01 [P1]: 后端必填 driver_name，原只发 name 导致新增驾驶员 400
+      driver_name: form.value.name.trim(),
       name: form.value.name.trim(),
       id_card: form.value.id_card.trim(),
       phone: form.value.phone.trim(),
+      license_id: form.value.license_no.trim(),
       license_no: form.value.license_no.trim(),
       vehicle_plate: form.value.vehicle_plate.trim(),
       status: form.value.status,

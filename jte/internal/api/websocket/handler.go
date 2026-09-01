@@ -2,7 +2,9 @@ package websocket
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -16,6 +18,9 @@ import (
 
 // upgrader 在 CheckOrigin 中校验请求来源是否在配置的 CORS 白名单内。
 // AUTO-FIX-2026-06-29: 原实现 CheckOrigin 永远返回 true，存在 CSWSH 跨站 WebSocket 劫持风险。
+// AUTO-FIX-2026-08-31 [P1]: 补充同源放行——浏览器经 localhost 与 127.0.0.1 访问同一
+// 服务时 Host 与 Origin 主机一致，同源请求不可能构成 CSWSH，
+// 原实现只比对白名单导致本机 IP 形式访问时实时推送全部 403。
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
@@ -25,9 +30,41 @@ var upgrader = websocket.Upgrader{
 			// 非浏览器客户端（如 curl、设备 SDK）无 Origin 头，允许通过
 			return true
 		}
+		// 同源放行：Origin 的 host:port 与请求 Host 一致（hostport 忽略默认端口差异）
+		if u, err := url.Parse(origin); err == nil && u.Host != "" {
+			if isSameHostPort(u.Host, r.Host, r.TLS != nil) {
+				return true
+			}
+		}
 		// 从配置上下文获取 CORS 白名单——此处用全局 defaultUpgraderOrigins
 		return defaultUpgraderOrigins.isAllowed(origin)
 	},
+}
+
+// isSameHostPort 判断两个 host:port 是否等价。端口按 http/https 默认端口补全：
+// Origin 无端口时按请求是否为 TLS 推断 443/80；Host 无端口时同理。
+func isSameHostPort(originHost, requestHost string, isTLS bool) bool {
+	defaultPort := "80"
+	if isTLS {
+		defaultPort = "443"
+	}
+	norm := func(h string) string {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" {
+			return ""
+		}
+		if strings.HasPrefix(h, "[") { // IPv6 [::1]:8080 形式
+			if _, port, err := net.SplitHostPort(h); err == nil && port != "" {
+				return h
+			}
+			return h + ":" + defaultPort
+		}
+		if strings.Contains(h, ":") {
+			return h // 已含端口
+		}
+		return h + ":" + defaultPort
+	}
+	return norm(originHost) == norm(requestHost)
 }
 
 // defaultUpgraderOrigins 是全局 CORS 白名单，由 SetCORSOrigins 在启动时注入。

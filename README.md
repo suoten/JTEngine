@@ -240,6 +240,7 @@ Go 1.22+ / Gin / Zap / Viper · Vue 3 / Vite / Element Plus / Pinia · TDengine 
 
 ## 🤝 联系与社区
 
+- 💬 QQ 交流群：**1109976461**（技术交流 · 问题反馈 · 使用答疑）
 - 🐛 问题反馈：[GitHub Issues](https://github.com/suoten/jt-engine/issues)
 - 🇨🇳 国内镜像：[Gitee](https://gitee.com/suoten/jt-engine)
 - 🌐 官网：https://www.jtengine.cn （付费模块 · 技术支持 · 商业授权）

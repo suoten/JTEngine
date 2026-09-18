@@ -513,7 +513,7 @@ func (s *Server) setupRouter() {
 		v1.POST("/alarms/linkage/rules", middleware.RequirePermission("alarm"), alarmHandler.AlarmLinkageRules)
 		v1.POST("/alarms/:id/ai-check", middleware.RequirePermission("alarm"), alarmHandler.AIFalseAlarmCheck)
 
-		sessionHandler := handler.NewSessionHandler(s.store, s.logger)
+		sessionHandler := handler.NewSessionHandler(s.store, s.sessions, s.logger)
 		v1.GET("/sessions", middleware.RequirePermission("monitor"), sessionHandler.List)
 		// [商业版] 前端 API 契约对齐：/sessions/:id
 		v1.GET("/sessions/:id", middleware.RequirePermission("monitor"), sessionHandler.Get)

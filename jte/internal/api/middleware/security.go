@@ -23,10 +23,18 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 		}
 
 		// CSP 策略：允许内联样式（Vue 运行时需要）和同源资源
+		// script-src 追加天地图/高德/百度地图 API 域（地图模块按需动态加载脚本）
+		// 天地图 JS SDK 内部以 http:// 加载样式/瓦片，需同时放行 http 源
 		c.Header("Content-Security-Policy",
-			"default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; "+
-				"style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; "+
-				"connect-src 'self' wss: ws:; font-src 'self' data:")
+			"default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' "+
+				"https://api.tianditu.gov.cn https://*.tianditu.gov.cn "+
+				"http://api.tianditu.gov.cn http://*.tianditu.gov.cn "+
+				"https://webapi.amap.com https://*.amap.com "+
+				"https://api.map.baidu.com https://*.map.baidu.com; "+
+				"style-src 'self' 'unsafe-inline' http://api.tianditu.gov.cn; "+
+				"img-src 'self' data: https: http://*.tianditu.gov.cn http://api.tianditu.gov.cn; "+
+				"connect-src 'self' wss: ws: http://api.tianditu.gov.cn https://api.tianditu.gov.cn; "+
+				"font-src 'self' data:; worker-src 'self' blob:")
 		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
 		c.Header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
 		c.Next()

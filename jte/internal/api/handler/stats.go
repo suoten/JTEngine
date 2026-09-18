@@ -6,17 +6,18 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/suoten/jt-engine/internal/gateway"
 	"github.com/suoten/jt-engine/pkg/storage"
 	"go.uber.org/zap"
 )
 
 type StatsHandler struct {
 	store    storage.Interface
-	sessions interface{ OnlineCount() int }
+	sessions *gateway.SessionManager
 	logger   *zap.Logger
 }
 
-func NewStatsHandler(store storage.Interface, sessions interface{ OnlineCount() int }, logger *zap.Logger) *StatsHandler {
+func NewStatsHandler(store storage.Interface, sessions *gateway.SessionManager, logger *zap.Logger) *StatsHandler {
 	return &StatsHandler{store: store, sessions: sessions, logger: logger}
 }
 
@@ -37,8 +38,16 @@ func (h *StatsHandler) Stats(c *gin.Context) {
 	now := time.Now()
 	alarmCount, _ := h.store.GetAlarmCount(ctx, now.Add(-24*time.Hour), now)
 	sessionCount := 0
+	protocolDist := map[string]int{}
 	if h.sessions != nil {
-		sessionCount = h.sessions.OnlineCount()
+		for _, s := range h.sessions.List() {
+			sessionCount++
+			p := string(s.GetProtocol())
+			if p == "" {
+				p = "unknown"
+			}
+			protocolDist[p]++
+		}
 	}
 
 	// 字段名与前端 Overview.vue 契约对齐：online_count/total_sessions/alarm_count
@@ -49,6 +58,7 @@ func (h *StatsHandler) Stats(c *gin.Context) {
 		"total_sessions":  sessionCount,
 		"alarm_count":     alarmCount,
 		"protocol_count":  7, // 808/809/1078/1045/905/1253/32960
+		"protocol_dist":   protocolDist, // FIXED-2026-09-18: 总览页协议分布数据源
 	})
 }
 

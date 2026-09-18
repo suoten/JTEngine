@@ -178,10 +178,11 @@ async function fetchLogs() {
       page: currentPage.value,
       page_size: pageSize,
     })
-    // FIXED-2026-07-24: API 返回 {logs:null} 时 data 是对象非数组，需 Array.isArray 兜底
-const _raw = data.logs || data
-logs.value = Array.isArray(_raw) ? _raw : []
-    totalLogs.value = data.total || logs.value.length
+    // FIXED-2026-09-18: axios 拦截器已返回 {code,data:{items,total}} 包装，需解包 data
+    const payload = data && data.data ? data.data : data
+    const rows = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.items) ? payload.items : [])
+    logs.value = rows
+    totalLogs.value = (payload && payload.total) || rows.length
   } catch (e) {
     logs.value = []
     ElMessage.error('加载协议日志失败，请检查网络或稍后重试')

@@ -40,10 +40,10 @@
       </div>
       <el-table :data="logs" stripe v-loading="loading">
         <el-table-column prop="time" label="时间" width="180">
-          <template #default="{ row }">{{ formatTime(row.time || row.created_at) }}</template>
+          <template #default="{ row }">{{ formatTime(row.timestamp || row.time || row.created_at) }}</template>
         </el-table-column>
         <el-table-column prop="user" label="用户" width="120">
-          <template #default="{ row }">{{ row.user || row.username || '-' }}</template>
+          <template #default="{ row }">{{ row.operator || row.user || row.username || '-' }}</template>
         </el-table-column>
         <el-table-column prop="action" label="操作" width="150">
           <template #default="{ row }">
@@ -51,7 +51,7 @@
           </template>
         </el-table-column>
         <el-table-column prop="detail" label="详情" min-width="300">
-          <template #default="{ row }">{{ row.detail || row.description || row.message || '-' }}</template>
+          <template #default="{ row }">{{ row.resource || row.detail || row.description || row.message || '-' }}</template>
         </el-table-column>
         <el-table-column prop="ip" label="IP地址" width="140">
           <template #default="{ row }">{{ row.ip || row.client_ip || '-' }}</template>
@@ -124,17 +124,22 @@ async function fetchLogs() {
       page: page.value,
       page_size: pageSize.value,
     }
-    if (searchUser.value) params.user = searchUser.value
+    if (searchUser.value) { params.operator = searchUser.value; params.user = searchUser.value }
     if (filterAction.value) params.action = filterAction.value
+    params.limit = pageSize.value * page.value > 1000 ? 1000 : 50
     if (dateRange.value && dateRange.value.length === 2) {
       params.start_date = dateRange.value[0]
       params.end_date = dateRange.value[1]
     }
     const res = await systemApi.getLogs(params)
-    if (res.code === 0 && res.data) {
-      const data = res.data
-      logs.value = data.logs || data.items || data.list || []
-      total.value = data.total || logs.value.length
+    // FIXED-2026-09-18: 兼容 {code,data:[...],total} 与 {code,data:{items,total}} 两种返回
+    const payload = res && res.data ? res.data : res
+    if (payload) {
+      const rows = Array.isArray(payload) ? payload
+        : (Array.isArray(payload.items) ? payload.items
+          : (Array.isArray(payload.logs) ? payload.logs : []))
+      logs.value = rows
+      total.value = (res && res.total) || payload.total || rows.length
     } else {
       logs.value = []
       total.value = 0

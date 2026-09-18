@@ -156,6 +156,19 @@ async function fetchData() {
       statsCards.value[0].value = String(overview.online_count ?? 0)
       statsCards.value[1].value = String(overview.total_sessions ?? 0)
       statsCards.value[2].value = String(overview.alarm_count ?? 0)
+      // FIXED-2026-09-18: 协议分布接入后端 protocol_dist（此前从未填充，恒为 0）
+      if (overview.protocol_dist && typeof overview.protocol_dist === 'object') {
+        const keyMap = {
+          'JT/T 808': 'jt808', 'JT/T 809': 'jt809', 'JT/T 1078': 'jt1078',
+          'JT/T 1045': 'jt1045', 'JT/T 905': 'jt905', 'JT/T 1253': 'jt1253',
+          'GB/T 32960': 'gbt32960',
+        }
+        const sum = Object.values(overview.protocol_dist).reduce((a, b) => a + (b || 0), 0) || 1
+        protocolStats.value = protocolStats.value.map(p => {
+          const cnt = overview.protocol_dist[keyMap[p.name]] || 0
+          return { ...p, count: cnt, percent: Math.round((cnt / sum) * 1000) / 10 }
+        })
+      }
     }
 
     const sessions = await sessionApi.getList({ page: 1, page_size: 5 }).catch(() => ({ sessions: [] }))

@@ -238,6 +238,10 @@ Go 1.22+ / Gin / Zap / Viper · Vue 3 / Vite / Element Plus / Pinia · TDengine 
 
 > ⚠️ AGPL 第 13 条网络条款：对外提供基于本软件的服务需开放完整源码，商业授权可免除该义务。
 
+## 🔗 关联项目
+
+- **[JT-Simulate](https://github.com/suoten/JT-Simulate)**（[Gitee 镜像](https://gitee.com/suoten/jt-simulate)）| 部标协议仿真平台 — 与 JTE 网关配套的协议仿真测试工具。
+
 ## 🤝 联系与社区
 
 - 💬 QQ 交流群：**1109976461**（技术交流 · 问题反馈 · 使用答疑）

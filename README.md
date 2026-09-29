@@ -240,7 +240,8 @@ Go 1.22+ / Gin / Zap / Viper · Vue 3 / Vite / Element Plus / Pinia · TDengine 
 
 ## 🔗 关联项目
 
-- **[JT-Simulate](https://github.com/suoten/JT-Simulate)**（[Gitee 镜像](https://gitee.com/suoten/jt-simulate)）| 部标协议仿真平台 — 与 JTE 网关配套的协议仿真测试工具。
+- **JT-Simulate** | 部标协议仿真平台 — 与 JTE 网关配套的协议仿真测试工具。
+  GitHub：[github.com/suoten/JT-Simulate](https://github.com/suoten/JT-Simulate) ｜ Gitee：[gitee.com/suoten/jt-simulate](https://gitee.com/suoten/jt-simulate)
 
 ## 🤝 联系与社区
 

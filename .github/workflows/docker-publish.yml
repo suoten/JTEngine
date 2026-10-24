@@ -1,24 +1,25 @@
 # JTE 镜像发布工作流
 #
-# 触发：推送 tag（v*）自动构建；也可在 Actions 页面手动运行
-# 前提（一次性，仓库 Settings → Secrets and variables → Actions）：
-#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN  —— Docker Hub 账号 + Access Token（hub.docker.com → Account Settings → Security）
-#   ACR_USERNAME / ACR_PASSWORD          —— 阿里云容器镜像服务访问凭证（个人版免费，
-#                                           控制台 → 实例 → 访问凭证，用户名是阿里云全账号，
-#                                           密码在开通时设置）
-# 至少配置一组；两组都配则双仓库同时发布。
+# 触发：推送 master 自动构建（只刷新 :latest）；打 tag（v*）发布正式版；
+# 也可在 Actions 页面手动运行
 #
-# 产出：
-#   JTE 镜像（amd64 + arm64 多架构）：Docker Hub suoten/jt-engine 与 ACR <ns>/jte
-#     标签：latest、stable、v<版本号>
-#   第三方依赖镜像同步到 ACR（国内全家桶 docker-compose.cn.yml 依赖它们；
-#   GH 海外 runner 可正常拉取 Docker Hub，用 imagetools 直传不需要 pull 完整镜像）
+# 镜像目标（三层，按配置逐级启用）：
+#   1. GHCR ghcr.io/suoten/jt-engine     —— 零配置，用内置 GITHUB_TOKEN，推送即自动发布
+#   2. Docker Hub suoten/jt-engine       —— 需 Secrets：DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+#   3. 阿里云 ACR（国内全家桶用）         —— 需 Secrets：ACR_USERNAME / ACR_PASSWORD，
+#      并把 5 个第三方依赖镜像同步到 ACR（国内免费加速器拒绝代理第三方组织镜像）
+#
+# Secrets 配置（仓库 Settings → Secrets and variables → Actions，按仓库隔离，
+# 其他仓库的 Secret 不会自动带过来）：
+#   DOCKERHUB_TOKEN：hub.docker.com → Account Settings → Security → New Access Token
+#   ACR：cr.console.aliyun.com 个人版（免费）→ 访问凭证（用户名是阿里云全账号）
 #
 # 改命名空间：同时修改下方 env 和 jte/docker-compose.cn.yml 的默认值
 name: docker-publish
 
 on:
   push:
+    branches: [master]
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -35,6 +36,9 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     env:
       HAS_DH: ${{ secrets.DOCKERHUB_USERNAME != '' && '1' || '0' }}
       HAS_ACR: ${{ secrets.ACR_USERNAME != '' && '1' || '0' }}
@@ -44,8 +48,7 @@ jobs:
       - name: 检查镜像仓库凭证
         run: |
           if [ "${HAS_DH}" != "1" ] && [ "${HAS_ACR}" != "1" ]; then
-            echo "::error::未配置任何镜像仓库凭证。请到仓库 Settings → Secrets 添加 DOCKERHUB_USERNAME/DOCKERHUB_TOKEN 或 ACR_USERNAME/ACR_PASSWORD"
-            exit 1
+            echo "::notice::未配置 Docker Hub / ACR 凭证，本次仅发布到 GHCR（ghcr.io）。国内用户建议配置 Secrets 以启用 Docker Hub/ACR。"
           fi
 
       - name: 计算版本号
@@ -53,12 +56,25 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-          else
+            echo "flavor=release" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "flavor=release" >> "$GITHUB_OUTPUT"
+          else
+            # master 日常推送：短 SHA 标记，只刷新 :latest，不覆盖 stable/版本标签
+            echo "version=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+            echo "flavor=edge" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR（内置令牌，零配置）
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 登录 Docker Hub
         if: env.HAS_DH == '1'
@@ -79,12 +95,24 @@ jobs:
       - name: 构建并推送 JTE 镜像（多架构）
         run: |
           VER="${{ steps.ver.outputs.version }}"
-          TAGS=""
-          if [ "${HAS_DH}" = "1" ]; then
-            TAGS="$TAGS -t ${DOCKERHUB_REPO}:latest -t ${DOCKERHUB_REPO}:stable -t ${DOCKERHUB_REPO}:v${VER}"
-          fi
-          if [ "${HAS_ACR}" = "1" ]; then
-            TAGS="$TAGS -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:latest -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:stable -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:v${VER}"
+          FLAVOR="${{ steps.ver.outputs.flavor }}"
+          GHCR_REPO="ghcr.io/$(echo '${{ github.repository_owner }}' | tr 'A-Z' 'a-z')/jt-engine"
+          TAGS="-t ${GHCR_REPO}:latest -t ${GHCR_REPO}:sha-${VER}"
+          if [ "${FLAVOR}" = "release" ]; then
+            TAGS="$TAGS -t ${GHCR_REPO}:stable -t ${GHCR_REPO}:v${VER}"
+            if [ "${HAS_DH}" = "1" ]; then
+              TAGS="$TAGS -t ${DOCKERHUB_REPO}:latest -t ${DOCKERHUB_REPO}:stable -t ${DOCKERHUB_REPO}:v${VER}"
+            fi
+            if [ "${HAS_ACR}" = "1" ]; then
+              TAGS="$TAGS -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:latest -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:stable -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:v${VER}"
+            fi
+          else
+            if [ "${HAS_DH}" = "1" ]; then
+              TAGS="$TAGS -t ${DOCKERHUB_REPO}:latest -t ${DOCKERHUB_REPO}:sha-${VER}"
+            fi
+            if [ "${HAS_ACR}" = "1" ]; then
+              TAGS="$TAGS -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:latest -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:sha-${VER}"
+            fi
           fi
           docker buildx build \
             --platform linux/amd64,linux/arm64 \

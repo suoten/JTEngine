@@ -22,6 +22,7 @@ services:
         # 国内构建默认走镜像源，海外可通过环境变量覆盖
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
+        VERSION: ${VERSION:-1.1.0}
     container_name: jte
     restart: unless-stopped
     ports:

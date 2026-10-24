@@ -50,11 +50,14 @@ COPY go.mod go.sum ./
 COPY . .
 COPY --from=frontend-builder /build/web/dist ./web/dist
 
+# 版本号注入 main.Version（运行日志/healthz 会显示，便于远程排障确认构建版本）
+ARG VERSION=dev
+
 # CGO_ENABLED=1：mattn/go-sqlite3 需要 CGO 编译，禁用会导致构建失败
 # -ldflags="-s -w"：去除调试信息，减小二进制体积
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o jte ./cmd/jte/
+    CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w -X main.Version=${VERSION}" -o jte ./cmd/jte/
 
 # =============================================================================
 # Stage 3: 运行时镜像（不含编译工具链）
@@ -70,8 +73,12 @@ LABEL org.opencontainers.image.title="JTE Engine" \
 
 # 安装运行时依赖（不含 gcc/musl-dev 等编译工具链）
 # ca-certificates: TLS 证书；tzdata: 时区；wget: 健康检查
+# /app/data、/app/spool 预创建并赋权：容器以非 root 用户 jte 运行，/app 属主为 root，
+# 运行时创建会 permission denied（sqlite 默认 DSN ./data/jte.db，spool 为离线消息暂存）
 RUN apk --no-cache add ca-certificates tzdata wget \
-    && addgroup -S jte && adduser -S jte -G jte
+    && addgroup -S jte && adduser -S jte -G jte \
+    && mkdir -p /app/data /app/spool \
+    && chown jte:jte /app/data /app/spool
 
 WORKDIR /app
 

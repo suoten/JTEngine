@@ -10,6 +10,7 @@ services:
         # 国内构建默认走镜像源（加速器只代理官方镜像，模块下载需直连国内源），海外可覆盖
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
+        VERSION: ${VERSION:-1.1.0}
     ports:
       - "7611:7611"
       - "8080:8080"

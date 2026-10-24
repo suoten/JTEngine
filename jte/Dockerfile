@@ -29,6 +29,10 @@ RUN npm run build
 # =============================================================================
 FROM golang:1.23-alpine AS backend-builder
 
+# GOPROXY 可通过 build-arg 覆盖；默认 goproxy.cn（国内构建必须，proxy.golang.org 不可达）
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
+
 # 安装 C 编译器（go-sqlite3 依赖 CGO），仅在此阶段存在
 RUN apk --no-cache add gcc musl-dev
 

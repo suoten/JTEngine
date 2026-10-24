@@ -11,7 +11,17 @@
 
 services:
   jte:
-    image: ${JTE_IMAGE:-ghcr.io/suoten/jt-engine:stable}
+    # 默认从本地源码构建（镜像名 jte:local）：只需拉取 node/golang/alpine 官方基础镜像，
+    # 国内加速器可正常代理官方镜像，绕开第三方镜像（minio 等）被加速器拒绝的问题。
+    # 已有预构建镜像时通过环境变量指定：JTE_IMAGE=xxx docker compose -f docker-compose.lite.yml up -d
+    image: ${JTE_IMAGE:-jte:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 国内构建默认走镜像源，海外可通过环境变量覆盖
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
     container_name: jte
     restart: unless-stopped
     ports:

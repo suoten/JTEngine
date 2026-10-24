@@ -1,0 +1,35 @@
+# JTE 精简版部署：单容器（SQLite 存储）
+# 无需 MySQL / TDengine / Redis / MinIO / ZLMediaKit，一条命令起一个能用的平台。
+# 适合：快速体验、演示、小型部署；数据规模大后请换用 docker-compose.yml 全家桶。
+#
+# 启动：  docker compose -f docker-compose.lite.yml up -d
+# 停止：  docker compose -f docker-compose.lite.yml down
+# 看日志：docker logs -f jte
+#
+# 国内网络拉取 ghcr.io 失败时，可切换到 Docker Hub 镜像（受加速源加速）：
+#   JTE_IMAGE=suoten/jt-engine:stable docker compose -f docker-compose.lite.yml up -d
+
+services:
+  jte:
+    image: ${JTE_IMAGE:-ghcr.io/suoten/jt-engine:stable}
+    container_name: jte
+    restart: unless-stopped
+    ports:
+      - "${JTE_GATEWAY_PORT:-7611}:7611"   # JT/T 808 终端接入（TCP）
+      - "${JTE_API_PORT:-8080}:8080"       # 管理后台 / API（HTTP）
+    environment:
+      - JTE_STORAGE_TYPE=${JTE_STORAGE_TYPE:-sqlite}
+    volumes:
+      - jte-data:/app/data                 # SQLite 数据库等持久化数据
+      - jte-spool:/app/spool               # 离线消息暂存
+    # SIGTERM 后等待 30s 让引擎完成优雅关闭（刷写队列、释放资源）
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  jte-data:
+  jte-spool:

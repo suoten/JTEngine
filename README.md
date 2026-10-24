@@ -24,7 +24,7 @@
   <a href="#-60-秒跑起来无需-go-环境">60 秒跑起来</a> •
   <a href="#-为什么选择-jte">为什么选择 JTE</a> •
   <a href="#-功能一览">功能一览</a> •
-  <a href="#-五种部署方式总有一款适合你">部署方式</a> •
+  <a href="#-六种部署方式总有一款适合你">部署方式</a> •
   <a href="#-免费版-vs-付费模块">免费 vs 付费</a> •
   <a href="#-文档导航">文档</a> •
   <a href="https://www.jtengine.cn">官网</a>
@@ -38,6 +38,19 @@
 ---
 
 ## 🚀 60 秒跑起来（无需 Go 环境）
+
+### 方式 ⓪：一键安装脚本（零基础推荐，遇到拉取失败会自动换国内加速源）
+
+**Windows**：下载仓库里的 `install-jte.bat` 和 `install-jte.ps1` 放同一文件夹，双击 `install-jte.bat` 即可。
+（前提：已装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，脚本会在没装 Docker 时引导安装）
+
+**Linux**（一条命令，自动装 Docker、配加速源、起服务）：
+
+```bash
+curl -fsSL https://gitee.com/suoten/jt-engine/raw/master/install-jte.sh | sudo bash
+```
+
+图文步骤见 👉 [小白安装指南](QUICK-INSTALL.md)
 
 ### 方式 ①：Docker 一条命令（最推荐）
 
@@ -179,10 +192,11 @@ graph LR
 
 ---
 
-## 🛠️ 五种部署方式，总有一款适合你
+## 🛠️ 六种部署方式，总有一款适合你
 
 | 方式 | 适合人群 | 难度 | 教程 |
 |------|---------|------|------|
+| **一键安装脚本** | **零基础（推荐）** | **零操作** | [QUICK-INSTALL.md](QUICK-INSTALL.md)（双击/一条命令） |
 | Docker 单容器 | 快速体验 | ⭐ | 本文上方「60 秒跑起来」 |
 | Docker Compose | 生产部署（推荐） | ⭐⭐ | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | 预编译二进制 | 无 Docker 的服务器 | ⭐ | [Releases](https://github.com/suoten/jt-engine/releases) |
@@ -198,6 +212,7 @@ graph LR
 
 | 文档 | 内容 |
 |------|------|
+| [QUICK-INSTALL.md](QUICK-INSTALL.md) | 小白一键安装指南（Windows 双击 / Linux 一条命令） |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | 生产部署完整指南（Docker/K8s/信创） |
 | [BT-PANEL-DEPLOY.md](BT-PANEL-DEPLOY.md) | 宝塔面板截图级部署教程（小白友好） |
 | [DEPLOY-ACTIVATION-GUIDE.md](DEPLOY-ACTIVATION-GUIDE.md) | 授权激活 + 付费模块安装指南 |

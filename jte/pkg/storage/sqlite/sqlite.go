@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,6 +22,13 @@ type SQLiteStore struct {
 }
 
 func NewSQLiteStore(dbPath string, logger *zap.Logger) (*SQLiteStore, error) {
+	// 库文件所在目录可能不存在（如容器未挂载 /app/data 就以 sqlite 模式启动），
+	// sql.Open 不会创建目录，缺目录时报 "no such file or directory"，这里兜底创建
+	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create sqlite data dir %s: %w", dir, err)
+		}
+	}
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)

@@ -32,14 +32,14 @@ gateway:
 
 api:
   enabled: true
-  port: 8090
+  port: 8080
   # AUTO-FIX-2026-06-29 [P1]: cors_origins 禁止配置 ["*"]（与 Allow-Credentials: true
   # 构成危险组合，任意网站可携带凭证跨域访问）。生产环境必须配置具体域名白名单。
   cors_origins:
   - "http://localhost:5173"   # Vite 开发服务器
   - "http://localhost:3000"   # Vite 开发服务器 (jte-dashboard)
-  - "http://localhost:8090"   # 本地访问
-  - "http://127.0.0.1:8090"   # AUTO-FIX-2026-08-31 [P1]: 本机 IP 形式访问（原缺失导致同源 WS 被 403）
+  - "http://localhost:8080"   # 本地访问
+  - "http://127.0.0.1:8080"   # AUTO-FIX-2026-08-31 [P1]: 本机 IP 形式访问（原缺失导致同源 WS 被 403）
   # - "https://jte.example.com"  # 生产环境前端域名
   rate_limit: 100
   jwt:

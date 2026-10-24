@@ -40,7 +40,14 @@ services:
       - JTE_GATEWAY_TCP_PORT=7611
       - JTE_API_PORT=8080
       - JTE_STORAGE_TYPE=${JTE_STORAGE_TYPE:-sqlite}
-      - JTE_ZLMEDIAKIT_URL=http://zlmediakit:80
+      - JTE_ZLMEDIAKIT_URL=${JTE_ZLMEDIAKIT_URL:-http://zlmediakit:80}
+      # 视频（1078）必需：ZLMediaKit 的 API secret（每个新容器随机生成，
+      # 首次启动后 docker exec jte-zlmediakit grep ^secret= /opt/media/conf/config.ini
+      # 读取并写入 .env 的 ZLM_SECRET）与 RTP 固定端口池；
+      # 浏览器播放需把 JTE_ZLMEDIAKIT_URL 设为浏览器可达地址（如 http://服务器IP:1936）
+      - JTE_ZLMEDIAKIT_SECRET=${ZLM_SECRET:-}
+      - JTE_ZLMEDIAKIT_HTTP_PORT=${ZLM_HTTP_PORT:-1936}
+      - JTE_ZLMEDIAKIT_RTP_PORT=10001
       - JTE_MYSQL_HOST=mysql
       - JTE_MYSQL_PORT=3306
       - JTE_MYSQL_DATABASE=${MYSQL_DATABASE:-jte}
@@ -158,7 +165,10 @@ services:
       - "${ZLM_RTSP_PORT:-554}:554"
       - "${ZLM_RTMP_PORT:-1935}:1935"
       - "${ZLM_RTP_PORT:-10000}:10000/udp"
-      - "${ZLM_RTP_TCP_PORT:-10001}:10000"
+      # RTP 固定端口池（对应 JTE_ZLMEDIAKIT_RTP_PORT=10001，池大小 50）：
+      # 自动分配的随机高位端口无法被端口映射覆盖，必须映射固定范围
+      - "10001-10050:10001-10050"
+      - "10001-10050:10001-10050/udp"
     volumes:
       - zlm-data:/opt/media
     healthcheck:

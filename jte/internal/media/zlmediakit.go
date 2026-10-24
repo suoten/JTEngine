@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/suoten/jt-engine/internal/util"
@@ -31,6 +32,8 @@ type ZLMediaKitClient struct {
 	httpClient *http.Client
 	stopCh     chan struct{}
 	stopOnce   sync.Once
+	// rtpPortCursor 固定端口池的轮转游标（原子递增），多路并发流分散到不同端口
+	rtpPortCursor uint32
 }
 
 type StreamInfo struct {
@@ -45,9 +48,9 @@ func NewZLMediaKitClient(cfg *ZLMediaKitConfig, logger *zap.Logger) *ZLMediaKitC
 	if cfg.RTSPPort == 0 {
 		cfg.RTSPPort = 554
 	}
-	if cfg.RTPPort == 0 {
-		cfg.RTPPort = 10000
-	}
+	// FIXED [2026-10-24]: RTPPort 不再兜底为 10000。10000 是 ZLMediaKit rtp_proxy
+	// 的常驻主端口，用作 openRtpServer 固定端口池起始会立即冲突。
+	// RTPPort=0 表示不启用固定端口池（由 ZLMediaKit 自动分配，仅适合非容器部署）。
 	if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 80
 	}
@@ -99,22 +102,32 @@ func (c *ZLMediaKitClient) Stop() {
 }
 
 func (c *ZLMediaKitClient) apiRequest(method, path string, body io.Reader) (map[string]interface{}, error) {
-	url := fmt.Sprintf("%s/index/api/%s", c.config.APIURL, path)
+	// FIXED [2026-10-24]: 官方 ZLMediaKit（release/master 镜像）的 API 鉴权只认
+	// ?secret= 查询参数，不认 X-API-Secret 头——仅传头会得到 code=-100
+	// "Please login first"，导致 openRtpServer 等全部失败。
+	// 查询参数 + Header 双通道：官方镜像与支持 Header 的自编译版本都兼容。
+	if c.config.Secret != "" {
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
+		}
+		path = fmt.Sprintf("%s%ssecret=%s", path, sep, url.QueryEscape(c.config.Secret))
+	}
+
+	reqURL := fmt.Sprintf("%s/index/api/%s", c.config.APIURL, path)
 
 	var req *http.Request
 	var err error
 	if body != nil {
-		req, err = http.NewRequest(method, url, body)
+		req, err = http.NewRequest(method, reqURL, body)
 	} else {
-		req, err = http.NewRequest(method, url, nil)
+		req, err = http.NewRequest(method, reqURL, nil)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	// [P1-1] API secret 改用 Header 传递，避免泄露到 URL 日志。
-	// ZLMediaKit 的 REST API 支持通过 ?secret= 查询参数或 X-API-Secret Header 进行认证。
-	// 使用 Header 更安全：URL query 参数会被反向代理、访问日志、浏览器历史等记录。
+	// 保留 Header 传递（部分自编译版本支持，无此支持的版本会忽略）
 	if c.config.Secret != "" {
 		req.Header.Set("X-API-Secret", c.config.Secret)
 	}
@@ -143,11 +156,46 @@ func (c *ZLMediaKitClient) apiRequest(method, path string, body io.Reader) (map[
 	return result, nil
 }
 
+// rtpPortPoolSize 固定端口池大小：从 rtp_port 起连续本数量个端口，
+// 容器化 ZLMediaKit 部署时映射该范围即可承接全部并发流。
+const rtpPortPoolSize = 50
+
+// StartRTPServer 在 ZLMediaKit 上为 streamID 开启 RTP 收流端口并返回端口号。
+//
+// FIXED [2026-10-24]: openRtpServer?port=0 自动分配的是 30000+ 的随机高位端口，
+// Docker 端口映射无法提前覆盖，容器化 ZLMediaKit 收不到终端推流/引擎转发。
+// 配置 rtp_port>0 时改用固定端口池：从 rtp_port 起按游标轮转取用，
+// 端口被占（并发流或残留状态）时依次尝试池内下一个；池耗尽回退自动分配。
 func (c *ZLMediaKitClient) StartRTPServer(streamID string) (int, error) {
+	if c.config.RTPPort > 0 {
+		first := int(atomic.AddUint32(&c.rtpPortCursor, 1))
+		var lastErr error
+		for i := 0; i < rtpPortPoolSize; i++ {
+			port := c.config.RTPPort + ((first-1+i)%rtpPortPoolSize)
+			p, err := c.openRtpServer(streamID, port)
+			if err == nil {
+				return p, nil
+			}
+			lastErr = err
+			// 流已存在等业务性错误，换端口无意义，直接透传
+			msg := fmt.Sprint(err)
+			if strings.Contains(msg, "exist") || strings.Contains(msg, "存在") {
+				return 0, err
+			}
+			c.logger.Warn("rtp port unavailable, trying next",
+				zap.Int("port", port), zap.Error(err))
+		}
+		c.logger.Warn("rtp port pool exhausted, falling back to auto-allocate",
+			zap.Int("pool_start", c.config.RTPPort), zap.Error(lastErr))
+	}
+	return c.openRtpServer(streamID, 0)
+}
+
+func (c *ZLMediaKitClient) openRtpServer(streamID string, port int) (int, error) {
 	// port=0 lets ZLMediaKit auto-allocate a free port, avoiding conflicts.
 	// tcp_mode 由配置驱动：0=仅 UDP（不传该参数），1=TCP 主动，2=TCP 被动。
 	// FIXED [P2]: streamID 需 URL 编码，防止特殊字符（如 #、&、=）破坏查询参数解析
-	path := fmt.Sprintf("openRtpServer?port=0&stream_id=%s", url.QueryEscape(streamID))
+	path := fmt.Sprintf("openRtpServer?port=%d&stream_id=%s", port, url.QueryEscape(streamID))
 	if c.config.TcpMode > 0 {
 		path = fmt.Sprintf("%s&tcp_mode=%d", path, c.config.TcpMode)
 	}
@@ -156,21 +204,21 @@ func (c *ZLMediaKitClient) StartRTPServer(streamID string) (int, error) {
 		return 0, err
 	}
 
-	port, _ := result["port"].(float64)
-	if port == 0 {
+	allocated, _ := result["port"].(float64)
+	if allocated == 0 {
 		// some versions return the port under data
 		if data, ok := result["data"].(map[string]interface{}); ok {
 			if p, ok := data["port"].(float64); ok {
-				port = p
+				allocated = p
 			}
 		}
 	}
 
 	c.logger.Info("RTP server started",
 		zap.String("stream_id", streamID),
-		zap.Int("port", int(port)))
+		zap.Int("port", int(allocated)))
 
-	return int(port), nil
+	return int(allocated), nil
 }
 
 func (c *ZLMediaKitClient) StopRTPServer(streamID string) error {
@@ -280,13 +328,17 @@ func (c *ZLMediaKitClient) ExchangeSDP(app, stream, sdpOffer string) (string, er
 	// FIXED [P2]: 查询参数需 URL 编码
 	reqURL := fmt.Sprintf("%s/index/api/webrtc?app=%s&stream=%s&type=play",
 		c.config.APIURL, url.QueryEscape(app), url.QueryEscape(stream))
+	// FIXED [2026-10-24]: secret 必须走查询参数（官方 ZLMediaKit 不认 Header，同 apiRequest）
+	if c.config.Secret != "" {
+		reqURL += "&secret=" + url.QueryEscape(c.config.Secret)
+	}
 	reqBody := strings.NewReader(sdpOffer)
 	req, err := http.NewRequest("POST", reqURL, reqBody)
 	if err != nil {
 		return "", fmt.Errorf("create webrtc request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/sdp")
-	// [P1-1] WebRTC 接口同样使用 Header 传递 secret
+	// 保留 Header 传递（部分自编译版本支持）
 	if c.config.Secret != "" {
 		req.Header.Set("X-API-Secret", c.config.Secret)
 	}

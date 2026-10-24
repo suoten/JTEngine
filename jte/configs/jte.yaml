@@ -331,17 +331,22 @@ zlmediakit:
   # - 本地开发（非容器）：http://127.0.0.1:80 正确
   # - docker-compose 部署：必须设置环境变量 JTE_ZLMEDIAKIT_URL=http://zlmediakit:80
   #   （容器内 127.0.0.1 指向容器自身，无法连接 ZLMediaKit 服务）
-  #   见 jte/docker-compose.yml L34 和根目录 docker-compose.yml
+  #   见 jte/docker-compose.yml 和根目录 docker-compose.yml
   url: "http://127.0.0.1:80"
   secret: ""
-  # AUTO-FIX-2026-06-29 [P2]: openRtpServer 的 tcp_mode 配置化。
-  #   0 = 仅 UDP（不传 tcp_mode）
-  #   1 = TCP 主动模式（默认，ZLM 主动连接上游 1078 引擎）
-  #   2 = TCP 被动模式（ZLM 监听等待上游连接）
-  # 缺省时 media.NewZLMediaKitClient 兜底为 1，保持修复前硬编码行为。
-  tcp_mode: 1
-
-# AUTO-FIX-2026-06-26: TCP-RTP支持配置（按第一轮.txt要求）[2026-06-26]
+  # 流媒体端口：生成浏览器播放地址（FLV/HLS）与终端推流地址用。
+  # ZLMediaKit 的 HTTP 端口若非 80（如宿主机映射为 1936），必须通过环境变量
+  # JTE_ZLMEDIAKIT_HTTP_PORT 同步设置，否则播放地址会带错误端口。
+  # 注意：viper 的 AutomaticEnv 只对配置文件中已存在的键生效，故此处必须显式声明。
+  http_port: 80
+  rtsp_port: 554
+  # RTP 收流固定端口池起始端口（池大小 50，端口池内轮转分配）：
+  # 容器化 ZLMediaKit 必须配置（如 10001）并映射对应端口范围
+  # （10001-10050 的 udp+tcp），否则自动分配的随机高位端口无法被
+  # Docker 端口映射覆盖，终端推流/引擎转发都到不了容器。
+  # 0 = 不启用固定端口池（ZLMediaKit 自动分配，仅适合非容器部署）。
+  # 从 10001 起：10000 是 ZLMediaKit rtp_proxy 的常驻主端口，不可复用。
+  rtp_port: 0
 video:
   rtp_mode: "udp"        # udp/tcp/auto，tcp时启动TCP-RTP监听器
   stream_port: 0         # TCP-RTP监听端口，0=不启动，推荐9000

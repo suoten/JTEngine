@@ -96,6 +96,51 @@ curl -fsSL https://gitee.com/suoten/jt-engine/raw/master/install-jte.sh | sudo b
 
 ---
 
+## 加挂 1078 视频功能（可选）
+
+视频播放需要 ZLMediaKit 流媒体服务，精简版/单容器默认不带。加挂三步：
+
+**第 1 步：跑起 ZLMediaKit 容器**
+
+```bash
+docker volume create zlm-conf
+docker run -d --name zlm --restart unless-stopped \
+  -v zlm-conf:/opt/media/conf \
+  -p 1936:80 -p 554:554 -p 1935:1935 \
+  -p 10001-10050:10001-10050 -p 10001-10050:10001-10050/udp \
+  zlmediakit/zlmediakit:master
+```
+
+> 国内网络拉不动官方 ZLMediaKit 镜像（第三方镜像被加速器拒绝），到仓库
+> Releases 或群文件下载离线包后 `docker load -i zlmediakit.tar` 再执行上述命令。
+
+**第 2 步：固定 API secret（新版 ZLM 每个新容器随机生成，必须固定）**
+
+```bash
+docker exec zlm sed -i 's/^secret=.*/secret=jte2026video/' /opt/media/conf/config.ini
+docker restart zlm
+```
+
+**第 3 步：重建 JTE 容器接入**（`192.168.x.x` 换成本机局域网 IP——终端设备、
+浏览器、JTE 容器三方都要能访问这个地址）
+
+```bash
+docker rm -f jte
+docker run -d --name jte -p 7611:7611 -p 8080:8080 \
+  -e JTE_STORAGE_TYPE=sqlite -v jte-data:/app/data \
+  -e JTE_ZLMEDIAKIT_URL=http://192.168.x.x:1936 \
+  -e JTE_ZLMEDIAKIT_SECRET=jte2026video \
+  -e JTE_ZLMEDIAKIT_HTTP_PORT=1936 \
+  -e JTE_ZLMEDIAKIT_RTP_PORT=10001 \
+  --restart unless-stopped \
+  suoten/jt-engine:stable
+```
+
+然后到管理后台"视频预览"选设备通道播放。终端设备需能访问到
+`你的IP:10001-10050`（RTP 推流端口池）。
+
+---
+
 ## 常见问题
 
 ### 1. Docker 拉镜像报错 403 Forbidden / failed size validation

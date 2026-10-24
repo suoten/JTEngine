@@ -1,0 +1,113 @@
+# JTE 镜像发布工作流
+#
+# 触发：推送 tag（v*）自动构建；也可在 Actions 页面手动运行
+# 前提（一次性，仓库 Settings → Secrets and variables → Actions）：
+#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN  —— Docker Hub 账号 + Access Token（hub.docker.com → Account Settings → Security）
+#   ACR_USERNAME / ACR_PASSWORD          —— 阿里云容器镜像服务访问凭证（个人版免费，
+#                                           控制台 → 实例 → 访问凭证，用户名是阿里云全账号，
+#                                           密码在开通时设置）
+# 至少配置一组；两组都配则双仓库同时发布。
+#
+# 产出：
+#   JTE 镜像（amd64 + arm64 多架构）：Docker Hub suoten/jt-engine 与 ACR <ns>/jte
+#     标签：latest、stable、v<版本号>
+#   第三方依赖镜像同步到 ACR（国内全家桶 docker-compose.cn.yml 依赖它们；
+#   GH 海外 runner 可正常拉取 Docker Hub，用 imagetools 直传不需要 pull 完整镜像）
+#
+# 改命名空间：同时修改下方 env 和 jte/docker-compose.cn.yml 的默认值
+name: docker-publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不带 v，如 1.1.0）'
+        required: true
+        default: '1.1.0'
+
+env:
+  DOCKERHUB_REPO: suoten/jt-engine
+  ACR_HOST: registry.cn-hangzhou.aliyuncs.com
+  ACR_NAMESPACE: suoten
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      HAS_DH: ${{ secrets.DOCKERHUB_USERNAME != '' && '1' || '0' }}
+      HAS_ACR: ${{ secrets.ACR_USERNAME != '' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查镜像仓库凭证
+        run: |
+          if [ "${HAS_DH}" != "1" ] && [ "${HAS_ACR}" != "1" ]; then
+            echo "::error::未配置任何镜像仓库凭证。请到仓库 Settings → Secrets 添加 DOCKERHUB_USERNAME/DOCKERHUB_TOKEN 或 ACR_USERNAME/ACR_PASSWORD"
+            exit 1
+          fi
+
+      - name: 计算版本号
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        if: env.HAS_DH == '1'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 登录阿里云 ACR
+        if: env.HAS_ACR == '1'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_HOST }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      # arm64 + CGO（go-sqlite3）在 QEMU 下编译较慢（约 20-40 分钟），属正常
+      - name: 构建并推送 JTE 镜像（多架构）
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          TAGS=""
+          if [ "${HAS_DH}" = "1" ]; then
+            TAGS="$TAGS -t ${DOCKERHUB_REPO}:latest -t ${DOCKERHUB_REPO}:stable -t ${DOCKERHUB_REPO}:v${VER}"
+          fi
+          if [ "${HAS_ACR}" = "1" ]; then
+            TAGS="$TAGS -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:latest -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:stable -t ${ACR_HOST}/${ACR_NAMESPACE}/jte:v${VER}"
+          fi
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="${VER}" \
+            ${TAGS} \
+            --push ./jte
+
+      # 同步第三方依赖镜像到 ACR：国内免费加速器拒绝代理第三方组织镜像，
+      # 全家桶在国内的唯一可行路径。imagetools create 直接跨仓库复制 manifest，
+      # 不需要 pull/push 完整镜像层
+      - name: 同步第三方依赖镜像到 ACR
+        if: env.HAS_ACR == '1'
+        run: |
+          for img in \
+            "mysql:8.0" \
+            "redis:7-alpine" \
+            "tdengine/tdengine:3.3.2.0" \
+            "minio/minio:RELEASE.2024-07-16T15-48-33Z" \
+            "zlmediakit/zlmediakit:release-12.0.0"
+          do
+            tag="${img##*:}"
+            flat="$(echo "${img%:*}" | tr '/' '-')"
+            echo "==> docker.io/${img} -> ${ACR_HOST}/${ACR_NAMESPACE}/${flat}:${tag}"
+            docker buildx imagetools create -t "${ACR_HOST}/${ACR_NAMESPACE}/${flat}:${tag}" "docker.io/${img}"
+          done
+          echo "全部依赖镜像同步完成，国内可用 docker-compose.cn.yml 一键全家桶"

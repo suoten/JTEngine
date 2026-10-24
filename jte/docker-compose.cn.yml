@@ -1,0 +1,187 @@
+# JTE 国内全家桶部署（MySQL + Redis + TDengine + MinIO + ZLMediaKit）
+#
+# 与 docker-compose.yml 的区别：所有第三方镜像改从阿里云 ACR 拉取，
+# 绕开"国内免费加速器拒绝代理第三方组织镜像（403）"的问题；
+# jte 用预构建镜像，不再本地构建。
+#
+# 前提：docker-publish 工作流已把依赖镜像同步到你的 ACR 命名空间
+# （见 .github/workflows/docker-publish.yml，打 tag 或手动触发即同步）。
+#
+# 用法：
+#   docker compose -f docker-compose.cn.yml up -d
+#   命名空间不同时：JTE_REGISTRY=registry.cn-hangzhou.aliyuncs.com/你的命名空间 \
+#     docker compose -f docker-compose.cn.yml up -d
+#
+# 默认 JTE_REGISTRY 与 docker-publish.yml 的 ACR_HOST/ACR_NAMESPACE 保持一致，
+# 改动需同步两处。
+
+services:
+  jte:
+    image: ${JTE_REGISTRY:-registry.cn-hangzhou.aliyuncs.com/suoten}/jte:stable
+    ports:
+      - "${JTE_GATEWAY_PORT:-7611}:7611"
+      - "${JTE_API_PORT:-8080}:8080"
+    volumes:
+      - jte-logs:/app/logs
+      - jte-spool:/app/spool
+      - jte-data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      tdengine:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      zlmediakit:
+        condition: service_healthy
+    environment:
+      - JTE_GATEWAY_TCP_PORT=7611
+      - JTE_API_PORT=8080
+      - JTE_STORAGE_TYPE=${JTE_STORAGE_TYPE:-sqlite}
+      - JTE_ZLMEDIAKIT_URL=http://zlmediakit:80
+      - JTE_MYSQL_HOST=mysql
+      - JTE_MYSQL_PORT=3306
+      - JTE_MYSQL_DATABASE=${MYSQL_DATABASE:-jte}
+      - JTE_MYSQL_USER=${MYSQL_USER:-jte}
+      - JTE_MYSQL_PASSWORD=${MYSQL_PASSWORD:-jte}
+      - JTE_REDIS_HOST=redis
+      - JTE_REDIS_PORT=6379
+      - JTE_REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - JTE_TDENGINE_HOST=tdengine
+      - JTE_TDENGINE_PORT=6030
+      - JTE_TDENGINE_WS_PORT=6041
+      - JTE_MINIO_ENDPOINT=minio:9000
+      - JTE_MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - JTE_MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+    healthcheck:
+      test: ["CMD-SHELL", "if [ \"$$JTE_API_TLS_ENABLED\" = \"true\" ]; then wget -qO- --no-check-certificate https://localhost:8080/healthz; else wget -qO- http://localhost:8080/healthz; fi || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - jte-net
+
+  mysql:
+    image: ${JTE_REGISTRY:-registry.cn-hangzhou.aliyuncs.com/suoten}/mysql:8.0
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-root}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-jte}
+      - MYSQL_USER=${MYSQL_USER:-jte}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-jte}
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - jte-net
+
+  redis:
+    image: ${JTE_REGISTRY:-registry.cn-hangzhou.aliyuncs.com/suoten}/redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ${REDIS_PASSWORD:+-a $$REDIS_PASSWORD} ping | grep PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - jte-net
+
+  tdengine:
+    image: ${JTE_REGISTRY:-registry.cn-hangzhou.aliyuncs.com/suoten}/tdengine-tdengine:3.3.2.0
+    ports:
+      - "${TDENGINE_PORT:-6030}:6030"
+      - "${TDENGINE_WS_PORT:-6041}:6041"
+      - "6043-6049:6043-6049"
+      - "6043-6049:6043-6049/udp"
+    volumes:
+      - tdengine-data:/var/lib/taos
+      - tdengine-log:/var/log/taos
+    environment:
+      - TAOS_FQDN=tdengine
+    healthcheck:
+      test: ["CMD", "taos", "-s", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - jte-net
+
+  minio:
+    image: ${JTE_REGISTRY:-registry.cn-hangzhou.aliyuncs.com/suoten}/minio-minio:RELEASE.2024-07-16T15-48-33Z
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - jte-net
+
+  zlmediakit:
+    image: ${JTE_REGISTRY:-registry.cn-hangzhou.aliyuncs.com/suoten}/zlmediakit-zlmediakit:release-12.0.0
+    ports:
+      - "${ZLM_HTTP_PORT:-1936}:80"
+      - "${ZLM_RTSP_PORT:-554}:554"
+      - "${ZLM_RTMP_PORT:-1935}:1935"
+      - "${ZLM_RTP_PORT:-10000}:10000/udp"
+      - "${ZLM_RTP_TCP_PORT:-10001}:10000"
+    volumes:
+      - zlm-data:/opt/media
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/index/api/getServerConfig || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - jte-net
+
+volumes:
+  zlm-data:
+  mysql-data:
+  redis-data:
+  tdengine-data:
+  tdengine-log:
+  minio-data:
+  jte-logs:
+  jte-spool:
+  jte-data:
+
+networks:
+  jte-net:
+    driver: bridge

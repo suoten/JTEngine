@@ -1,4 +1,6 @@
-# syntax=docker/dockerfile:1.7
+# 注意：不要加 `# syntax=docker/dockerfile:1.x` 指令——它会让冷构建额外拉取
+# docker/dockerfile 镜像（国内网络的又一个依赖点）。Docker 23+/BuildKit 内置
+# 前端已支持本文件用到的 --mount=type=cache、COPY --chown、多阶段构建。
 # AUTO-FIX-2026-07-21 [P1-可靠性]: Dockerfile 优化
 # - 基础镜像 alpine:3.19 → alpine:3.20（最新稳定版，安全补丁更及时）
 # - 添加 --mount=type=cache BuildKit 缓存优化（Go module + npm + go-build）

@@ -605,7 +605,7 @@ func streamH264(conn net.Conn, phone string, units []accessUnit, fps int, stopCh
 				rtpSeq++
 				hdr := make([]byte, 12)
 				hdr[0] = 0x80
-				hdr[1] = 96
+				hdr[1] = 98
 				if ci == len(chunks)-1 {
 					hdr[1] |= 0x80 // marker: 帧末包
 				}

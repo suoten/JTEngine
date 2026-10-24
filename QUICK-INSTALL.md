@@ -98,21 +98,24 @@ curl -fsSL https://gitee.com/suoten/jt-engine/raw/master/install-jte.sh | sudo b
 
 ## 加挂 1078 视频功能（可选）
 
-视频播放需要 ZLMediaKit 流媒体服务，精简版/单容器默认不带。加挂三步：
+视频播放需要 ZLMediaKit 流媒体服务，精简版/单容器默认不带。加挂四步：
 
-**第 1 步：跑起 ZLMediaKit 容器**
+**第 1 步：跑起 ZLMediaKit 容器（与 JTE 同一 docker 网络）**
 
 ```bash
+docker load -i zlmediakit.tar        # 国内离线包（ Releases/群文件下载）
+docker network create jte-media
 docker volume create zlm-conf
 docker run -d --name zlm --restart unless-stopped \
+  --network jte-media \
   -v zlm-conf:/opt/media/conf \
   -p 1936:80 -p 554:554 -p 1935:1935 \
   -p 10001-10050:10001-10050 -p 10001-10050:10001-10050/udp \
   zlmediakit/zlmediakit:master
 ```
 
-> 国内网络拉不动官方 ZLMediaKit 镜像（第三方镜像被加速器拒绝），到仓库
-> Releases 或群文件下载离线包后 `docker load -i zlmediakit.tar` 再执行上述命令。
+> ⚠️ JTE 与 ZLMediaKit 必须在同一个 docker 网络里**容器直连**——实测容器经
+> 宿主机 IP 回环发 UDP 会被 Docker 端口映射丢弃（API 是 TCP 能通，RTP 是 UDP 不通）。
 
 **第 2 步：固定 API secret（新版 ZLM 每个新容器随机生成，必须固定）**
 
@@ -121,14 +124,19 @@ docker exec zlm sed -i 's/^secret=.*/secret=jte2026video/' /opt/media/conf/confi
 docker restart zlm
 ```
 
-**第 3 步：重建 JTE 容器接入**（`192.168.x.x` 换成本机局域网 IP——终端设备、
-浏览器、JTE 容器三方都要能访问这个地址）
+**第 3 步：查本机局域网 IP**
+
+Mac：`ipconfig getifaddr en0`；Linux：`hostname -I | awk '{print $1}'`（得到类似 192.168.1.23）
+
+**第 4 步：重建 JTE 容器接入**（IP 换成第 3 步的结果）
 
 ```bash
 docker rm -f jte
 docker run -d --name jte -p 7611:7611 -p 8080:8080 \
+  --network jte-media \
   -e JTE_STORAGE_TYPE=sqlite -v jte-data:/app/data \
-  -e JTE_ZLMEDIAKIT_URL=http://192.168.x.x:1936 \
+  -e JTE_ZLMEDIAKIT_URL=http://zlm:80 \
+  -e JTE_ZLMEDIAKIT_PUBLIC_URL=http://192.168.1.23:1936 \
   -e JTE_ZLMEDIAKIT_SECRET=jte2026video \
   -e JTE_ZLMEDIAKIT_HTTP_PORT=1936 \
   -e JTE_ZLMEDIAKIT_RTP_PORT=10001 \
@@ -136,8 +144,12 @@ docker run -d --name jte -p 7611:7611 -p 8080:8080 \
   suoten/jt-engine:stable
 ```
 
-然后到管理后台"视频预览"选设备通道播放。终端设备需能访问到
-`你的IP:10001-10050`（RTP 推流端口池）。
+两个地址的分工（v1.1.2+）：`URL` 是容器内地址（API 调用与 RTP 转发走它），
+`PUBLIC_URL` 是对外地址（浏览器 FLV/HLS 播放地址、下发给终端的推流地址走它）。
+
+然后到管理后台"视频预览"选设备通道播放。要求：车载终端能访问到
+`你的IP:10001-10050`（RTP 推流端口池），即设备与服务器同网或在公网可达；
+终端的"平台IP"填这台机器的 IP。
 
 ---
 

@@ -17,6 +17,9 @@ import (
 
 type ZLMediaKitConfig struct {
 	APIURL      string `json:"api_url" yaml:"api_url"`
+	// PublicURL 对外播放/推流地址（浏览器与终端可达）。容器化部署中 APIURL
+	// 是容器内地址，播放地址与终端推流地址需用对外地址，两者分离。
+	PublicURL   string `json:"public_url" yaml:"public_url"`
 	Secret      string `json:"secret" yaml:"secret"`
 	RTSPPort    int    `json:"rtsp_port" yaml:"rtsp_port"`
 	RTPPort     int    `json:"rtp_port" yaml:"rtp_port"`
@@ -57,10 +60,13 @@ func NewZLMediaKitClient(cfg *ZLMediaKitConfig, logger *zap.Logger) *ZLMediaKitC
 	if cfg.StreamIdle == 0 {
 		cfg.StreamIdle = 30
 	}
-	// TcpMode 缺省兜底为 1（TCP 主动模式），保持修复前的硬编码行为，
-	// 避免既有部署因未配置 tcp_mode 而回退到纯 UDP 导致 RTP 不通。
-	if cfg.TcpMode == 0 {
-		cfg.TcpMode = 1
+	// FIXED [2026-10-24]: 不再把 TcpMode=0 强转为 1。ZLMediaKit openRtpServer 的
+	// tcp_mode=1 是 TCP 被动监听（只开 TCP 端口），而 1078 引擎的 0x1200 转发
+	// 和绝大多数部标终端推流走 UDP——tcp_mode=1 时 UDP 包无人接收，全部丢失
+	// （实测 ZLM 日志仅有 TCP 监听 + RtpProcess timeout，对端 :::0）。
+	// 0 = UDP（默认，部标标准形态），1 = TCP 被动，2 = TCP 主动。
+	if cfg.TcpMode < 0 {
+		cfg.TcpMode = 0
 	}
 
 	return &ZLMediaKitClient{
@@ -233,7 +239,15 @@ func (c *ZLMediaKitClient) StopRTPServer(streamID string) error {
 }
 
 func (c *ZLMediaKitClient) GetStreamURL(app, stream string, schema string) string {
-	host := strings.TrimPrefix(c.config.APIURL, "http://")
+	// FIXED [2026-10-24]: 播放地址主机优先取 PublicURL（浏览器/终端可达的对外地址）。
+	// 容器化部署中 APIURL 是容器内地址（API 调用与 RTP 转发用），若用它拼播放
+	// 地址，浏览器无法解析容器名/容器 IP；PublicURL 未配置时沿用 APIURL
+	// （API 与播放同址的传统部署形态）。
+	src := c.config.APIURL
+	if c.config.PublicURL != "" {
+		src = c.config.PublicURL
+	}
+	host := strings.TrimPrefix(src, "http://")
 	host = strings.TrimPrefix(host, "https://")
 	// 去除 APIURL 中可能包含的端口部分，避免生成 "host:apiport:streamport" 双端口 URL
 	if idx := strings.LastIndex(host, ":"); idx > 0 {

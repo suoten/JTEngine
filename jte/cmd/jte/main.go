@@ -523,6 +523,7 @@ func NewApp() (*App, error) {
 		if cfg.ZLMediaKit.URL != "" {
 			mediaClient := media.NewZLMediaKitClient(&media.ZLMediaKitConfig{
 				APIURL:      cfg.ZLMediaKit.URL,
+				PublicURL:   cfg.ZLMediaKit.PublicURL,
 				Secret:      cfg.ZLMediaKit.Secret,
 				RTSPPort:    cfg.ZLMediaKit.RTSPPort,
 				RTPPort:     cfg.ZLMediaKit.RTPPort,

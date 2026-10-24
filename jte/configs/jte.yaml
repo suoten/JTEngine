@@ -333,6 +333,12 @@ zlmediakit:
   #   （容器内 127.0.0.1 指向容器自身，无法连接 ZLMediaKit 服务）
   #   见 jte/docker-compose.yml 和根目录 docker-compose.yml
   url: "http://127.0.0.1:80"
+  # 对外播放/推流地址（浏览器与终端可达，如 http://192.168.1.10:1936）。
+  # 容器化部署必配：url 填容器内地址（API/转发用，如 http://zlmediakit:80），
+  # public_url 填对外地址（浏览器 FLV/HLS 播放与 0x9101 终端推流地址用）。
+  # 未配置时沿用 url（API 与播放同址的传统部署形态）。
+  # 环境变量 JTE_ZLMEDIAKIT_PUBLIC_URL 可覆盖。
+  public_url: ""
   secret: ""
   # 流媒体端口：生成浏览器播放地址（FLV/HLS）与终端推流地址用。
   # ZLMediaKit 的 HTTP 端口若非 80（如宿主机映射为 1936），必须通过环境变量
@@ -347,6 +353,12 @@ zlmediakit:
   # 0 = 不启用固定端口池（ZLMediaKit 自动分配，仅适合非容器部署）。
   # 从 10001 起：10000 是 ZLMediaKit rtp_proxy 的常驻主端口，不可复用。
   rtp_port: 0
+  # openRtpServer 的 tcp_mode：
+  #   0 = UDP（默认。1078 引擎的 0x1200 转发和部标终端推流均走 UDP；
+  #        实测 tcp_mode=1 时 ZLM 只开 TCP 监听，UDP 包全部丢失）
+  #   1 = TCP 被动（ZLM 监听，适合明确配置走 TCP 推流的终端）
+  #   2 = TCP 主动
+  tcp_mode: 0
 video:
   rtp_mode: "udp"        # udp/tcp/auto，tcp时启动TCP-RTP监听器
   stream_port: 0         # TCP-RTP监听端口，0=不启动，推荐9000

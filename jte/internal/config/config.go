@@ -605,11 +605,16 @@ type DownstreamPlatformConfig struct {
 
 type ZLMediaKitConfig struct {
 	URL        string `mapstructure:"url"`
-	Secret     string `mapstructure:"secret"`
-	RTSPPort   int    `mapstructure:"rtsp_port"`
-	RTPPort    int    `mapstructure:"rtp_port"`
-	HTTPPort   int    `mapstructure:"http_port"`
-	StreamIdle int    `mapstructure:"stream_idle"`
+	// PublicURL 对外播放/推流地址（浏览器与终端可达），如 http://192.168.1.10:1936。
+	// Docker 部署中 url 指向容器内地址（API 调用与 0x1200 RTP 转发，如
+	// http://zlmediakit:80），播放地址与 0x9101 下发给终端的推流地址则取
+	// PublicURL 的主机名；未配置时沿用 url（API 与播放同址的传统形态）。
+	PublicURL   string `mapstructure:"public_url"`
+	Secret      string `mapstructure:"secret"`
+	RTSPPort    int    `mapstructure:"rtsp_port"`
+	RTPPort     int    `mapstructure:"rtp_port"`
+	HTTPPort    int    `mapstructure:"http_port"`
+	StreamIdle  int    `mapstructure:"stream_idle"`
 	// TcpMode 控制 ZLMediaKit openRtpServer 的 tcp_mode 参数：
 	//   0 = 仅 UDP（不传 tcp_mode）
 	//   1 = TCP 主动模式（passive=1，ZLM 主动连接上游）

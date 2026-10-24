@@ -419,8 +419,13 @@ func (h *MediaHandler) Start(c *gin.Context) {
 		if h.commandSender != nil {
 			// AUTO-FIX-2026-06-29 [P1-7]: 填充 0x9101 的 IP/Port 字段并设置传输模式。
 			// 原实现 IPAddress/Port 始终为零值，终端无法获知 RTP 推流地址。
-			// 从 ZLMediaKit URL 提取主机 IP，填入分配的 RTP 端口。
-			zlmHost := extractHost(h.cfg.ZLMediaKit.URL)
+			// FIXED [2026-10-24]: 终端推流地址优先取 PublicURL（终端可达的对外地址）；
+			// 容器化部署中 URL 是容器内地址，终端无法解析容器名/容器 IP。
+			zlmPushURL := h.cfg.ZLMediaKit.URL
+			if h.cfg.ZLMediaKit.PublicURL != "" {
+				zlmPushURL = h.cfg.ZLMediaKit.PublicURL
+			}
+			zlmHost := extractHost(zlmPushURL)
 			rtpMode := h.cfg.Video.RTPMode
 			if rtpMode == "" {
 				rtpMode = "udp"
@@ -732,7 +737,12 @@ func (h *MediaHandler) SwitchStream(c *gin.Context) {
 			rtpPort = p
 		}
 	}
-	zlmHost := extractHost(h.cfg.ZLMediaKit.URL)
+	// FIXED [2026-10-24]: 与 media/start 一致，重连下发的 0x9101 推流地址优先取 PublicURL
+	zlmPushURL := h.cfg.ZLMediaKit.URL
+	if h.cfg.ZLMediaKit.PublicURL != "" {
+		zlmPushURL = h.cfg.ZLMediaKit.PublicURL
+	}
+	zlmHost := extractHost(zlmPushURL)
 	rtpMode := h.cfg.Video.RTPMode
 	if rtpMode == "" {
 		rtpMode = "udp"

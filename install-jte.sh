@@ -23,7 +23,7 @@ GATEWAY_PORT="${JTE_GATEWAY_PORT:-7611}"
 # 镜像候选：按顺序尝试，第一个成功的生效（可用环境变量 JTE_IMAGE 强制指定）
 IMAGE_CANDIDATES=()
 [ -n "${JTE_IMAGE:-}" ] && IMAGE_CANDIDATES+=("$JTE_IMAGE")
-IMAGE_CANDIDATES+=("ghcr.io/suoten/jt-engine:stable" "suoten/jt-engine:stable")
+IMAGE_CANDIDATES+=("suoten/jt-engine:stable" "ghcr.io/suoten/jt-engine:stable")
 
 # Docker Hub 加速源候选：拉取失败时逐个写入 daemon.json 重试。
 # 公共加速源可用性会变化；建议注册阿里云使用专属加速器（优先读 JTE_MIRROR）：

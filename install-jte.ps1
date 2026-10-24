@@ -36,7 +36,7 @@ $ContainerName = 'jte'
 
 # param 默认值不支持管道表达式，候选列表在此构建（空值/空白项被过滤）
 if (-not $ImageCandidates) {
-    $ImageCandidates = @($env:JTE_IMAGE, 'ghcr.io/suoten/jt-engine:stable', 'suoten/jt-engine:stable') |
+    $ImageCandidates = @($env:JTE_IMAGE, 'suoten/jt-engine:stable', 'ghcr.io/suoten/jt-engine:stable') |
         Where-Object { $_ -and $_.Trim() }
 }
 if (-not $RegistryMirrors) {

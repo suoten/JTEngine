@@ -61,16 +61,16 @@ chmod +x jte
 - **Windows/Mac**：下载安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，装完重启电脑，打开它等左下角变绿
 - **Linux**：`curl -fsSL https://get.docker.com | sh -s -- --mirror Aliyun`
 
-### 第 2 步：拉代码并构建启动
+### 第 2 步：拉代码并启动（拉取预构建镜像，约 1 分钟）
 
 ```bash
 git clone https://gitee.com/suoten/jt-engine.git   # 国内用 Gitee
 cd jt-engine/jte
-docker compose -f docker-compose.lite.yml up -d --build
+docker compose -f docker-compose.lite.yml up -d
 ```
 
-首次构建约 10-20 分钟（从源码编译，只需拉取官方基础镜像，国内加速器都能拉）。
-之后日常启停：`docker compose -f docker-compose.lite.yml up -d` / `down`。
+镜像来自 Docker Hub（国内加速器实测可拉）。日常启停：
+`docker compose -f docker-compose.lite.yml up -d` / `down`。
 
 ### 第 3 步：打开后台
 
@@ -81,10 +81,18 @@ docker compose -f docker-compose.lite.yml up -d --build
 
 ---
 
-## 路径 C：一键安装脚本（预构建镜像发布后开放）
+## 路径 C：一键安装脚本（全自动）
 
-官方镜像发布到 Docker Hub / 阿里云 ACR 之后，Windows 双击 `install-jte.bat`、
-Linux 一条命令即可全自动安装（自动配加速源、自动重试）。当前请先用路径 A / B。
+**Windows**：从仓库下载 `install-jte.bat` 和 `install-jte.ps1` 放同一文件夹，双击 `install-jte.bat`。
+没装 Docker 会引导安装；拉取镜像失败会自动配置国内加速源并重启 Docker 重试。
+
+**Linux**（一条命令，自动装 Docker、配加速源、起服务）：
+
+```bash
+curl -fsSL https://gitee.com/suoten/jt-engine/raw/master/install-jte.sh | sudo bash
+```
+
+装完自动打印访问地址和默认账号，升级 = 重新运行一次（数据不丢）。
 
 ---
 

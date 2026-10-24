@@ -39,9 +39,7 @@
 
 ## 🚀 60 秒跑起来（无需 Go 环境）
 
-### 方式 ⓪：一键安装脚本（零基础；依赖的预构建镜像发布后开放）
-
-> 🐧 本方式依赖的预构建镜像（Docker Hub / 阿里云 ACR）即将发布，**发布前请先用方式 ① 或 ②**。
+### 方式 ⓪：一键安装脚本（零基础推荐，拉取失败会自动换国内加速源重试）
 
 **Windows**：下载仓库里的 `install-jte.bat` 和 `install-jte.ps1` 放同一文件夹，双击 `install-jte.bat` 即可。
 （前提：已装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，脚本会在没装 Docker 时引导安装）
@@ -54,19 +52,29 @@ curl -fsSL https://gitee.com/suoten/jt-engine/raw/master/install-jte.sh | sudo b
 
 图文步骤见 👉 [小白安装指南](QUICK-INSTALL.md)
 
-### 方式 ①：Docker 精简版（单容器 + SQLite，国内网络亲测可用）
+### 方式 ①：Docker 一条命令（镜像已发布，国内加速器实测可拉）
 
-已装 Docker 的用户三条命令搞定。镜像从源码本地构建，只需拉取 node/golang/alpine
-**官方基础镜像**——国内加速器（阿里云等）都能正常代理这类镜像：
+```bash
+docker run -d --name jte \
+  -p 7611:7611 -p 8080:8080 \
+  -e JTE_STORAGE_TYPE=sqlite \
+  -v jte-data:/app/data \
+  --restart unless-stopped \
+  suoten/jt-engine:stable
+```
+
+SQLite 持久化（数据在 `jte-data` 卷，升级重启不丢）。海外用户也可用 `ghcr.io/suoten/jt-engine:stable`。
+
+> 🐧 国内网络提示：需 Docker 加速器正常工作（阿里云/daocloud 等均可，已实测可拉取本镜像）；
+> 个别加速器若拒绝，换 `https://docker.m.daocloud.io` 等再试。
+
+不想敲命令的，用精简编排（效果同上，多行更好维护）：
 
 ```bash
 git clone https://gitee.com/suoten/jt-engine.git   # 国内用 Gitee；海外可用 GitHub
 cd jt-engine/jte
-docker compose -f docker-compose.lite.yml up -d --build
+docker compose -f docker-compose.lite.yml up -d
 ```
-
-首次构建约 10-20 分钟；之后启动/停止直接 `docker compose -f docker-compose.lite.yml up -d` / `down`。
-SQLite 持久化存储（数据卷，升级重启数据不丢）。
 
 | 你要做的事 | 地址 / 命令 |
 |-----------|------------|

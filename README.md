@@ -39,7 +39,9 @@
 
 ## 🚀 60 秒跑起来（无需 Go 环境）
 
-### 方式 ⓪：一键安装脚本（零基础推荐，遇到拉取失败会自动换国内加速源）
+### 方式 ⓪：一键安装脚本（零基础；依赖的预构建镜像发布后开放）
+
+> 🐧 本方式依赖的预构建镜像（Docker Hub / 阿里云 ACR）即将发布，**发布前请先用方式 ① 或 ②**。
 
 **Windows**：下载仓库里的 `install-jte.bat` 和 `install-jte.ps1` 放同一文件夹，双击 `install-jte.bat` 即可。
 （前提：已装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，脚本会在没装 Docker 时引导安装）
@@ -52,17 +54,19 @@ curl -fsSL https://gitee.com/suoten/jt-engine/raw/master/install-jte.sh | sudo b
 
 图文步骤见 👉 [小白安装指南](QUICK-INSTALL.md)
 
-### 方式 ①：Docker 一条命令（最推荐）
+### 方式 ①：Docker 精简版（单容器 + SQLite，国内网络亲测可用）
 
-只要你装了 Docker，复制这一行：
+已装 Docker 的用户三条命令搞定。镜像从源码本地构建，只需拉取 node/golang/alpine
+**官方基础镜像**——国内加速器（阿里云等）都能正常代理这类镜像：
 
 ```bash
-docker run -d --name jte \
-  -p 7611:7611 -p 8080:8080 \
-  ghcr.io/suoten/jt-engine:stable
+git clone https://gitee.com/suoten/jt-engine.git   # 国内用 Gitee；海外可用 GitHub
+cd jt-engine/jte
+docker compose -f docker-compose.lite.yml up -d --build
 ```
 
-然后：
+首次构建约 10-20 分钟；之后启动/停止直接 `docker compose -f docker-compose.lite.yml up -d` / `down`。
+SQLite 持久化存储（数据卷，升级重启数据不丢）。
 
 | 你要做的事 | 地址 / 命令 |
 |-----------|------------|
@@ -70,38 +74,49 @@ docker run -d --name jte \
 | 登录（默认账号，登录后请改密码） | `admin` / `admin123` |
 | 验证服务健康 | `curl http://localhost:8080/healthz` |
 | 接入车载终端 | 把终端的"平台 IP"指向 `你的服务器IP:7611`（TCP） |
+| 看日志 / 升级 | `docker logs -f jte` / 重新 `git pull` 后 `up -d --build` |
 
-✅ 就这样，一个能接入 JT/T 808 终端、看实时位置、看报警、看视频的平台已经跑起来了。
+✅ 一个能接入 JT/T 808 终端、看实时位置、看报警的平台已经跑起来了（视频/时序库等完整栈见方式 ③）。
 
-### 方式 ②：下载预编译二进制（不用装任何开发环境）
+### 方式 ②：下载预编译二进制（不用装任何环境，Mac/Linux/Windows 通吃）
 
-到 [Releases 页面](https://github.com/suoten/jt-engine/releases) 下载对应系统的文件：
+到 Releases 页面下载对应系统的压缩包（国内推荐 Gitee，免翻墙）：
+[Gitee Releases](https://gitee.com/suoten/jt-engine/releases) ｜ [GitHub Releases](https://github.com/suoten/JTEngine/releases)
 
-| 系统 | 下载文件 |
+| 系统 | 下载文件（版本号以页面为准） |
 |------|---------|
-| Linux 服务器（x86） | `jte-linux-amd64` |
-| Linux 服务器（ARM，如鲲鹏/树莓派） | `jte-linux-arm64` |
-| Windows（仅体验，付费模块不可用） | `jte-windows-amd64.exe` |
+| Mac（Apple M 系列芯片；终端 `uname -m` 显示 arm64） | `jte-x.x.x-darwin-arm64.zip` |
+| Mac（Intel；`uname -m` 显示 x86_64） | `jte-x.x.x-darwin-amd64.zip` |
+| Linux 服务器（x86） | `jte-x.x.x-linux-amd64.zip` |
+| Linux 服务器（ARM，如鲲鹏/树莓派） | `jte-x.x.x-linux-arm64.zip` |
+| Windows | `jte-x.x.x-windows-amd64.zip` |
 
-Linux 服务器上 3 条命令启动：
+解压后 3 条命令启动（Mac/Linux）：
 
 ```bash
-chmod +x jte-linux-amd64
-./jte-linux-amd64 serve
-# 打开浏览器访问 http://服务器IP:8080
+chmod +x jte
+./jte serve
+# 打开浏览器访问 http://localhost:8080
 ```
 
-> 💡 二进制内嵌了 Vue3 前端和默认配置（内存存储），**单文件即可运行**，不需要数据库、不需要前端构建。
+> 💡 二进制内嵌了 Vue3 前端和默认配置，**单文件即可运行**，不需要数据库、不需要前端构建。
+> 默认内存存储（重启数据清零，适合体验功能；要持久化请用方式 ① 的 Docker 精简版）。
+> 二进制为开源核心（808/1078），付费协议模块后续通过 `jte module install` 按需安装。
 
 ### 方式 ③：docker-compose 生产全家桶（MySQL + TDengine + Redis + MinIO + 视频）
 
 ```bash
-git clone https://github.com/suoten/jt-engine.git
+git clone https://gitee.com/suoten/jt-engine.git
 cd jt-engine/jte
 docker compose up -d
 ```
 
 一条命令拉起完整生产栈：JTE 引擎 + MySQL + TDengine 时序库 + Redis + MinIO 对象存储 + ZLMediaKit 视频服务。
+
+> ⚠️ **国内网络注意**：全家桶需要拉取 minio、tdengine、zlmediakit 等**第三方组织镜像**，
+> 目前所有免费加速器（包括阿里云个人加速器）都拒绝代理这类镜像（403 Forbidden），
+> 换任何加速源都绕不开。海外网络或代理环境可正常拉取；国内环境请先用方式 ① 精简版，
+> 或等待官方预构建镜像发布（发布后此问题一并解决）。
 
 ### 方式 ④：宝塔面板（纯图形界面，适合零基础服务器用户）
 
@@ -196,10 +211,10 @@ graph LR
 
 | 方式 | 适合人群 | 难度 | 教程 |
 |------|---------|------|------|
-| **一键安装脚本** | **零基础（推荐）** | **零操作** | [QUICK-INSTALL.md](QUICK-INSTALL.md)（双击/一条命令） |
-| Docker 单容器 | 快速体验 | ⭐ | 本文上方「60 秒跑起来」 |
-| Docker Compose | 生产部署（推荐） | ⭐⭐ | [DEPLOYMENT.md](DEPLOYMENT.md) |
-| 预编译二进制 | 无 Docker 的服务器 | ⭐ | [Releases](https://github.com/suoten/jt-engine/releases) |
+| 预编译二进制 | 零基础、不想装 Docker（含 macOS） | ⭐ | 本文上方「方式 ②」 |
+| Docker 精简版 | 快速体验 / 小型部署（**当前推荐**） | ⭐ | 本文上方「方式 ①」 |
+| 一键安装脚本 | 零基础（预构建镜像发布后开放） | 零操作 | [QUICK-INSTALL.md](QUICK-INSTALL.md) |
+| Docker Compose 全家桶 | 生产部署 | ⭐⭐ | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | 宝塔面板 | 零基础、喜欢图形界面 | ⭐⭐ | [BT-PANEL-DEPLOY.md](BT-PANEL-DEPLOY.md)（截图级教程） |
 | 源码编译 / K8s | 开发者、大规模集群 | ⭐⭐⭐ | [DEPLOYMENT.md](DEPLOYMENT.md) |
 

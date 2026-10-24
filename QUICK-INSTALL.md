@@ -1,137 +1,131 @@
 # JTE 小白安装指南（不懂编程也能装）
 
-> 本指南面向没有任何技术背景的用户。全部照着做，10 分钟内能装好。
+> 本指南面向没有任何技术背景的用户，照着做 10 分钟内装好。
 > 遇到问题先看文末【常见问题】，大部分都有现成答案。
 
 ---
 
-## 你需要准备什么
+## 选哪条路？
 
-| 事项 | 说明 |
-|------|------|
-| 一台电脑/服务器 | Windows 10 以上，或 Linux（Ubuntu/Debian/CentOS/麒麟等） |
-| 内存 4GB 以上 | 精简版只需跑 1 个容器，要求很低 |
-| 能上网 | 安装过程需要下载约 1GB 的软件 |
-
----
-
-## Windows 安装（3 步）
-
-### 第 1 步：安装 Docker Desktop（只需做一次）
-
-1. 打开官网下载页：https://www.docker.com/products/docker-desktop/
-2. 下载 **Docker Desktop for Windows**，双击安装（一路默认下一步）
-3. 安装完**重启电脑**，然后打开桌面上的 **Docker Desktop** 图标
-4. 等左下角变成绿色 **Running** 就绪（首次约 1 分钟）
-
-> 安装过程中如果提示"需要启用 WSL 2"，按它的提示点确定并重启即可。
-
-### 第 2 步：下载安装脚本（2 个文件）
-
-到 Gitee 仓库（国内速度快）下载两个文件，放在**同一个文件夹**里：
-
-- 仓库地址：https://gitee.com/suoten/jt-engine
-- 点网页上的文件名 → 右上角【原始数据】→ 右键另存为
-
-需要下载的 2 个文件：
-
-| 文件 | 用途 |
-|------|------|
-| `install-jte.bat` | 双击这个 |
-| `install-jte.ps1` | 幕后干活的（必须和 bat 放同一文件夹） |
-
-### 第 3 步：双击 `install-jte.bat`
-
-剩下的全自动：拉取镜像（国内会自动配加速源）→ 启动 → 浏览器自动打开管理后台。
-
-登录默认账号：**admin / admin123**（登录后请立即改密码）。
-
-装好了。车载终端把"平台地址"填成 `你的电脑IP:7611`（TCP）即可接入。
+| 你的情况 | 推荐路径 |
+|----------|----------|
+| 只想快点看到平台长什么样，数据丢了无所谓 | **路径 A：下载二进制**（不用装任何东西） |
+| 要长期用、数据不能丢 | **路径 B：Docker 精简版**（需要装 Docker） |
+| 零基础 + Linux 服务器 + 想全自动 | 路径 C：一键安装脚本（预构建镜像发布后开放） |
 
 ---
 
-## Linux 服务器安装（1 条命令）
+## 路径 A：下载二进制（最快，Mac/Linux/Windows 都行，不用装 Docker）
+
+### 第 1 步：下载
+
+到 Releases 页面（国内推荐 Gitee，免翻墙）：
+[Gitee Releases](https://gitee.com/suoten/jt-engine/releases) ｜ [GitHub Releases](https://github.com/suoten/JTEngine/releases)
+
+**Mac 用户先确认芯片**：打开"终端"（聚焦搜索 Terminal），输入 `uname -m` 回车：
+- 显示 `arm64`（M1/M2/M3 芯片）→ 下载 `jte-x.x.x-darwin-arm64.zip`
+- 显示 `x86_64`（Intel 芯片）→ 下载 `jte-x.x.x-darwin-amd64.zip`
+
+| 系统 | 下载文件 |
+|------|---------|
+| Mac（arm64） | `jte-x.x.x-darwin-arm64.zip` |
+| Mac（x86_64） | `jte-x.x.x-darwin-amd64.zip` |
+| Linux x86 | `jte-x.x.x-linux-amd64.zip` |
+| Linux ARM | `jte-x.x.x-linux-arm64.zip` |
+| Windows | `jte-x.x.x-windows-amd64.zip` |
+
+### 第 2 步：解压并运行
+
+**Mac / Linux**：解压 zip，在终端里进入解压出的目录，执行：
 
 ```bash
-curl -fsSL https://gitee.com/suoten/jt-engine/raw/master/install-jte.sh | sudo bash
+chmod +x jte
+./jte serve
 ```
 
-装完会自动打印管理后台地址和默认账号。
-别忘了在防火墙/云安全组放行 **7611（TCP）** 和 **8080（TCP）** 端口。
+**Windows**：解压 zip，双击目录里的 `jte.exe`（或在 CMD 中执行 `jte.exe serve`）。
+
+### 第 3 步：打开后台
+
+浏览器访问 http://localhost:8080 ，账号 **admin / admin123**（登录后请立即改密码）。
+
+> ⚠️ 二进制版默认**内存存储：重启后数据清零**，适合先体验功能。
+> 确认要长期使用，请换路径 B（数据持久化，不丢）。
 
 ---
 
-## 装完之后
+## 路径 B：Docker 精简版（单容器 + SQLite，数据不丢）
 
-| 你想做 | 命令 / 操作 |
-|--------|------------|
-| 打开管理后台 | 浏览器访问 `http://服务器IP:8080` |
-| 停止 | `docker stop jte` |
-| 再启动 | `docker start jte` |
-| 看运行日志 | `docker logs -f jte` |
-| 升级新版本 | Windows：重新双击 `install-jte.bat`；Linux：重新执行上面那条命令 |
-| 卸载 | `docker rm -f jte`（数据在 `jte-data` 卷里，想彻底清掉再执行 `docker volume rm jte-data jte-spool`） |
+### 第 1 步：装 Docker（只需做一次）
 
-> 数据保存在 Docker 卷 `jte-data` 中，升级、重启都不会丢。
+- **Windows/Mac**：下载安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，装完重启电脑，打开它等左下角变绿
+- **Linux**：`curl -fsSL https://get.docker.com | sh -s -- --mirror Aliyun`
+
+### 第 2 步：拉代码并构建启动
+
+```bash
+git clone https://gitee.com/suoten/jt-engine.git   # 国内用 Gitee
+cd jt-engine/jte
+docker compose -f docker-compose.lite.yml up -d --build
+```
+
+首次构建约 10-20 分钟（从源码编译，只需拉取官方基础镜像，国内加速器都能拉）。
+之后日常启停：`docker compose -f docker-compose.lite.yml up -d` / `down`。
+
+### 第 3 步：打开后台
+
+浏览器访问 http://localhost:8080 ，账号 **admin / admin123**。
+
+> 💡 数据存在 Docker 卷中（`docker volume ls` 可看到 `jte_jte-data`），重启/升级都不丢。
+> 升级方法：`git pull` 后重新执行 `docker compose -f docker-compose.lite.yml up -d --build`。
+
+---
+
+## 路径 C：一键安装脚本（预构建镜像发布后开放）
+
+官方镜像发布到 Docker Hub / 阿里云 ACR 之后，Windows 双击 `install-jte.bat`、
+Linux 一条命令即可全自动安装（自动配加速源、自动重试）。当前请先用路径 A / B。
 
 ---
 
 ## 常见问题
 
-### 1. 拉取镜像报错 `failed size validation` / 一直卡在拉取
+### 1. Docker 拉镜像报错 403 Forbidden / failed size validation
 
-这是国内访问 Docker 镜像仓库不通导致的（截图里 minio/zlmediakit 那种红叉就是它）。
-安装脚本遇到这种情况会**自动换加速源重试**。如果手动处理：
+这是国内访问 Docker 镜像仓库的普遍问题，**不是你操作错了**：
 
-1. 注册阿里云（免费），打开 https://cr.console.aliyun.com/cn-hangzhou/instances/mirrors ，复制你的**专属加速器地址**（形如 `https://xxxxxx.mirror.aliyuncs.com`）
-2. Windows：Docker Desktop → Settings → Docker Engine，把地址填进去：
-   ```json
-   {
-     "registry-mirrors": ["https://xxxxxx.mirror.aliyuncs.com"]
-   }
-   ```
-   点 **Apply & Restart**；
-   Linux：编辑 `/etc/docker/daemon.json` 写入同样内容，然后 `systemctl restart docker`
-3. 重新双击安装脚本 / 重新执行安装命令
+- `403 Forbidden`：你配的加速器拒绝代理这个镜像。**阿里云等免费加速器现在只代理
+  Docker Hub 官方镜像**（mysql、redis、node 这类）；minio、tdengine、zlmediakit 等
+  **第三方组织的镜像**一律拒绝，换任何免费加速器都没用
+- `failed size validation`：加速器返回了损坏的数据，重试一次，不行就按下面第 2 条处理
 
-也可以在运行脚本前指定加速源：
+**怎么办**：本指南路径 B 的精简版只需要官方基础镜像，加速器能拉，不会遇到这个问题。
+需要第三方镜像的全家桶部署，请等官方预构建镜像发布。
+
+### 2. 换了加速源还是同样报错
+
+本地可能缓存了损坏数据：Windows 在 Docker Desktop → Troubleshoot → **Clean / Purge data**；
+Linux 执行 `docker system prune -a`，然后重来。
+
+### 3. 端口被占用（8080 或 7611）
+
+改端口后启动：
 
 ```bash
-# Linux 示例
-JTE_MIRROR=https://xxxxxx.mirror.aliyuncs.com sudo -E bash install-jte.sh
+JTE_API_PORT=8090 JTE_GATEWAY_PORT=7613 sudo -E docker compose -f docker-compose.lite.yml up -d
 ```
 
-### 2. 换了加速源还是报 `failed size validation`
+### 4. Mac 提示"无法验证开发者"或 Gatekeeper 拦截
 
-多半是本地缓存坏了。Windows：Docker Desktop → Troubleshoot → **Clean / Purge data**（会删掉已有镜像和容器）；Linux：`docker system prune -a`。然后重新安装。
+系统设置 → 隐私与安全性 → 底部点"仍要打开"；或终端执行 `xattr -d com.apple.quarantine jte`。
 
-### 3. 端口被占用
+### 5. 数据存在哪？怎么备份？
 
-- 8080 被占用：管理后台起不来。改端口：Windows 安装时在 PowerShell 里运行
-  `powershell -File install-jte.ps1 -ApiPort 8090`；Linux：`JTE_API_PORT=8090 sudo -E bash install-jte.sh`
-- 7611 被占用：终端接入端口，同样可用 `-GatewayPort` / `JTE_GATEWAY_PORT` 修改
+路径 B 的数据在 Docker 卷 `jte_jte-data`（SQLite 文件在容器内 /app/data/jte.db）。
+备份：`docker run --rm -v jte_jte-data:/data -v $(pwd):/backup alpine tar czf /backup/jte-data-backup.tar.gz -C /data .`
 
-### 4. Windows 提示"无法运行脚本"
+### 6. 想要完整功能（视频、时序库海量轨迹、MySQL）
 
-直接双击 `install-jte.bat`（不要单独双击 ps1）。bat 已自动处理运行权限。
-
-### 5. 设备不多，精简版够用吗？
-
-精简版用 SQLite 单容器，几百台设备规模没有问题。数据量大（万级设备、海量轨迹）时
-再换全家桶部署，见仓库内 [DEPLOYMENT.md](DEPLOYMENT.md)（MySQL + TDengine + Redis + MinIO + 视频）。
-
-### 6. 想要纯图形界面（不用命令行）
-
-用宝塔面板：见 [BT-PANEL-DEPLOY.md](BT-PANEL-DEPLOY.md) 截图级教程。
-
----
-
-## 两种部署形态对比
-
-| | 精简版（本指南/一键脚本） | 全家桶（docker-compose.yml） |
-|--|--|--|
-| 容器数量 | 1 个 | 6 个 |
-| 依赖 | 无（SQLite 内嵌） | MySQL + TDengine + Redis + MinIO + ZLMediaKit |
-| 适合 | 体验、演示、小型项目 | 生产、大量设备、长期运营 |
-| 数据库 | SQLite（文件） | MySQL + TDengine |
-| 升级路径 | 直接换全家桶，数据可导出迁移 | — |
+那是生产全家桶（MySQL + TDengine + Redis + MinIO + ZLMediaKit），见
+[DEPLOYMENT.md](DEPLOYMENT.md)。国内网络目前拉不动其中的第三方镜像，预构建镜像
+发布后会更新此文档。零基础用户也可用宝塔面板图形化部署：[BT-PANEL-DEPLOY.md](BT-PANEL-DEPLOY.md)。

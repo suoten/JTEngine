@@ -30,6 +30,7 @@ services:
       - "${JTE_API_PORT:-8080}:8080"       # 管理后台 / API（HTTP）
     environment:
       - JTE_STORAGE_TYPE=${JTE_STORAGE_TYPE:-sqlite}
+      - JTE_API_PORT=${JTE_API_PORT:-8080}
     volumes:
       - jte-data:/app/data                 # SQLite 数据库等持久化数据
       - jte-spool:/app/spool               # 离线消息暂存

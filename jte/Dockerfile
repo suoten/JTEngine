@@ -73,12 +73,13 @@ LABEL org.opencontainers.image.title="JTE Engine" \
 
 # 安装运行时依赖（不含 gcc/musl-dev 等编译工具链）
 # ca-certificates: TLS 证书；tzdata: 时区；wget: 健康检查
-# /app/data、/app/spool 预创建并赋权：容器以非 root 用户 jte 运行，/app 属主为 root，
-# 运行时创建会 permission denied（sqlite 默认 DSN ./data/jte.db，spool 为离线消息暂存）
+# /app/data、/app/spool、/app/modules 预创建并赋权：容器以非 root 用户 jte 运行，
+# /app 属主为 root，运行时创建会 permission denied（sqlite DSN ./data/jte.db、spool
+# 离线暂存、modules 供 license 本地密钥与审计日志写入）
 RUN apk --no-cache add ca-certificates tzdata wget \
     && addgroup -S jte && adduser -S jte -G jte \
-    && mkdir -p /app/data /app/spool \
-    && chown jte:jte /app/data /app/spool
+    && mkdir -p /app/data /app/spool /app/modules \
+    && chown jte:jte /app/data /app/spool /app/modules
 
 WORKDIR /app
 

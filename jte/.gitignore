@@ -40,3 +40,7 @@ cmd/jte/builtin_modules.go
 
 .DS_Store
 Thumbs.db
+
+# 发布打包产物（make-release.ps1 生成）
+dist/
+release/

@@ -4,7 +4,7 @@
 # - 添加 --mount=type=cache BuildKit 缓存优化（Go module + npm + go-build）
 # - 最终镜像不包含编译工具链（gcc/musl-dev 仅在 builder 阶段）
 # - 使用 COPY --chown 替代单独的 RUN chown 步骤（减少一层）
-# - Go 版本对齐 go.mod (1.23)
+# - Go 版本对齐 go.mod（跟随 go.mod 的 go 指令升级）
 
 # =============================================================================
 # Stage 1: 前端构建
@@ -27,7 +27,8 @@ RUN npm run build
 # =============================================================================
 # Stage 2: 后端构建
 # =============================================================================
-FROM golang:1.23-alpine AS backend-builder
+# Go 版本对齐 go.mod（go 1.25.0；用旧版镜像会报 "go.mod requires go >= 1.25.0"）
+FROM golang:1.25-alpine AS backend-builder
 
 # GOPROXY 可通过 build-arg 覆盖；默认 goproxy.cn（国内构建必须，proxy.golang.org 不可达）
 ARG GOPROXY=https://goproxy.cn,direct

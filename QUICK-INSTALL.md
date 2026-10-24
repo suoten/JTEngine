@@ -98,12 +98,14 @@ curl -fsSL https://gitee.com/suoten/jt-engine/raw/master/install-jte.sh | sudo b
 
 ## 加挂 1078 视频功能（可选）
 
-视频播放需要 ZLMediaKit 流媒体服务，精简版/单容器默认不带。加挂四步：
+视频播放需要 ZLMediaKit 流媒体服务，精简版/单容器默认不带。两种形态任选：
 
-**第 1 步：跑起 ZLMediaKit 容器（与 JTE 同一 docker 网络）**
+### 形态 A：JTE 也是 Docker 跑的（推荐）
+
+**第 1 步：拉起 ZLMediaKit 容器（与 JTE 同一 docker 网络）**
 
 ```bash
-docker load -i zlmediakit.tar        # 国内离线包（ Releases/群文件下载）
+docker pull zlmediakit/zlmediakit:master    # 国内拉不动时需代理，或用国内镜像仓库
 docker network create jte-media
 docker volume create zlm-conf
 docker run -d --name zlm --restart unless-stopped \
@@ -114,8 +116,9 @@ docker run -d --name zlm --restart unless-stopped \
   zlmediakit/zlmediakit:master
 ```
 
-> ⚠️ JTE 与 ZLMediaKit 必须在同一个 docker 网络里**容器直连**——实测容器经
-> 宿主机 IP 回环发 UDP 会被 Docker 端口映射丢弃（API 是 TCP 能通，RTP 是 UDP 不通）。
+> 💡 推荐 JTE 与 ZLMediaKit 同 docker 网络容器直连（API 与 RTP 转发不经过宿主机
+> 端口映射），避开宿主机防火墙/安全软件对端口的占用与拦截——例如实测中
+> 360 安全卫士会抢占 10001/UDP 端口导致推流数据被吃掉。
 
 **第 2 步：固定 API secret（新版 ZLM 每个新容器随机生成，必须固定）**
 
@@ -144,12 +147,34 @@ docker run -d --name jte -p 7611:7611 -p 8080:8080 \
   suoten/jt-engine:stable
 ```
 
-两个地址的分工（v1.1.2+）：`URL` 是容器内地址（API 调用与 RTP 转发走它），
-`PUBLIC_URL` 是对外地址（浏览器 FLV/HLS 播放地址、下发给终端的推流地址走它）。
+### 形态 B：JTE 用二进制跑（非 Docker），ZLM 用 Docker
 
-然后到管理后台"视频预览"选设备通道播放。要求：车载终端能访问到
-`你的IP:10001-10050`（RTP 推流端口池），即设备与服务器同网或在公网可达；
-终端的"平台IP"填这台机器的 IP。
+ZLMediaKit 容器按形态 A 第 1、2 步跑起（**不需要** docker network，原生进程
+直接访问宿主机映射端口）。然后在 JTE 二进制所在目录用环境变量启动：
+
+```bash
+JTE_STORAGE_TYPE=memory \
+JTE_ZLMEDIAKIT_URL=http://127.0.0.1:1936 \
+JTE_ZLMEDIAKIT_PUBLIC_URL=http://192.168.1.23:1936 \
+JTE_ZLMEDIAKIT_SECRET=jte2026video \
+JTE_ZLMEDIAKIT_HTTP_PORT=1936 \
+JTE_ZLMEDIAKIT_RTP_PORT=10001 \
+./jte serve
+```
+
+（Windows 用 `set 变量=值` 或 PowerShell `$env:变量="值"`；也可改 `configs/jte.yaml`
+的 `zlmediakit` 段。）
+
+> ⚠️ 二进制版为内存存储（重启数据清零）——要数据持久化请用形态 A 的 Docker 版。
+> 若推流不通，检查宿主机端口是否被安全软件占用：`netstat -ano | grep 10001`，
+> 被占用时换 `JTE_ZLMEDIAKIT_RTP_PORT` 为其他空闲端口（同时调整 ZLM 容器端口映射）。
+
+### 播放
+
+后台"视频预览"选设备通道播放。两个地址的分工（v1.1.2+）：`URL` 是 JTE 到 ZLM 的
+内部地址（API 调用与 RTP 转发），`PUBLIC_URL` 是对外地址（浏览器 FLV/HLS 播放、
+下发给终端的推流地址）。要求：车载终端能访问 `你的IP:10001-10050`（RTP 推流
+端口池），终端的"平台IP"填这台机器的 IP。
 
 ---
 

@@ -42,10 +42,10 @@ WORKDIR /build
 # [P1-可靠性] 先复制依赖文件，利用 Docker 层缓存
 COPY go.mod go.sum ./
 
-# [P1-可靠性] BuildKit 缓存：Go module 下载缓存 + 编译缓存，加速重复构建
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod download
+# 注意：不要在此处单独执行 `go mod download`——它会下载 go.mod 里全部 require，
+# 包括三个未发布的付费模块（module-protocol-809/905/1045@v0.0.0，仅 -tags builtin
+# 构建才需要，由工作区 go.work 提供）。默认构建不 import 它们，由下方 go build
+# 按需拉取实际依赖即可。
 
 COPY . .
 COPY --from=frontend-builder /build/web/dist ./web/dist
